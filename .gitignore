@@ -1,0 +1,18 @@
+# Build artifacts
+vnc-monitor-test
+src/*.o
+auth-helper/vnc-monitor-auth-helper
+build/
+
+# Runtime-generated server identity / secrets
+ra2-server-key.pem
+*.pem
+
+# Local diagnostics / benchmark output
+*.csv
+*.log
+
+# Editor / OS noise
+.vscode/
+.idea/
+*~
