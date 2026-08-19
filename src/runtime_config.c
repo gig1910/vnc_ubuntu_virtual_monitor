@@ -243,7 +243,7 @@ runtime_config_defaults(RuntimeConfig *cfg)
         .source_mode = FRAME_SOURCE_MUTTER,
         .capture_backend = CAPTURE_BACKEND_PIPEWIRE,
         .capture_timeout_ms = 5000,
-        .mutter_cursor_mode = MUTTER_CURSOR_HIDDEN,
+        .mutter_cursor_mode = MUTTER_CURSOR_METADATA,
         .mutter_hardware_cursor_mode = MUTTER_HW_CURSOR_AUTO,
         .vnc_max_fps = 0,
         .latest_only = 1,
@@ -312,7 +312,7 @@ runtime_config_usage(const char *argv0)
         "  --source mutter|test         Frame source                [mutter]\n"
         "  --capture-backend MODE       pipewire|gstreamer        [pipewire]\n"
         "  --capture-timeout-ms N       Wait for first real frame   [5000]\n"
-        "  --mutter-cursor MODE         hidden|embedded|metadata   [hidden]\n"
+        "  --mutter-cursor MODE         hidden|embedded|metadata [metadata]\n"
         "  --mutter-hardware-cursor M   auto|enabled|disabled         [auto]\n"
         "  --vnc-fps source|N           Max VNC publish rate      [source]\n"
         "                              source/0 = every new source frame\n"
