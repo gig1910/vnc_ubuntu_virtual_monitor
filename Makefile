@@ -21,6 +21,7 @@ SOURCES := \
 	src/test_pattern.c \
 	src/frame_bridge.c \
 	src/frame_diff.c \
+	src/adaptive_rfb.c \
 	src/pipeline_stats.c \
 	src/monitor_layout_cache.c \
 	src/mutter_virtual_monitor.c \
@@ -55,7 +56,7 @@ AUTH_SOCKET_GROUP ?= $(shell id -gn)
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
-	$(CC) $(CFLAGS) $(OBJECTS) -o $@ $(PKG_LIBS) -pthread
+	$(CC) $(CFLAGS) $(OBJECTS) -o $@ $(PKG_LIBS) -ljpeg -pthread
 
 src/%.o: src/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_CFLAGS) -c $< -o $@
