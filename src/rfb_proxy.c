@@ -80,23 +80,13 @@ backend_handshake(
     static const char version[] =
         "RFB 003.008\n";
 
-    if (
-        io_write_exact(
-            fd,
-            version,
-            12
-        ) < 0
-    )
+    if (io_write_exact(fd, version, 12) < 0)
         return -1;
 
     uint8_t count = 0;
 
     if (
-        io_read_exact(
-            fd,
-            &count,
-            1
-        ) < 0 ||
+        io_read_exact(fd, &count, 1) < 0 ||
         count == 0
     )
         return -1;
@@ -106,13 +96,7 @@ backend_handshake(
     if (!types)
         return -1;
 
-    if (
-        io_read_exact(
-            fd,
-            types,
-            count
-        ) < 0
-    ) {
+    if (io_read_exact(fd, types, count) < 0) {
         free(types);
         return -1;
     }
@@ -129,48 +113,26 @@ backend_handshake(
     free(types);
 
     if (!supports_none) {
-        fprintf(
-            stderr,
-            "Internal backend did not offer security type None\n"
-        );
+        fprintf(stderr, "Internal backend did not offer security type None\n");
         return -1;
     }
 
     const uint8_t none = 1;
 
-    if (
-        io_write_exact(
-            fd,
-            &none,
-            1
-        ) < 0
-    )
+    if (io_write_exact(fd, &none, 1) < 0)
         return -1;
 
     uint8_t result[4];
 
     if (
-        io_read_exact(
-            fd,
-            result,
-            sizeof(result)
-        ) < 0 ||
+        io_read_exact(fd, result, sizeof(result)) < 0 ||
         io_get_u32_be(result) != 0
     ) {
-        fprintf(
-            stderr,
-            "Internal backend security handshake failed\n"
-        );
+        fprintf(stderr, "Internal backend security handshake failed\n");
         return -1;
     }
 
-    if (
-        io_write_exact(
-            fd,
-            &client_init,
-            1
-        ) < 0
-    )
+    if (io_write_exact(fd, &client_init, 1) < 0)
         return -1;
 
     return 0;
@@ -182,20 +144,9 @@ forward_server_init(
     int external_fd,
     Ra2Direction *server_to_client)
 {
-    /*
-     * RFB ServerInit:
-     * 2 width + 2 height + 16 pixel format + 4 name length = 24 bytes,
-     * followed by name.
-     */
     uint8_t header[24];
 
-    if (
-        io_read_exact(
-            backend_fd,
-            header,
-            sizeof(header)
-        ) < 0
-    )
+    if (io_read_exact(backend_fd, header, sizeof(header)) < 0)
         return -1;
 
     uint32_t name_len =
@@ -206,10 +157,7 @@ forward_server_init(
         return -1;
     }
 
-    size_t total =
-        sizeof(header) +
-        (size_t)name_len;
-
+    size_t total = sizeof(header) + (size_t)name_len;
     uint8_t *msg = malloc(total);
 
     if (!msg)
@@ -229,10 +177,6 @@ forward_server_init(
         return -1;
     }
 
-    /*
-     * Current test ServerInit is tiny. Keep a hard check because a single
-     * RA2 record is limited to 65535 plaintext bytes.
-     */
     if (total > RA2_MAX_RECORD) {
         fprintf(stderr, "Backend ServerInit exceeds one RA2 record\n");
         free(msg);
@@ -277,8 +221,7 @@ relay_loop(
         FD_SET(external_fd, &readfds);
         FD_SET(backend_fd, &readfds);
 
-        int stop_fd =
-            shutdown_signal_fd();
+        int stop_fd = shutdown_signal_fd();
 
         if (stop_fd >= 0)
             FD_SET(stop_fd, &readfds);
@@ -291,20 +234,30 @@ relay_loop(
         if (stop_fd > maxfd)
             maxfd = stop_fd;
 
+        /*
+         * 0.0.21: wake periodically even when neither direction is readable.
+         * The latest-only governor consumes transport queue telemetry from
+         * PipelineStats, so leaving select() blocked indefinitely could make a
+         * previously-high queue value stale and keep publishing paused.
+         */
+        struct timeval timeout = {
+            .tv_sec = 0,
+            .tv_usec = 20000
+        };
+
         int rc =
             select(
                 maxfd + 1,
                 &readfds,
                 NULL,
                 NULL,
-                NULL
+                &timeout
             );
 
         if (rc < 0) {
             if (errno == EINTR) {
-                if (shutdown_signal_requested()) {
+                if (shutdown_signal_requested())
                     return 0;
-                }
 
                 continue;
             }
@@ -318,6 +271,9 @@ relay_loop(
             external_fd,
             backend_fd
         );
+
+        if (rc == 0)
+            continue;
 
         if (
             stop_fd >= 0 &&
@@ -364,9 +320,7 @@ relay_loop(
             c2s_records++;
             c2s_bytes += plain_len;
 
-            benchmark_record_ra2_in(
-                plain_len
-            );
+            benchmark_record_ra2_in(plain_len);
 
             int wr =
                 io_write_exact(
@@ -379,12 +333,7 @@ relay_loop(
 
             if (wr < 0) {
                 perror("write to LibVNCServer backend");
-
-                fprintf(
-                    stderr,
-                    "RA2 relay stopped writing client data to backend\n"
-                );
-
+                fprintf(stderr, "RA2 relay stopped writing client data to backend\n");
                 return 0;
             }
         }
@@ -401,10 +350,7 @@ relay_loop(
                     &s2c_bytes
                 );
 
-            if (
-                coalesce_rc ==
-                RA2_COALESCE_BACKEND_EOF
-            ) {
+            if (coalesce_rc == RA2_COALESCE_BACKEND_EOF) {
                 fprintf(
                     stderr,
                     "LibVNCServer backend closed the relay "
@@ -415,26 +361,15 @@ relay_loop(
                     s2c_records,
                     s2c_bytes
                 );
-
                 return 0;
             }
 
-            if (
-                coalesce_rc ==
-                RA2_COALESCE_SHUTDOWN
-            ) {
-                fprintf(
-                    stderr,
-                    "Shutdown requested during RA2 coalescing\n"
-                );
-
+            if (coalesce_rc == RA2_COALESCE_SHUTDOWN) {
+                fprintf(stderr, "Shutdown requested during RA2 coalescing\n");
                 return 0;
             }
 
-            if (
-                coalesce_rc ==
-                RA2_COALESCE_ERROR
-            ) {
+            if (coalesce_rc == RA2_COALESCE_ERROR) {
                 fprintf(
                     stderr,
                     "RA2 relay stopped while coalescing/sending "
@@ -445,7 +380,6 @@ relay_loop(
                     s2c_records,
                     s2c_bytes
                 );
-
                 return 0;
             }
         }
@@ -462,9 +396,6 @@ rfb_proxy_run(
     uint8_t *client_init_msg = NULL;
     size_t client_init_len = 0;
 
-    /*
-     * First post-auth RFB message from the external client.
-     */
     if (
         ra2_recv_record(
             external_fd,
@@ -476,28 +407,17 @@ rfb_proxy_run(
         return -1;
 
     if (client_init_len != 1) {
-        fprintf(
-            stderr,
-            "Unexpected ClientInit length: %zu\n",
-            client_init_len
-        );
-
+        fprintf(stderr, "Unexpected ClientInit length: %zu\n", client_init_len);
         free(client_init_msg);
         return -1;
     }
 
-    uint8_t client_init =
-        client_init_msg[0];
-
+    uint8_t client_init = client_init_msg[0];
     free(client_init_msg);
 
-    printf(
-        "Encrypted ClientInit received (shared=%u)\n",
-        client_init
-    );
+    printf("Encrypted ClientInit received (shared=%u)\n", client_init);
 
-    int backend_fd =
-        connect_backend(cfg);
+    int backend_fd = connect_backend(cfg);
 
     if (backend_fd < 0)
         return -1;
@@ -507,16 +427,8 @@ rfb_proxy_run(
 
     int rc = -1;
 
-    if (
-        backend_handshake(
-            backend_fd,
-            client_init
-        ) < 0
-    ) {
-        fprintf(
-            stderr,
-            "Internal LibVNCServer handshake failed\n"
-        );
+    if (backend_handshake(backend_fd, client_init) < 0) {
+        fprintf(stderr, "Internal LibVNCServer handshake failed\n");
         goto out;
     }
 
@@ -527,16 +439,11 @@ rfb_proxy_run(
             &session->server_to_client
         ) < 0
     ) {
-        fprintf(
-            stderr,
-            "Failed forwarding encrypted ServerInit\n"
-        );
+        fprintf(stderr, "Failed forwarding encrypted ServerInit\n");
         goto out;
     }
 
-    printf(
-        "RA2r <-> LibVNCServer stream relay started\n"
-    );
+    printf("RA2r <-> LibVNCServer stream relay started\n");
 
     rc =
         relay_loop(
