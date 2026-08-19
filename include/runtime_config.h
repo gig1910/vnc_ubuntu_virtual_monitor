@@ -40,8 +40,17 @@ typedef struct {
     int capture_timeout_ms;
     MutterCursorMode mutter_cursor_mode;
     MutterHardwareCursorMode mutter_hardware_cursor_mode;
+
     /* 0 = source-driven: publish every newly consumed source frame. */
     int vnc_max_fps;
+
+    /* 0.0.21 low-latency/downstream resynchronization policy. */
+    int latest_only;
+    int keyframe;
+    int keyframe_interval_ms;
+    int keyframe_after_drop;
+    int latency_trace;
+
     int external_send_buffer;
     int backend_receive_buffer;
     int diff_detect;
