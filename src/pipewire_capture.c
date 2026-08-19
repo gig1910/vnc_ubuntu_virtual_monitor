@@ -1,10 +1,10 @@
 #include "pipewire_capture.h"
 
-#include <spa/buffer/meta.h>
+#include <spa/buffer/buffer.h>
 #include <spa/param/buffers.h>
 #include <spa/param/video/format-utils.h>
-#include <spa/utils/result.h>
 #include <spa/param/video/raw-utils.h>
+#include <spa/utils/result.h>
 
 #include <errno.h>
 #include <inttypes.h>
@@ -12,8 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-#define DAMAGE_META_RECTS 32
 
 static uint64_t
 monotonic_now_ns(void)
@@ -56,7 +54,8 @@ record_frame_interval(PipewireCapture *capture)
             fprintf(stderr,
                     "[CAPTURE][STALL] backend=pipewire seq=%" PRIu64
                     " gap=%.1fms\n",
-                    sequence, gap_ms);
+                    sequence,
+                    gap_ms);
         }
     }
 
@@ -64,12 +63,15 @@ record_frame_interval(PipewireCapture *capture)
         fprintf(stderr,
                 "[CAPTURE][FRAME] backend=pipewire seq=%" PRIu64
                 " gap=%.1fms callbacks=%" PRIu64
-                " dequeued=%" PRIu64 " recycled=%" PRIu64 "\n",
+                " dequeued=%" PRIu64
+                " recycled=%" PRIu64
+                " empty=%" PRIu64 "\n",
                 sequence,
                 capture->last_sample_ns ? gap_ms : 0.0,
                 capture->process_callbacks,
                 capture->dequeued_buffers,
-                capture->stale_buffers_recycled);
+                capture->stale_buffers_recycled,
+                capture->empty_buffers);
     }
 
     capture->last_sample_ns = now_ns;
@@ -83,12 +85,18 @@ log_capture_summary(const PipewireCapture *capture)
 
     fprintf(stderr,
             "[CAPTURE][SUMMARY] backend=pipewire samples=%" PRIu64
-            " intervals=%" PRIu64 " stalls=%" PRIu64
+            " intervals=%" PRIu64
+            " stalls=%" PRIu64
             " max-gap=%.1fms hist[<250=%" PRIu64
-            " 250-500=%" PRIu64 " 0.5-1s=%" PRIu64
-            " 1-2s=%" PRIu64 " 2-5s=%" PRIu64
-            " >=5s=%" PRIu64 "] callbacks=%" PRIu64
-            " dequeued=%" PRIu64 " stale-recycled=%" PRIu64
+            " 250-500=%" PRIu64
+            " 0.5-1s=%" PRIu64
+            " 1-2s=%" PRIu64
+            " 2-5s=%" PRIu64
+            " >=5s=%" PRIu64
+            "] callbacks=%" PRIu64
+            " dequeued=%" PRIu64
+            " stale-recycled=%" PRIu64
+            " empty=%" PRIu64
             " invalid=%" PRIu64 "\n",
             capture->sample_sequence,
             capture->interval_count,
@@ -103,6 +111,7 @@ log_capture_summary(const PipewireCapture *capture)
             capture->process_callbacks,
             capture->dequeued_buffers,
             capture->stale_buffers_recycled,
+            capture->empty_buffers,
             capture->invalid_buffers);
 }
 
@@ -144,7 +153,8 @@ on_stream_param_changed(void *userdata,
     memset(&info, 0, sizeof(info));
 
     if (spa_format_video_raw_parse(param, &info) < 0) {
-        fprintf(stderr, "[PIPEWIRE] could not parse negotiated video format\n");
+        fprintf(stderr,
+                "[PIPEWIRE] could not parse negotiated video format\n");
         return;
     }
 
@@ -167,9 +177,10 @@ on_stream_param_changed(void *userdata,
     if (info.format == SPA_VIDEO_FORMAT_BGRx &&
         (int)info.size.width == capture->width &&
         (int)info.size.height == capture->height) {
-        uint8_t params_buffer[1024];
-        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(params_buffer, sizeof(params_buffer));
-        const struct spa_pod *params[2];
+        uint8_t params_buffer[512];
+        struct spa_pod_builder b =
+            SPA_POD_BUILDER_INIT(params_buffer, sizeof(params_buffer));
+        const struct spa_pod *params[1];
         int stride = capture->width * 4;
         int size = stride * capture->height;
 
@@ -183,28 +194,18 @@ on_stream_param_changed(void *userdata,
             SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(
                 (1u << SPA_DATA_MemPtr) | (1u << SPA_DATA_MemFd)));
 
-        params[1] = spa_pod_builder_add_object(
-            &b,
-            SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
-            SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoDamage),
-            SPA_PARAM_META_size, SPA_POD_Int(
-                (int)(sizeof(struct spa_meta_region) * DAMAGE_META_RECTS)));
-
-        int rc = pw_stream_update_params(capture->stream, params, 2);
+        int rc = pw_stream_update_params(capture->stream, params, 1);
         if (rc < 0) {
             fprintf(stderr,
-                    "[PIPEWIRE] buffer/meta parameter update failed: %s\n",
+                    "[PIPEWIRE] buffer parameter update failed: %s\n",
                     spa_strerror(rc));
         }
         else {
             fprintf(stderr,
                     "[CAPTURE] native PipeWire buffers: requested 8 "
                     "(range 2..16), stride=%d size=%d\n",
-                    stride, size);
-            fprintf(stderr,
-                    "[CAPTURE] native PipeWire damage metadata: requested "
-                    "up to %d regions\n",
-                    DAMAGE_META_RECTS);
+                    stride,
+                    size);
         }
     }
 
@@ -213,7 +214,9 @@ on_stream_param_changed(void *userdata,
         (int)info.size.height != capture->height) {
         fprintf(stderr,
                 "[PIPEWIRE] unexpected format; expected BGRx %dx%d\n",
-                capture->width, capture->height);
+                capture->width,
+                capture->height);
+
         pthread_mutex_lock(&capture->mutex);
         capture->failed = 1;
         pthread_cond_broadcast(&capture->cond);
@@ -221,48 +224,21 @@ on_stream_param_changed(void *userdata,
     }
 }
 
-static int
-copy_pw_region(PipewireCapture *capture,
-               const struct spa_data *data,
-               int32_t stride,
-               int x1,
-               int y1,
-               int x2,
-               int y2)
-{
-    if (x1 < 0 || y1 < 0 ||
-        x2 > capture->width || y2 > capture->height ||
-        x2 <= x1 || y2 <= y1)
-        return -1;
-
-    const size_t frame_row_bytes = (size_t)capture->width * 4u;
-    const size_t region_row_bytes = (size_t)(x2 - x1) * 4u;
-    const uint8_t *src = (const uint8_t *)data->data + data->chunk->offset;
-    uint8_t *dst = capture->scratch;
-
-    for (int y = y1; y < y2; y++) {
-        memcpy(dst + (size_t)y * frame_row_bytes + (size_t)x1 * 4u,
-               src + (size_t)y * (size_t)stride + (size_t)x1 * 4u,
-               region_row_bytes);
-    }
-
-    return 0;
-}
-
 /*
  * Return values:
- *   1 = pixel state changed / full frame copied
- *   0 = valid buffer, but VideoDamage says there is no pixel change
- *  -1 = unusable buffer or malformed damage region
+ *   1 = complete usable BGRx frame copied to scratch
+ *   0 = intentionally empty/corrupted PipeWire buffer; ignore it
+ *  -1 = malformed/unusable buffer
  *
- * Mutter may cycle several PipeWire buffers. Unchanged pixels in a reused
- * producer buffer must not be treated as authoritative: SPA_META_VideoDamage
- * describes the pixels produced for this frame. Keep one persistent private
- * framebuffer and apply only those regions. This prevents stale contents from
- * one buffer in the pool from reappearing every time that buffer is reused.
+ * Mutter's virtual-screen-cast path renders a complete frame for normal
+ * buffers. It can also queue empty buffers with chunk->size == 0 and
+ * SPA_CHUNK_FLAG_CORRUPTED when no image was recorded (for example a skipped
+ * paint/cursor-only path). Mapped memory in such a buffer still contains old
+ * bytes from an earlier pool use, so copying data->maxsize unconditionally
+ * resurrects stale pixels on screen.
  */
 static int
-apply_pw_buffer(PipewireCapture *capture, struct pw_buffer *pwbuf)
+copy_pw_buffer(PipewireCapture *capture, struct pw_buffer *pwbuf)
 {
     struct spa_buffer *buf = pwbuf ? pwbuf->buffer : NULL;
     if (!buf || buf->n_datas < 1)
@@ -274,86 +250,39 @@ apply_pw_buffer(PipewireCapture *capture, struct pw_buffer *pwbuf)
     if (!data->data || !chunk)
         return -1;
 
-    const size_t frame_row_bytes = (size_t)capture->width * 4u;
+    if ((chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) != 0 ||
+        chunk->size == 0)
+        return 0;
+
+    const size_t row_bytes = (size_t)capture->width * 4u;
     int32_t stride = chunk->stride;
     if (stride == 0)
-        stride = (int32_t)frame_row_bytes;
+        stride = (int32_t)row_bytes;
 
-    if (stride < (int32_t)frame_row_bytes || chunk->offset > data->maxsize)
+    if (stride < (int32_t)row_bytes ||
+        chunk->offset > data->maxsize)
         return -1;
 
     size_t needed =
-        (size_t)(capture->height - 1) * (size_t)stride + frame_row_bytes;
+        (size_t)(capture->height - 1) * (size_t)stride + row_bytes;
+
     if (needed > (size_t)data->maxsize - (size_t)chunk->offset)
         return -1;
 
-    struct spa_meta *damage_meta =
-        spa_buffer_find_meta(buf, SPA_META_VideoDamage);
+    if ((size_t)chunk->size < needed)
+        return -1;
 
-    if (!damage_meta) {
-        return copy_pw_region(capture,
-                              data,
-                              stride,
-                              0,
-                              0,
-                              capture->width,
-                              capture->height) == 0 ? 1 : -1;
+    const uint8_t *src =
+        (const uint8_t *)data->data + (size_t)chunk->offset;
+    uint8_t *dst = capture->scratch;
+
+    for (int y = 0; y < capture->height; y++) {
+        memcpy(dst + (size_t)y * row_bytes,
+               src + (size_t)y * (size_t)stride,
+               row_bytes);
     }
 
-    int regions_applied = 0;
-    struct spa_meta_region *meta_region;
-
-    spa_meta_for_each(meta_region, damage_meta) {
-        if (!spa_meta_region_is_valid(meta_region))
-            break;
-
-        int64_t x1 = meta_region->region.position.x;
-        int64_t y1 = meta_region->region.position.y;
-        int64_t x2 = x1 + (int64_t)meta_region->region.size.width;
-        int64_t y2 = y1 + (int64_t)meta_region->region.size.height;
-
-        if (x1 < 0)
-            x1 = 0;
-        if (y1 < 0)
-            y1 = 0;
-        if (x2 > capture->width)
-            x2 = capture->width;
-        if (y2 > capture->height)
-            y2 = capture->height;
-
-        if (x2 <= x1 || y2 <= y1)
-            continue;
-
-        if (copy_pw_region(capture,
-                           data,
-                           stride,
-                           (int)x1,
-                           (int)y1,
-                           (int)x2,
-                           (int)y2) < 0)
-            return -1;
-
-        regions_applied++;
-    }
-
-    if (regions_applied > 0)
-        return 1;
-
-    /*
-     * A first frame without usable damage cannot be reconstructed from prior
-     * state. Fall back to one full copy so startup remains deterministic.
-     */
-    if (capture->sample_sequence == 0) {
-        return copy_pw_region(capture,
-                              data,
-                              stride,
-                              0,
-                              0,
-                              capture->width,
-                              capture->height) == 0 ? 1 : -1;
-    }
-
-    return 0;
+    return 1;
 }
 
 static void
@@ -366,14 +295,17 @@ log_invalid_buffer(PipewireCapture *capture, struct pw_buffer *pwbuf)
 
     struct spa_buffer *buf = pwbuf ? pwbuf->buffer : NULL;
     struct spa_data *data = buf && buf->n_datas ? &buf->datas[0] : NULL;
+    struct spa_chunk *chunk = data ? data->chunk : NULL;
 
     fprintf(stderr,
             "[PIPEWIRE] unusable capture buffer: n_datas=%u "
-            "type=%u data=%p maxsize=%u\n",
+            "type=%u data=%p maxsize=%u chunk-size=%u chunk-flags=0x%x\n",
             buf ? buf->n_datas : 0,
             data ? data->type : 0,
             data ? data->data : NULL,
-            data ? data->maxsize : 0);
+            data ? data->maxsize : 0,
+            chunk ? chunk->size : 0,
+            chunk ? chunk->flags : 0);
 }
 
 static void
@@ -381,55 +313,49 @@ on_stream_process(void *userdata)
 {
     PipewireCapture *capture = userdata;
     struct pw_buffer *buffer;
-    int buffers_this_callback = 0;
     int valid_buffers = 0;
-    int pixel_state_changed = 0;
 
     capture->process_callbacks++;
 
     /*
-     * Drain every available capture buffer in order. We still publish only
-     * once per process callback, but each buffer's VideoDamage must first be
-     * applied to the persistent private framebuffer. Dropping an intermediate
-     * damage buffer before applying it could lose a region that is absent from
-     * the newest buffer's damage list.
-     *
-     * Every pw_buffer is returned immediately after its pixels are applied;
-     * no PipeWire buffer survives into FrameBridge/VNC processing.
+     * Drain everything currently available. Normal Mutter buffers contain a
+     * complete image, so copying each valid one leaves scratch holding the
+     * newest valid frame. Empty/corrupted buffers are recycled without ever
+     * touching scratch. No pw_buffer survives into FrameBridge/VNC work.
      */
     while ((buffer = pw_stream_dequeue_buffer(capture->stream)) != NULL) {
         capture->dequeued_buffers++;
 
-        int apply_result = apply_pw_buffer(capture, buffer);
+        int copy_result = copy_pw_buffer(capture, buffer);
+
+        if (copy_result < 0)
+            log_invalid_buffer(capture, buffer);
 
         /* Critical invariant: recycle before FrameBridge/VNC work. */
         pw_stream_queue_buffer(capture->stream, buffer);
 
-        if (buffers_this_callback > 0)
-            capture->stale_buffers_recycled++;
-        buffers_this_callback++;
-
-        if (apply_result < 0) {
-            log_invalid_buffer(capture, buffer);
+        if (copy_result == 0) {
+            capture->empty_buffers++;
             continue;
         }
 
+        if (copy_result < 0)
+            continue;
+
+        if (valid_buffers > 0)
+            capture->stale_buffers_recycled++;
+
         valid_buffers++;
-        if (apply_result > 0)
-            pixel_state_changed = 1;
     }
 
     if (valid_buffers == 0)
         return;
 
     record_frame_interval(capture);
+
     pipeline_stats_capture(capture->stats,
                            (size_t)capture->width *
                            (size_t)capture->height * 4u);
-
-    /* No pixel damage: keep capture telemetry, but do not manufacture a VNC frame. */
-    if (!pixel_state_changed)
-        return;
 
     if (frame_bridge_publish_bgrx(capture->bridge,
                                   capture->scratch,
@@ -467,19 +393,24 @@ wait_for_first_frame(PipewireCapture *capture, int timeout_ms)
     }
 
     pthread_mutex_lock(&capture->mutex);
+
     while (!capture->first_frame && !capture->failed) {
         int rc = pthread_cond_timedwait(&capture->cond,
                                         &capture->mutex,
                                         &deadline);
+
         if (rc == ETIMEDOUT)
             break;
+
         if (rc != 0) {
             capture->failed = 1;
             break;
         }
     }
+
     int ok = capture->first_frame && !capture->failed;
     pthread_mutex_unlock(&capture->mutex);
+
     return ok ? 0 : -1;
 }
 
@@ -502,6 +433,7 @@ pipewire_capture_start(PipewireCapture *capture,
 
     if (pthread_mutex_init(&capture->mutex, NULL) != 0)
         return -1;
+
     if (pthread_cond_init(&capture->cond, NULL) != 0) {
         pthread_mutex_destroy(&capture->mutex);
         return -1;
@@ -517,7 +449,7 @@ pipewire_capture_start(PipewireCapture *capture,
     capture->capture_trace = capture_trace;
     capture->capture_stall_ms = capture_stall_ms;
 
-    capture->scratch = calloc((size_t)width * (size_t)height, 4u);
+    capture->scratch = malloc((size_t)width * (size_t)height * 4u);
     if (!capture->scratch)
         goto fail;
 
@@ -525,12 +457,14 @@ pipewire_capture_start(PipewireCapture *capture,
 
     capture->loop = pw_thread_loop_new("vnc-monitor-pipewire", NULL);
     if (!capture->loop) {
-        fprintf(stderr, "Failed to create PipeWire thread loop\n");
+        fprintf(stderr,
+                "Failed to create PipeWire thread loop\n");
         goto fail;
     }
 
     uint8_t pod_buffer[1024];
-    struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(pod_buffer, sizeof(pod_buffer));
+    struct spa_pod_builder builder =
+        SPA_POD_BUILDER_INIT(pod_buffer, sizeof(pod_buffer));
     const struct spa_pod *params[1];
 
     params[0] = spa_pod_builder_add_object(
@@ -539,8 +473,8 @@ pipewire_capture_start(PipewireCapture *capture,
         SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
         SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
         SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
-        SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&SPA_RECTANGLE((uint32_t)width,
-                                                                  (uint32_t)height)));
+        SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(
+            &SPA_RECTANGLE((uint32_t)width, (uint32_t)height)));
 
     struct pw_properties *props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Video",
@@ -550,7 +484,8 @@ pipewire_capture_start(PipewireCapture *capture,
         NULL);
 
     if (!props) {
-        fprintf(stderr, "Failed to create PipeWire properties\n");
+        fprintf(stderr,
+                "Failed to create PipeWire properties\n");
         goto fail;
     }
 
@@ -559,7 +494,8 @@ pipewire_capture_start(PipewireCapture *capture,
     if (pw_thread_loop_start(capture->loop) < 0) {
         pw_thread_loop_unlock(capture->loop);
         pw_properties_free(props);
-        fprintf(stderr, "Failed to start PipeWire thread loop\n");
+        fprintf(stderr,
+                "Failed to start PipeWire thread loop\n");
         goto fail;
     }
 
@@ -572,7 +508,8 @@ pipewire_capture_start(PipewireCapture *capture,
 
     if (!capture->stream) {
         pw_thread_loop_unlock(capture->loop);
-        fprintf(stderr, "Failed to create native PipeWire stream\n");
+        fprintf(stderr,
+                "Failed to create native PipeWire stream\n");
         goto fail;
     }
 
@@ -596,8 +533,9 @@ pipewire_capture_start(PipewireCapture *capture,
 
     fprintf(stderr,
             "[CAPTURE] backend: native PipeWire (target node=%u)\n"
-            "[CAPTURE] policy: drain all VideoDamage into persistent BGRx, "
-            "publish latest once, recycle pw_buffer before FrameBridge publish\n",
+            "[CAPTURE] policy: drain-to-latest complete BGRx, ignore "
+            "empty/corrupted chunks, recycle pw_buffer before "
+            "FrameBridge publish\n",
             node_id);
 
     if (wait_for_first_frame(capture, timeout_ms) < 0) {
@@ -608,7 +546,10 @@ pipewire_capture_start(PipewireCapture *capture,
     }
 
     printf("Native PipeWire capture started: node=%u, %dx%d BGRx\n",
-           node_id, width, height);
+           node_id,
+           width,
+           height);
+
     return 0;
 
 fail:
@@ -624,11 +565,13 @@ pipewire_capture_stop(PipewireCapture *capture)
 
     if (capture->loop) {
         pw_thread_loop_lock(capture->loop);
+
         if (capture->stream) {
             pw_stream_disconnect(capture->stream);
             pw_stream_destroy(capture->stream);
             capture->stream = NULL;
         }
+
         pw_thread_loop_unlock(capture->loop);
         pw_thread_loop_stop(capture->loop);
         pw_thread_loop_destroy(capture->loop);
