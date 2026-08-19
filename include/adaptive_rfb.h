@@ -6,7 +6,7 @@
 #include <rfb/rfb.h>
 
 #define ADAPTIVE_RFB_JPEG_ENCODING            21
-#define ADAPTIVE_RFB_JPEG_QUALITY             80
+#define ADAPTIVE_RFB_JPEG_QUALITY             55
 #define ADAPTIVE_RFB_JPEG_THRESHOLD_PERCENT   25.0
 #define ADAPTIVE_RFB_REPAIR_TILE_SIZE         32
 #define ADAPTIVE_RFB_REPAIR_BUDGET_KBPS       4096
