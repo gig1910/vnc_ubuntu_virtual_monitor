@@ -122,15 +122,17 @@ uninstall-pam-service:
 	sudo systemctl daemon-reload
 	@echo 'VNC Monitor PAM/systemd support removed.'
 
-# V20 has no redraw helper. Runtime support is only the PAM auth helper/socket.
+# Since 0.0.19 there is no redraw helper. Runtime support is only the PAM
+# authentication helper/socket.
 install-support: install-pam-service
 
 status-support: pam-service-status
 
 uninstall-support: uninstall-pam-service
 
-# Remove artifacts left by the V17/V18 redraw/HW-cursor diagnostics.
-# This intentionally keeps vnc-monitor-auth.socket/service because V20 uses them.
+# Remove artifacts left by the 0.0.17/0.0.18 redraw/HW-cursor diagnostics.
+# This intentionally keeps vnc-monitor-auth.socket/service because it is part
+# of the current authentication path.
 cleanup-obsolete-support:
 	./tools/cleanup-obsolete-support.sh
 
