@@ -40,6 +40,7 @@ typedef struct {
     uint64_t process_callbacks;
     uint64_t dequeued_buffers;
     uint64_t stale_buffers_recycled;
+    uint64_t empty_buffers;
     uint64_t invalid_buffers;
 
     int initialized;
