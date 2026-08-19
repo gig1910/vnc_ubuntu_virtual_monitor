@@ -93,6 +93,49 @@ signal_ready(
     pthread_mutex_unlock(&backend->mutex);
 }
 
+/*
+ * The relay thread updates these queue counters from the actual sockets.
+ * The publisher uses them only as a coarse backpressure signal. The point is
+ * not to estimate bandwidth perfectly; it is to stop manufacturing stale RFB
+ * work while the already-produced update stream is visibly queued.
+ */
+static int
+transport_backpressured(
+    PipelineStats *stats,
+    const RuntimeConfig *cfg,
+    int *external_outq,
+    int *backend_inq,
+    uint32_t *unacked)
+{
+    if (!stats || !stats->initialized)
+        return 0;
+
+    pthread_mutex_lock(&stats->mutex);
+
+    int ext = stats->external_outq_current;
+    int back = stats->backend_inq_current;
+    uint32_t ua = stats->tcp_unacked_current;
+
+    pthread_mutex_unlock(&stats->mutex);
+
+    if (external_outq)
+        *external_outq = ext;
+    if (backend_inq)
+        *backend_inq = back;
+    if (unacked)
+        *unacked = ua;
+
+    /*
+     * Linux commonly reports effective socket buffers larger than the value
+     * requested with SO_SNDBUF/SO_RCVBUF. Using the requested size as the
+     * threshold intentionally reacts before the kernel queues become full.
+     */
+    return
+        (ext >= cfg->external_send_buffer) ||
+        (back >= cfg->backend_receive_buffer) ||
+        (ua >= 24);
+}
+
 static void *
 backend_thread(void *arg)
 {
@@ -137,14 +180,6 @@ backend_thread(void *arg)
 
     screen->frameBuffer = (char *)fb;
 
-    /*
-     * Explicit native framebuffer format: BGRx in memory on little-endian
-     * machines, matching the PipeWire format we will later use.
-     *
-     * Do not rely on LibVNCServer defaults here: the old iPad client changes
-     * requested pixel format during connection setup (8 bpp -> 32 bpp), and
-     * LibVNCServer will translate from this fixed server format.
-     */
     screen->serverFormat.bitsPerPixel = 32;
     screen->serverFormat.depth = 24;
     screen->serverFormat.bigEndian = FALSE;
@@ -156,9 +191,6 @@ backend_thread(void *arg)
     screen->serverFormat.greenShift = 8;
     screen->serverFormat.blueShift = 0;
 
-    /*
-     * Internal backend is never exposed to the LAN.
-     */
     struct in_addr backend_addr;
 
     if (
@@ -186,16 +218,9 @@ backend_thread(void *arg)
     screen->port = cfg->backend_port;
     screen->ipv6port = -1;
 
-    /*
-     * No backend password. Authentication is performed by
-     * the RA2r front-end before this local connection exists.
-     */
     screen->passwordCheck = NULL;
     screen->authPasswdData = NULL;
 
-    /*
-     * Strict server-side view-only.
-     */
     if (cfg->view_only) {
         screen->kbdAddEvent = ignore_keyboard;
         screen->ptrAddEvent = ignore_pointer;
@@ -206,18 +231,11 @@ backend_thread(void *arg)
     screen->permitFileTransfer = cfg->enable_file_transfer ? TRUE : FALSE;
 
     screen->alwaysShared = TRUE;
-
-    /*
-     * Previously validated low-latency settings.
-     */
     screen->deferUpdateTime = 0;
     screen->progressiveSliceHeight = 0;
     screen->maxRectsPerUpdate = 0;
 
-    if (
-        cfg->source_mode ==
-        FRAME_SOURCE_TEST
-    ) {
+    if (cfg->source_mode == FRAME_SOURCE_TEST) {
         test_pattern_reset();
         test_pattern_init(fb, cfg);
     }
@@ -251,6 +269,16 @@ backend_thread(void *arg)
     uint64_t observed_bridge_sequence = 0;
     int pending_source_frame = 0;
     double next_vnc_publish = 0.0;
+
+    /* 0.0.21: latest-only governor + full-frame resync policy. */
+    int force_keyframe = cfg->keyframe ? 1 : 0;
+    const char *keyframe_reason = "initial";
+    double last_keyframe_at = start;
+    double last_source_arrival = 0.0;
+    int backpressure_active = 0;
+    uint64_t backpressure_events = 0;
+    uint64_t keyframes = 0;
+    uint64_t dropped_source_frames = 0;
 
     size_t max_diff_rects =
         (size_t)(
@@ -291,10 +319,7 @@ backend_thread(void *arg)
                 now = monotonic_seconds();
             }
 
-            if (
-                now - next_frame >
-                frame_interval * 2.0
-            )
+            if (now - next_frame > frame_interval * 2.0)
                 next_frame = now;
 
             next_frame += frame_interval;
@@ -320,14 +345,8 @@ backend_thread(void *arg)
                 pattern.dirty_y2 > pattern.dirty_y1
             ) {
                 dirty_pixels =
-                    (uint64_t)(
-                        pattern.dirty_x2 -
-                        pattern.dirty_x1
-                    ) *
-                    (uint64_t)(
-                        pattern.dirty_y2 -
-                        pattern.dirty_y1
-                    );
+                    (uint64_t)(pattern.dirty_x2 - pattern.dirty_x1) *
+                    (uint64_t)(pattern.dirty_y2 - pattern.dirty_y1);
 
                 rfbMarkRectAsModified(
                     screen,
@@ -338,10 +357,7 @@ backend_thread(void *arg)
                 );
             }
 
-            benchmark_set_stage(
-                pattern.stage,
-                pattern.square_size
-            );
+            benchmark_set_stage(pattern.stage, pattern.square_size);
 
             double rfb_started = benchmark_now();
             rfbProcessEvents(screen, 0);
@@ -364,15 +380,6 @@ backend_thread(void *arg)
             continue;
         }
 
-        /*
-         * Real Mutter source: source-driven publisher.
-         *
-         * No new FrameBridge sequence => no diff, no framebuffer copy and no
-         * VNC publish work. We only wake periodically (max 20 ms) to service
-         * RFB client messages and report stats. If --vnc-fps is non-zero it
-         * limits consumption of NEW source frames; it never manufactures
-         * timer-driven publishes of the same framebuffer.
-         */
         double now = monotonic_seconds();
         int wait_ms = 20;
 
@@ -413,8 +420,20 @@ backend_thread(void *arg)
                 );
             }
             else if (changed > 0) {
-                observed_bridge_sequence =
-                    current_sequence;
+                double arrived = monotonic_seconds();
+
+                if (
+                    last_source_arrival > 0.0 &&
+                    (arrived - last_source_arrival) * 1000.0 >=
+                        (double)cfg->capture_stall_ms &&
+                    cfg->keyframe
+                ) {
+                    force_keyframe = 1;
+                    keyframe_reason = "capture-stall";
+                }
+
+                last_source_arrival = arrived;
+                observed_bridge_sequence = current_sequence;
                 pending_source_frame = 1;
             }
         }
@@ -440,6 +459,79 @@ backend_thread(void *arg)
             continue;
         }
 
+        if (
+            cfg->keyframe &&
+            !force_keyframe &&
+            (now - last_keyframe_at) * 1000.0 >=
+                (double)cfg->keyframe_interval_ms
+        ) {
+            force_keyframe = 1;
+            keyframe_reason = "periodic";
+        }
+
+        if (
+            cfg->keyframe &&
+            cfg->keyframe_after_drop &&
+            observed_bridge_sequence > last_bridge_sequence + 1
+        ) {
+            force_keyframe = 1;
+            keyframe_reason = "source-drop";
+        }
+
+        int external_outq = 0;
+        int backend_inq = 0;
+        uint32_t unacked = 0;
+        int pressured =
+            transport_backpressured(
+                backend->stats,
+                cfg,
+                &external_outq,
+                &backend_inq,
+                &unacked
+            );
+
+        if (cfg->latest_only && pressured) {
+            if (!backpressure_active) {
+                backpressure_active = 1;
+                backpressure_events++;
+
+                if (cfg->verbose) {
+                    fprintf(
+                        stderr,
+                        "[GOV] backpressure: defer publish, keep latest only "
+                        "outq=%dB backend_inq=%dB unacked=%u\n",
+                        external_outq,
+                        backend_inq,
+                        unacked
+                    );
+                }
+            }
+
+            /*
+             * Do not consume FrameBridge here. fb therefore remains the last
+             * submitted client reference state. When the queues recover we
+             * diff (or keyframe) directly from that state to the newest frame.
+             */
+            if (cfg->keyframe && cfg->keyframe_after_drop) {
+                force_keyframe = 1;
+                keyframe_reason = "backpressure";
+            }
+
+            pipeline_stats_maybe_report(backend->stats);
+            continue;
+        }
+
+        if (backpressure_active) {
+            backpressure_active = 0;
+
+            if (cfg->verbose) {
+                fprintf(
+                    stderr,
+                    "[GOV] backpressure cleared: publishing newest frame\n"
+                );
+            }
+        }
+
         uint64_t sequence_before =
             last_bridge_sequence;
 
@@ -449,8 +541,48 @@ backend_thread(void *arg)
         int published_rect_count = 0;
         uint64_t published_pixels = 0;
         uint64_t dirty_pixels = 0;
+        int emitted_keyframe = 0;
 
-        if (cfg->diff_detect) {
+        if (force_keyframe && cfg->keyframe) {
+            int changed =
+                frame_bridge_consume(
+                    backend->frames,
+                    fb,
+                    &last_bridge_sequence
+                );
+
+            if (changed > 0) {
+                rfbMarkRectAsModified(
+                    screen,
+                    0,
+                    0,
+                    cfg->width,
+                    cfg->height
+                );
+
+                published_rect_count = 1;
+                published_pixels =
+                    (uint64_t)cfg->width *
+                    (uint64_t)cfg->height;
+                dirty_pixels = published_pixels;
+                emitted_keyframe = 1;
+                keyframes++;
+                last_keyframe_at = now;
+
+                fprintf(
+                    stderr,
+                    "[KF] seq=%llu reason=%s full=%dx%d\n",
+                    (unsigned long long)last_bridge_sequence,
+                    keyframe_reason ? keyframe_reason : "resync",
+                    cfg->width,
+                    cfg->height
+                );
+            }
+
+            force_keyframe = 0;
+            keyframe_reason = NULL;
+        }
+        else if (cfg->diff_detect) {
             int rect_count =
                 frame_diff_consume(
                     backend->frames,
@@ -464,8 +596,7 @@ backend_thread(void *arg)
             if (rect_count < 0) {
                 fprintf(
                     stderr,
-                    "Frame diff detection failed; "
-                    "falling back to full-frame copy\n"
+                    "Frame diff detection failed; falling back to full-frame copy\n"
                 );
 
                 int changed =
@@ -488,14 +619,12 @@ backend_thread(void *arg)
                     published_pixels =
                         (uint64_t)cfg->width *
                         (uint64_t)cfg->height;
-                    dirty_pixels =
-                        published_pixels;
+                    dirty_pixels = published_pixels;
                 }
             }
             else {
                 for (int i = 0; i < rect_count; i++) {
-                    FrameDiffRect *rect =
-                        &diff_rects[i];
+                    FrameDiffRect *rect = &diff_rects[i];
 
                     rfbMarkRectAsModified(
                         screen,
@@ -506,14 +635,8 @@ backend_thread(void *arg)
                     );
 
                     uint64_t rect_pixels =
-                        (uint64_t)(
-                            rect->x2 -
-                            rect->x1
-                        ) *
-                        (uint64_t)(
-                            rect->y2 -
-                            rect->y1
-                        );
+                        (uint64_t)(rect->x2 - rect->x1) *
+                        (uint64_t)(rect->y2 - rect->y1);
 
                     dirty_pixels += rect_pixels;
                     published_pixels += rect_pixels;
@@ -547,11 +670,6 @@ backend_thread(void *arg)
             }
         }
 
-        /*
-         * frame_diff_consume/frame_bridge_consume consume the latest sequence,
-         * not the sequence that first woke us. This intentionally collapses
-         * source bursts while a rate limit is active.
-         */
         observed_bridge_sequence =
             last_bridge_sequence;
         pending_source_frame = 0;
@@ -576,6 +694,9 @@ backend_thread(void *arg)
                 ? last_bridge_sequence - sequence_before
                 : 0;
 
+        if (sequence_delta > 1)
+            dropped_source_frames += sequence_delta - 1;
+
         double diff_ms =
             (pipeline_stats_now() - diff_started) * 1000.0;
 
@@ -597,9 +718,25 @@ backend_thread(void *arg)
             rfb_ms
         );
 
-        pipeline_stats_maybe_report(
-            backend->stats
-        );
+        if (cfg->latency_trace) {
+            fprintf(
+                stderr,
+                "[LATENCY] seq=%llu source_delta=%llu dropped=%llu "
+                "keyframe=%s diff=%.3fms rfb=%.3fms "
+                "outq=%dB backend_inq=%dB unacked=%u\n",
+                (unsigned long long)last_bridge_sequence,
+                (unsigned long long)sequence_delta,
+                (unsigned long long)(sequence_delta > 1 ? sequence_delta - 1 : 0),
+                emitted_keyframe ? "yes" : "no",
+                diff_ms,
+                rfb_ms,
+                external_outq,
+                backend_inq,
+                unacked
+            );
+        }
+
+        pipeline_stats_maybe_report(backend->stats);
 
         benchmark_record_frame(
             dirty_pixels,
@@ -610,6 +747,14 @@ backend_thread(void *arg)
 
         benchmark_maybe_report();
     }
+
+    fprintf(
+        stderr,
+        "[GOV][SUMMARY] keyframes=%llu backpressure-events=%llu dropped-source=%llu\n",
+        (unsigned long long)keyframes,
+        (unsigned long long)backpressure_events,
+        (unsigned long long)dropped_source_frames
+    );
 
     rfbShutdownServer(screen, TRUE);
     rfbScreenCleanup(screen);
