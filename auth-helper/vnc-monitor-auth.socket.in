@@ -1,0 +1,13 @@
+[Unit]
+Description=VNC Monitor PAM authentication socket
+
+[Socket]
+ListenStream=/run/vnc-monitor-auth.sock
+SocketUser=@SOCKET_USER@
+SocketGroup=@SOCKET_GROUP@
+SocketMode=0600
+Accept=yes
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
