@@ -1,20 +1,14 @@
-# VNC Monitor Server V20
+# VNC Ubuntu Virtual Monitor
 
-**V20:** native libpipewire capture is now the default for Mutter RecordVirtual.
-The capture callback drains to the newest buffer, copies BGRx into private memory,
-recycles the `pw_buffer` immediately, and only then publishes to FrameBridge.
-Use `--capture-backend gstreamer` for the V19 comparison path. See `V20_TEST.md`.
+Current development version: **0.0.21**.
 
-# VNC Monitor modular RA2r test
+This project exposes a true virtual monitor from the current GNOME Wayland session to an old VNC client. The target use case is an old iPad used strictly as an additional display, not as an input/control surface.
 
-## V19 PipeWire buffer ownership fix
+The previous V20 naming is normalized to **0.0.20**. Git tags should use the usual `v` prefix, for example `v0.0.20`, while the program version itself is `0.0.20` / `0.0.21`.
 
-V19 fixes the RecordVirtual/PipeWire buffer-starvation path by detaching/copying producer buffers inside `pipewiresrc` before downstream processing. The obsolete forced-redraw GNOME Shell helper has been removed. See `V19_TEST.md`.
+## Architecture
 
-
-Current test architecture:
-
-```
+```text
 iPad VNC client
     |
     | RFB 3.8 + RA2r / AES-128-EAX
@@ -22,448 +16,120 @@ iPad VNC client
     v
 RA2r front-end :5901
     |
-    | local auth request
     +----> /run/vnc-monitor-auth.sock
-    |          root PAM helper
+    |          privileged PAM helper
     |
     | plain RFB on loopback only
     v
 LibVNCServer backend 127.0.0.1:5903
     |
-    +--> 1024x768 dynamic test framebuffer, max 60 FPS
+    v
+latest-only VNC publisher / periodic full-frame resync
+    |
+    v
+FrameBridge
+    ^
+    |
+native PipeWire consumer
+    ^
+    |
+Mutter RecordVirtual
+    ^
+    |
+current GNOME Wayland session
 ```
 
-## V16 source-driven publisher / shutdown hardening
+The virtual monitor exists only while an authenticated VNC client is connected.
 
-V16 keeps the V15 `GstSample` stall diagnostics but changes the real-monitor
-VNC publisher to **source-driven** operation. The default `--vnc-fps source`
-means that diff/VNC work only happens for a genuinely new FrameBridge sequence;
-there is no periodic reprocessing of an unchanged framebuffer. Numeric
-`--vnc-fps N` values are now only ceilings for new source frames.
+## 0.0.21
 
-V16 added `--mutter-hardware-cursor auto|enabled|disabled` and verifies the actual startup
-environment of the running `gnome-shell`. V19 restores its default to `auto`; the old
-`MUTTER_DEBUG_DISABLE_HW_CURSORS=1` workaround is no longer part of the normal setup.
-Ctrl+C retains the socket shutdown supervisor and second-Ctrl+C emergency `_exit`.
-See `V16_TEST.md`.
+0.0.21 keeps the native libpipewire capture backend introduced in 0.0.20 and adds a downstream freshness policy.
 
-## V15 capture-stall diagnostics
-
-V15 added instrumentation at the incoming `GstSample` boundary. Use
-`--capture-trace on` for per-sample timing and `--capture-stall-ms N` to choose
-the stall threshold (default 500 ms). The server also prints the matching
-Mutter DisplayConfig mode/refresh and a capture interval histogram at shutdown.
-See `V15_TEST.md`.
-
-
-## Modules
-
-- `src/ra2.c` — RA2r handshake, EAX record layer and re-key.
-- `src/auth_client.c` — client of the privileged PAM helper.
-- `src/rfb_proxy.c` — encrypted RA2r ↔ local plain-RFB relay.
-- `src/rfb_backend.c` — loopback-only LibVNCServer backend.
-- `src/test_pattern.c` — synthetic 1024×768 60 FPS test pattern.
-- `src/io.c` — basic exact socket I/O.
-- `auth-helper/` — already-tested root PAM helper and systemd socket units.
-
-The LibVNCServer backend remains strict server-side view-only:
-keyboard, pointer/touch and client clipboard callbacks are no-op, file transfer is disabled.
-
-## Build
-
-```bash
-make -j20
-```
-
-Expected dependencies are the same ones already tested:
-
-- libvncserver-dev
-- OpenSSL development files
-- Nettle development files
-- pthreads
-
-The PAM helper is separate and is not linked into the VNC process.
-
-## PAM/systemd authentication helper
-
-Build/render it for the current user without changing the system:
-
-```bash
-make pam-service
-```
-
-Install the helper, `/etc/pam.d/vnc-monitor`, and the systemd socket/service, then enable the socket:
-
-```bash
-make install-pam-service
-```
-
-The target invokes `sudo` only where root access is needed. Do not run the whole Make process with `sudo`, because the generated socket owner is derived from the invoking user. Override explicitly if necessary with `AUTH_SOCKET_USER=... AUTH_SOCKET_GROUP=...`.
-
-Status:
-
-```bash
-make pam-service-status
-```
-
-Install the runtime support component (PAM authentication):
-
-```bash
-make install-support
-```
-
-V19 has no redraw-helper support component.
-
-## Run
-
-The PAM socket/helper should be active:
-
-```bash
-make pam-service-status
-```
-
-Then:
-
-```bash
-./vnc-monitor-test
-```
-
-Connect the iPad to the laptop's LAN IP on port `5901`.
-
-Expected log milestones:
-
-```
-Internal LibVNCServer backend: 127.0.0.1:5903
-RA2r VNC front-end listening on TCP port 5901
-External client connected: ...
-Security type selected: 13 (RA2r)
-RA2r credentials received for user "gig"
-RA2r + auth-helper handshake complete for "gig"
-Encrypted ClientInit received (shared=1)
-RA2r <-> LibVNCServer stream relay started
-```
-
-At that point the iPad should show the same dynamic test picture, but the externally visible RFB session is RA2r-encrypted and authenticated using the Ubuntu account.
-
-## Security boundary
-
-The backend is bound to `127.0.0.1` only and uses RFB security type `None` internally. It is intentionally not reachable from the LAN.
-
-The privileged helper checks `SO_PEERCRED` and only permits a local process to authenticate the Unix username that owns that process.
-
-## Next step
-
-Once this test is confirmed on the iPad, replace only `test_pattern` / framebuffer production with the Mutter + PipeWire + GStreamer appsink source. The RA2r, PAM helper, proxy and LibVNCServer view-only layers remain separate modules.
-
-
-## v2: persistent RA2 identity + explicit colour format
-
-This revision fixes two observations from the first integrated test.
-
-### Stable RA2 server signature
-
-The first version generated a new RSA server key for every TCP connection.
-That makes an RA2-capable VNC Viewer see a different server signature on
-reconnect.
-
-The key is now generated only once and stored in the current directory:
+### Native PipeWire capture remains the default
 
 ```text
-./ra2-server-key.pem
+--capture-backend pipewire
 ```
 
-The file is created with mode `0600` and loaded on subsequent connections.
-Do not delete it unless you intentionally want to change the server identity.
+The PipeWire callback drains to the newest available buffer, copies BGRx to owned memory and immediately recycles the `pw_buffer` before downstream VNC work.
 
-The first connection after upgrading to this revision may still warn because
-the previous test used an ephemeral key. After the new key is accepted once,
-future reconnects should see the same signature.
-
-### Colour diagnostic
-
-The LibVNCServer source framebuffer format is now explicitly fixed to:
-
-```text
-32 bpp, depth 24, little endian
-R shift 16, G shift 8, B shift 0
-```
-
-The synthetic test image is intentionally high-saturation RGB bars plus a
-moving coloured grid square. This makes any colour-format problem visually
-obvious.
-
-The old iPad client may still temporarily request:
-
-```text
-8 bpp, depth 6
-```
-
-and later switch to:
-
-```text
-32 bpp, depth 24
-```
-
-LibVNCServer is expected to translate both from the fixed 32-bit server
-framebuffer format.
-
-
-## v3: old-client RA2 stream compatibility diagnostic
-
-The persistent server identity from v2 is retained.
-
-The remaining reconnect loop occurs only after the encrypted RFB data stream
-has started, so v3 narrows the test to the RA2 transport layer.
-
-For normal post-auth RFB traffic, the proxy now limits each RA2 encrypted
-record payload to 4096 bytes:
-
-```text
-RA2_STREAM_RECORD_MAX = 4096
-```
-
-The RFB/RA2 specification allows arbitrary independent RA2 record boundaries,
-but this old iPad VNC client may have a smaller practical encrypted-record
-buffer than the protocol's U16 maximum. 4096 is deliberately conservative for
-this compatibility test.
-
-The relay also logs the exact direction/reason when it stops and record/byte
-counters. If the client still reconnects, preserve the final lines such as:
-
-```text
-RA2 relay stopped while receiving from client ...
-EAX authentication tag mismatch ...
-RA2 relay stopped while sending to client ...
-LibVNCServer backend closed the relay ...
-```
-
-If 4096-byte records make the connection stable, we can later benchmark
-8192/16384/32768 and keep the largest stable value.
-
-
-## v4: runtime configuration
-
-Most test/runtime parameters are now command-line options. Recompilation is
-not required to change transport sizes or compatibility switches.
-
-Show all options:
+The previous GStreamer path remains available only for A/B diagnostics:
 
 ```bash
-./vnc-monitor-test --help
+./vnc-monitor-test --capture-backend gstreamer
 ```
 
-Show resolved defaults:
-
-```bash
-./vnc-monitor-test --show-config
-```
-
-Useful transport tests:
-
-```bash
-./vnc-monitor-test --ra2-record-size 1024
-./vnc-monitor-test --ra2-record-size 2048
-./vnc-monitor-test --ra2-record-size 8192
-```
-
-Useful RFB compatibility tests:
-
-```bash
-./vnc-monitor-test --zrle off --raw on
-./vnc-monitor-test --cursor off
-./vnc-monitor-test --newfbsize off
-./vnc-monitor-test --zrle off --raw on --cursor off --newfbsize off
-```
-
-Framebuffer/runtime tests:
-
-```bash
-./vnc-monitor-test --fps 30
-./vnc-monitor-test --width 1024 --height 768 --fps 60
-```
-
-Security-related defaults remain conservative:
+### Latest-only downstream governor
 
 ```text
-view-only=on
-clipboard=off
-file-transfer=off
-backend-bind=127.0.0.1
+--latest-only on
 ```
 
-They are exposed as switches for controlled testing, but the defaults should
-remain the production defaults.
+When the RA2/backend transport is visibly backpressured, the VNC publisher does not consume intermediate FrameBridge states. It keeps the LibVNCServer framebuffer as the client reference state and waits until the transport recovers. It then consumes the newest available source frame directly.
 
+This avoids deliberately building a queue of stale desktop states.
 
-## v5: reliable Ctrl-C / SIGTERM shutdown
+### Full-frame keyframes / resync
 
-The previous versions used a process flag while the main thread could remain
-blocked in `accept()` and the active proxy could remain blocked in `select()`.
-In a multi-threaded process this was not a reliable shutdown mechanism.
-
-v5 adds a dedicated `shutdown_signal` module using the self-pipe pattern:
-
-```text
-SIGINT / SIGTERM
-      |
-      v
-async-signal-safe write()
-      |
-      v
-self-pipe
-      |
-      +--> listener select()
-      |
-      +--> active relay select()
-```
-
-Therefore a single Ctrl-C wakes either state immediately:
-
-- waiting for a new VNC connection;
-- relaying an active RA2r session.
-
-Expected shutdown log:
-
-```text
-^C
-Shutdown requested; stopping active RA2 relay
-External client disconnected
-Stopping VNC monitor test...
-Stopped.
-```
-
-No repeated Ctrl-C should be necessary.
-
-
-## v6: benchmark subsystem
-
-A separate `benchmark` module now records per-interval workload, LibVNCServer
-processing and RA2 transport metrics. See `BENCHMARK.md`.
-
-Quick start:
-
-```bash
-./vnc-monitor-test \
-  --ra2-record-size 32768 \
-  --benchmark suite \
-  --benchmark-step 5 \
-  --benchmark-csv bench-32768.csv
-```
-
-
-## v7: RA2 stream coalescing
-
-The benchmark remains a normal module of the main project and is disabled by
-default. Enable it only with `--benchmark ...`.
-
-The server-to-client path now uses `ra2_stream_coalescer` between the local
-LibVNCServer backend and `ra2_send_record()`.
+VNC does not have H.264 I-frames, so the equivalent used here is a full framebuffer update.
 
 Defaults:
 
 ```text
---ra2-record-size 32768
---ra2-coalesce on
---ra2-coalesce-us 500
+--keyframe on
+--keyframe-interval-ms 2000
+--keyframe-after-drop on
 ```
 
-A/B tests require no rebuild:
+A full-frame resync is forced:
 
-```bash
-./vnc-monitor-test \
-  --ra2-record-size 32768 \
-  --ra2-coalesce off
-```
+- for the initial real frame;
+- periodically, on the next available source frame after the configured interval;
+- after source-frame collapse/drop;
+- after downstream backpressure;
+- after a detected capture stall.
 
-```bash
-./vnc-monitor-test \
-  --ra2-record-size 32768 \
-  --ra2-coalesce on \
-  --ra2-coalesce-us 0
-```
+The important correctness rule is that the local LibVNCServer framebuffer is not advanced while stale source states are being dropped. Therefore the next diff is always calculated from the last submitted client-reference state to the newest source state. A full resync is additionally used after drops/backpressure to eliminate any possibility of accumulated visual artifacts.
 
-```bash
-./vnc-monitor-test \
-  --ra2-record-size 32768 \
-  --ra2-coalesce on \
-  --ra2-coalesce-us 500
-```
-
-`0 us` still drains all data already queued in the loopback socket; it simply
-does not add a deliberate aggregation window.
-
-Benchmark output now includes:
+Keyframe diagnostics look like:
 
 ```text
-bread=.../s     backend reads per second
-bavg=...B       average backend read size
-rec=.../s       RA2 records per second
-avg=...B        average RA2 record payload
-coal=...x       backend-read / RA2-record coalescing ratio
+[KF] seq=1234 reason=periodic full=1024x768
+[KF] seq=1301 reason=backpressure full=1024x768
+[KF] seq=1408 reason=capture-stall full=1024x768
 ```
 
-A healthy coalescer should move `avg` from the previous ~8 bytes toward KBs
-while dramatically reducing `rec`.
-
-
-## v8: real GNOME Wayland virtual monitor
-
-The default source is now the real virtual monitor in the *current* GNOME
-Wayland session:
-
-```bash
-./vnc-monitor-test
-```
-
-Lifecycle:
+The governor reports transitions such as:
 
 ```text
-no VNC client
-    -> no Mutter virtual monitor
-
-authenticated VNC client
-    -> RemoteDesktop.CreateSession
-    -> ScreenCast.CreateSession(remote-desktop-session-id=...)
-    -> RecordVirtual(cursor-mode=1, is-platform=true)
-    -> RemoteDesktop.Session.Start
-    -> PipeWireStreamAdded(node_id)
-    -> resolve node_id -> object.serial
-    -> GStreamer pipewiresrc
-    -> BGRx 1024x768
-    -> FrameBridge
-    -> LibVNCServer
-    -> RA2r
-    -> iPad
-
-client disconnect
-    -> stop GStreamer
-    -> RemoteDesktop.Session.Stop
-    -> virtual monitor disappears
+[GOV] backpressure: defer publish, keep latest only ...
+[GOV] backpressure cleared: publishing newest frame
 ```
 
-For the old synthetic source:
-
-```bash
-./vnc-monitor-test --source test
-```
-
-The current real-screen path deliberately marks a whole 1024x768 frame dirty
-when a new PipeWire frame arrives. This is the simplest correctness-first
-implementation. Damage propagation and zero-copy/copy reduction are deferred
-until the end-to-end real monitor is validated.
-
-Current compatibility defaults:
+and prints a shutdown summary:
 
 ```text
---source mutter
---width 1024
---height 768
---ra2-record-size 16384
---ra2-coalesce on
---ra2-coalesce-us 500
+[GOV][SUMMARY] keyframes=... backpressure-events=... dropped-source=...
 ```
 
-Build dependencies are taken from pkg-config:
+### Latency diagnostics
+
+Enable per-publish diagnostics with:
+
+```text
+--latency-trace on
+```
+
+This reports source-sequence collapse, keyframe state, diff/RFB processing time, and the currently observed transport queues. It is intentionally diagnostic and is off by default.
+
+## Build
+
+```bash
+make clean
+make -j20
+```
+
+Expected pkg-config development dependencies:
 
 ```text
 libvncserver
@@ -477,281 +143,176 @@ gstreamer-video-1.0
 libpipewire-0.3
 ```
 
+The PAM helper additionally requires PAM development headers/libraries.
 
-## v9: bounded-latency real monitor
-
-The v8 real-screen path proved that the GNOME Wayland extended monitor works,
-but it could accumulate tens of seconds of stale encoded VNC traffic.
-
-v9 treats this as a **frame age / queueing problem**, not a source FPS problem:
-
-```text
-Mutter/PipeWire
-    -> capture as fast as available
-    -> FrameBridge keeps only the newest frame
-    -> VNC publishes at an independent bounded rate
-    -> bounded TCP queues propagate backpressure early
-```
-
-New runtime controls:
-
-```text
---vnc-fps 10
---external-send-buffer 65536
---backend-recv-buffer 65536
-```
-
-The important distinction is:
-
-```text
---fps       source/backend loop ceiling
---vnc-fps   how often a fresh real frame may be offered to VNC
-```
-
-For an old client, freshness is more important than queueing 60 old frames.
-
-
-## v10: tile damage + remembered GNOME layout
-
-### Real-frame damage
-
-The real source no longer has to mark 1024x768 as changed for every captured
-frame. By default:
-
-```text
---diff-detect on
---diff-tile-size 32
-```
-
-`frame_diff` keeps the existing VNC framebuffer as the old frame, compares
-the latest PipeWire frame in 32x32 tiles, copies only changed tiles, merges
-adjacent tile runs, and calls `rfbMarkRectAsModified()` only for those regions.
-
-Disable for diagnostics:
+Check the program version:
 
 ```bash
-./vnc-monitor-test --diff-detect off
+./vnc-monitor-test --version
 ```
 
-### Monitor identity / layout
-
-Mutter's `RecordVirtual` D-Bus method does **not** expose properties for a
-custom monitor name/vendor/model/serial. The supported virtual-recording
-properties are cursor mode and `is-platform`.
-
-Therefore v10 solves the actual layout problem one layer higher:
-`monitor_layout_cache` stores the GNOME `monitors.xml` configuration while the
-virtual monitor exists and restores that file immediately before the next
-virtual-monitor hotplug.
-
-Default:
-
-```text
---layout-remember on
---layout-resave off
-```
-
-First use:
-
-1. connect the iPad;
-2. arrange the 4-monitor layout once in GNOME Settings and apply it;
-3. disconnect the iPad normally.
-
-The program saves:
-
-```text
-$XDG_CONFIG_HOME/vnc-monitor-server/monitors-1024x768.xml
-```
-
-On later connections it restores that cached GNOME configuration before
-creating the virtual monitor.
-
-A conservative one-time backup of the pre-VNC GNOME file is kept as:
-
-```text
-$XDG_CONFIG_HOME/vnc-monitor-server/physical-before-vnc.xml
-```
-
-To intentionally replace an existing cached layout:
+Show all runtime options:
 
 ```bash
-./vnc-monitor-test --layout-resave on
+./vnc-monitor-test --help
 ```
 
-Arrange the displays, then disconnect normally.
-
-
-## v11: pipeline diagnostics
-
-The old `damage` wording was removed from the real-frame CLI/module:
-
-```text
-frame_diff.c/.h
---diff-detect on|off
---diff-tile-size 32
-```
-
-New always-available diagnostics:
-
-```text
---frame-stats on            one pipeline summary per second
---frame-trace off           one line per VNC publish when enabled
---frame-stats-interval-ms 1000
-```
-
-Example summary:
-
-```text
-[PIPE] cap=59.9fps pub=10.0fps skip=49.9fps
-       rect=5.2/frame changed=3.7%
-       diff=0.42/0.78ms rfb=1.20/8.40ms
-       backend=2.10Mbit/s reads=30.0/s
-       RA2=2.10Mbit/s rec=30.0/s avg=8750B
-       queues ext=0/16384B backend=0/32768B
-       unacked=1/4 rtt=3.20/8.10ms
-```
-
-Per-publish trace:
+Show resolved defaults:
 
 ```bash
-./vnc-monitor-test --frame-trace on
+./vnc-monitor-test --show-config
 ```
 
-produces:
+## PAM authentication helper
+
+Build/render support files without changing the system:
+
+```bash
+make pam-service
+```
+
+Install the privileged helper, PAM policy and systemd socket/service:
+
+```bash
+make install-pam-service
+```
+
+Do not run the whole Make process through `sudo`; the install target invokes `sudo` only for operations that need root privileges and keeps socket ownership tied to the invoking user.
+
+Status:
+
+```bash
+make pam-service-status
+```
+
+The production support components are:
 
 ```text
-[FRAME] source_delta=6 skipped=5 rects=5 changed=28672 px (3.65%)
-        diff=0.410ms rfb=1.240ms
-        outq=0B backend_inq=0B unacked=1 rtt=3.20ms
+/usr/local/libexec/vnc-monitor-auth-helper
+/etc/pam.d/vnc-monitor
+/etc/systemd/system/vnc-monitor-auth.socket
+/etc/systemd/system/vnc-monitor-auth@.service
+/run/vnc-monitor-auth.sock
 ```
 
-This makes the 30-60 second delay observable stage-by-stage:
-capture rate, frame skipping, diff cost/area, LibVNCServer cost, internal
-backend throughput, RA2 throughput, Linux TCP send queue, backend receive
-queue, unacknowledged TCP segments and RTT.
+There is no forced-redraw GNOME Shell helper in the current architecture.
 
+Legacy 0.0.17/0.0.18 redraw/HW-cursor diagnostic leftovers can be removed with:
 
-## v12: explicit capture refresh + live Mutter layout restore
+```bash
+make cleanup-obsolete-support
+```
 
-### Capture negotiation
+This cleanup intentionally keeps the PAM authentication service/socket.
 
-The PipeWire/GStreamer caps are now explicitly fixed to the requested virtual
-monitor refresh rate:
+## Run
+
+Normal production-direction test:
+
+```bash
+./vnc-monitor-test
+```
+
+Relevant defaults:
 
 ```text
-video/x-raw,format=BGRx,width=1024,height=768,framerate=60/1
+source=mutter
+capture-backend=pipewire
+1024x768
+max source FPS=60
+latest-only=on
+keyframe=on
+keyframe interval=2000 ms
+keyframe after drop=on
+RFB backend=127.0.0.1:5903
+RA2r public port=5901
+RA2 record max=16384
+RA2 coalescing=on, 500 us
+view-only=on
+clipboard input=off
+file transfer=off
 ```
 
-The first received sample prints the *actual* negotiated caps:
+For the synthetic source:
+
+```bash
+./vnc-monitor-test --source test
+```
+
+For the old capture path:
+
+```bash
+./vnc-monitor-test --capture-backend gstreamer
+```
+
+For detailed latency/governor diagnostics:
+
+```bash
+./vnc-monitor-test --latency-trace on --frame-trace on
+```
+
+## GNOME / Mutter virtual-monitor path
+
+The real monitor is created inside the existing GNOME Wayland session:
 
 ```text
-[CAPTURE] negotiated caps: video/x-raw, ...
+RemoteDesktop.CreateSession
+    -> ScreenCast.CreateSession(remote-desktop-session-id=...)
+    -> RecordVirtual(cursor-mode=..., is-platform=true)
+    -> RemoteDesktop.Session.Start
+    -> PipeWireStreamAdded(node_id)
+    -> native PipeWire capture
 ```
 
-This is intentionally independent from `--vnc-fps`: Mutter/PipeWire can
-produce at 60 Hz while the VNC side publishes only the newest frame at a lower
-rate.
+Stopping the RemoteDesktop session removes the virtual monitor.
 
-### Layout
+The project does not require X11 and does not create a separate remote-login desktop.
 
-The previous `monitors.xml` copy mechanism was removed. Mutter already has its
-monitor configuration in memory, so replacing the XML file at runtime is not a
-reliable way to change the active layout.
+## View-only security boundary
 
-v12 uses the live D-Bus API instead:
+The external client receives RA2r-encrypted RFB. Authentication is performed through the local privileged PAM helper.
+
+The internal LibVNCServer backend:
+
+- binds to `127.0.0.1` only;
+- uses RFB security type `None` only on loopback;
+- is never intended to be reachable from the LAN.
+
+Server-side input policy is strict view-only:
+
+- keyboard input ignored;
+- pointer/touch input ignored;
+- client clipboard input disabled;
+- file transfer disabled.
+
+## RA2 server identity
+
+The persistent RA2 RSA identity is created at runtime as:
 
 ```text
-org.gnome.Mutter.DisplayConfig.GetCurrentState
-org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig
+./ra2-server-key.pem
 ```
 
-First successful run:
+It is deliberately **not tracked by Git**. Treat it as a private key and keep it out of source-control archives.
 
-1. connect the iPad;
-2. arrange the four displays in GNOME Settings;
-3. Apply;
-4. disconnect normally.
+If the key is deleted, the next run will create a new identity and the VNC client may ask to trust the server signature again.
 
-The live logical layout is serialized to:
+## Versioning
+
+This project is still pre-alpha/prototype software. Until the interface and architecture settle, versions use:
 
 ```text
-$XDG_CONFIG_HOME/vnc-monitor-server/layout-1024x768.ini
+0.0.x
 ```
 
-On later connections the virtual monitor is created first; then the saved
-geometry is applied to the *current* connector/mode IDs through
-`ApplyMonitorsConfig`.
-
-Exact connector matching is preferred. If a virtual connector name changes,
-the cache falls back to Mutter's vendor/product/serial monitor spec.
-
-
-## v13 capture negotiation fix
-
-v12 used an exact GStreamer `framerate=N/1` caps field. On the tested Mutter
-RecordVirtual stream that can make the PipeWire pipeline fail to enter PLAYING.
-
-v13 follows the working RecordVirtual pattern and requests an upper bound:
+Examples:
 
 ```text
-video/x-raw,format=BGRx,width=1024,height=768,max-framerate=60/1
+program version: 0.0.20
+git tag:         v0.0.20
+
+program version: 0.0.21
+git tag:         v0.0.21
 ```
 
-It also prints:
-
-```text
-[CAPTURE] pipeline: ...
-Capture source: Mutter RecordVirtual stream=... node_id=... object.serial=...
-[CAPTURE] negotiated caps: ...
-```
-
-and dumps GStreamer bus ERROR/WARNING messages if startup fails.
-
-The capture source is the PipeWire node emitted by that specific
-`RecordVirtual` stream; it is not a composite capture of all physical
-monitors.
-
-A failed capture startup no longer writes a monitor-layout cache. v13 uses
-`layout-v2-WIDTHxHEIGHT.ini`, intentionally ignoring the cache accidentally
-created by v12 after its failed startup.
-
-
-## v14: diagnose Mutter damage + silent layout restore
-
-### Mutter cursor mode
-
-The ScreenCast API defines three RecordVirtual cursor modes:
-
-```text
-0 hidden
-1 embedded
-2 metadata
-```
-
-v13 used `embedded`. v14 makes this explicit:
-
-```text
---mutter-cursor hidden|embedded|metadata
-```
-
-Default is now `hidden` for the first Ubuntu 26.04/Mutter damage test.
-
-This is not the VNC cursor setting. It controls whether Mutter itself includes
-the desktop cursor in the PipeWire virtual-monitor stream.
-
-### Layout confirmation dialog
-
-`ApplyMonitorsConfig` methods are:
-
-```text
-0 verify
-1 temporary
-2 persistent
-```
-
-The previous implementation used `2`, so GNOME correctly showed its
-"keep this display configuration?" confirmation UI.
-
-v14 uses method `1` instead. Our own layout cache is the persistence layer, so
-the transient virtual-monitor layout can be applied immediately and silently
-on every connection.
+The historical shorthand `V20`, `V19`, etc. should not be used for new releases or documentation.
