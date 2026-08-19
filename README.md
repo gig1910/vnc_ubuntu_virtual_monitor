@@ -1,33 +1,33 @@
 # VNC Ubuntu Virtual Monitor
 
-Current development version: **0.0.21**.
+Current development version: **0.0.25**.
 
 This project exposes a true virtual monitor from the current GNOME Wayland session to an old VNC client. The target use case is an old iPad used strictly as an additional display, not as an input/control surface.
 
-The previous V20 naming is normalized to **0.0.20**. Git tags should use the usual `v` prefix, for example `v0.0.20`, while the program version itself is `0.0.20` / `0.0.21`.
+Git tags use the usual `v` prefix (`v0.0.25`), while the program reports the version without it (`0.0.25`).
 
-## Architecture
+## Production architecture
 
 ```text
-iPad VNC client
+old iPad VNC client
     |
     | RFB 3.8 + RA2r / AES-128-EAX
-    | Ubuntu username/password
+    | encrypted username/password
     v
 RA2r front-end :5901
     |
     +----> /run/vnc-monitor-auth.sock
     |          privileged PAM helper
     |
-    | plain RFB on loopback only
+    | decrypted RFB, loopback only
     v
 LibVNCServer backend 127.0.0.1:5903
     |
+    |  small/simple delta -> ZRLE
+    |  heavy delta        -> JPEG encoding 21
+    |  idle               -> progressive lossless repair
     v
-latest-only VNC publisher / periodic full-frame resync
-    |
-    v
-FrameBridge
+FrameBridge / framebuffer diff
     ^
     |
 native PipeWire consumer
@@ -39,88 +39,181 @@ Mutter RecordVirtual
 current GNOME Wayland session
 ```
 
-The virtual monitor exists only while an authenticated VNC client is connected.
+The virtual monitor exists only while an authenticated VNC client is connected. No X11 session, remote-login desktop or separate desktop session is created.
 
-## 0.0.21
+## Mutter virtual monitor
 
-0.0.21 keeps the native libpipewire capture backend introduced in 0.0.20 and adds a downstream freshness policy.
+The monitor is created in the existing GNOME Wayland session through:
 
-### Native PipeWire capture remains the default
+```text
+RemoteDesktop.CreateSession
+    -> ScreenCast.CreateSession(remote-desktop-session-id=...)
+    -> ScreenCast.Session.RecordVirtual(cursor-mode=..., is-platform=true)
+    -> RemoteDesktop.Session.Start
+    -> PipeWireStreamAdded(node_id)
+```
+
+`ScreenCast.Session.Start` is intentionally not called separately. Starting the RemoteDesktop session starts the associated stream.
+
+Stopping the RemoteDesktop session removes the virtual monitor.
+
+## Capture path
+
+Native libpipewire capture is the production/default backend:
 
 ```text
 --capture-backend pipewire
 ```
 
-The PipeWire callback drains to the newest available buffer, copies BGRx to owned memory and immediately recycles the `pw_buffer` before downstream VNC work.
+The PipeWire `process()` callback drains buffers, copies valid BGRx pixels into owned memory and requeues each `pw_buffer` immediately. A `struct pw_buffer *` never survives the callback.
 
-The previous GStreamer path remains available only for A/B diagnostics:
+A PipeWire chunk with either:
+
+```text
+chunk->size == 0
+```
+
+or:
+
+```text
+SPA_CHUNK_FLAG_CORRUPTED
+```
+
+is treated as containing no new video pixels. Its memory may contain stale data from an earlier buffer use and is not copied.
+
+The older GStreamer path remains only for A/B diagnostics:
 
 ```bash
 ./vnc-monitor-test --capture-backend gstreamer
 ```
 
-### Latest-only downstream governor
+## Cursor path
+
+For the production Mutter path use cursor metadata:
 
 ```text
---latest-only on
+--mutter-cursor metadata
 ```
 
-When the RA2/backend transport is visibly backpressured, the VNC publisher does not consume intermediate FrameBridge states. It keeps the LibVNCServer framebuffer as the client reference state and waits until the transport recovers. It then consumes the newest available source frame directly.
+The PipeWire consumer reads `SPA_META_Cursor`. Base framebuffer pixels and cursor state are kept separately and the cursor is composed in software. Cursor-only metadata can therefore produce a small framebuffer delta without waiting for a new full video frame.
 
-This avoids deliberately building a queue of stale desktop states.
+Do not re-enable `MUTTER_DEBUG_DISABLE_HW_CURSORS=1`; the current design does not require it.
 
-### Full-frame keyframes / resync
+## 0.0.25 adaptive transport
 
-VNC does not have H.264 I-frames, so the equivalent used here is a full framebuffer update.
+0.0.25 keeps the 0.0.24 latest-only/backpressure governor but changes the meaning of resynchronization completely.
 
-Defaults:
+### Lossless state does not need a keyframe after a skipped source frame
+
+For normal ZRLE updates, framebuffer diff compares the newest FrameBridge image with the last source state already submitted to the backend framebuffer. Intermediate source frames can therefore be skipped safely:
 
 ```text
---keyframe on
---keyframe-interval-ms 2000
---keyframe-after-drop on
+last submitted source state
+        |
+        | direct diff
+        v
+newest source state
 ```
 
-A full-frame resync is forced:
+A source sequence gap, transport backpressure or a large lossless change does **not** by itself mean that the client framebuffer is corrupt.
 
-- for the initial real frame;
-- periodically, on the next available source frame after the configured interval;
-- after source-frame collapse/drop;
-- after downstream backpressure;
-- after a detected capture stall.
+A normal period with no PipeWire video frames is also not a capture failure. `capture-stall`/idle-gap detection is diagnostic only and does not schedule a repair or full-frame keyframe.
 
-The important correctness rule is that the local LibVNCServer framebuffer is not advanced while stale source states are being dropped. Therefore the next diff is always calculated from the last submitted client-reference state to the newest source state. A full resync is additionally used after drops/backpressure to eliminate any possibility of accumulated visual artifacts.
+### Adaptive codec selection
 
-Keyframe diagnostics look like:
+The old iPad advertises RFB JPEG encoding `21`. LibVNCServer 0.9.15 does not implement that encoding itself, so the project registers encoding 21 through the LibVNCServer extension mechanism and emits the JPEG rectangle directly into the same internal RFB connection.
+
+The RA2r relay remains an opaque encrypted transport and does not parse or transcode framebuffer updates.
+
+Current experimental defaults:
 
 ```text
-[KF] seq=1234 reason=periodic full=1024x768
-[KF] seq=1301 reason=backpressure full=1024x768
-[KF] seq=1408 reason=capture-stall full=1024x768
+JPEG encoding:          21
+JPEG quality:           80
+heavy-change threshold: 25% of framebuffer pixels
 ```
 
-The governor reports transitions such as:
+Policy:
 
 ```text
-[GOV] backpressure: defer publish, keep latest only ...
-[GOV] backpressure cleared: publishing newest frame
+small/simple delta
+    -> normal LibVNCServer ZRLE
+    -> lossless
+
+heavy delta >= 25%
+    -> JPEG encoding 21
+    -> lossy, lower bandwidth
+
+idle
+    -> progressive ZRLE repair
+    -> restores exact pixels
 ```
 
-and prints a shutdown summary:
+Only a new delta that is itself heavy joins a pending JPEG update. Small UI/cursor deltas keep their normal lossless priority even when a JPEG rectangle is waiting for the client/transport.
+
+The JPEG sender remains RFB demand-driven: it sends only when the viewer has an outstanding `FramebufferUpdateRequest`, no normal LibVNCServer update is pending, and transport queues are at low water.
+
+### Exactness / repair bitmap
+
+After a JPEG rectangle is actually sent, its covered `32x32` tiles are marked inexact. This is separate from the source framebuffer: the source can already contain the newest exact pixels while the iPad temporarily contains their JPEG approximation.
+
+Lossless live updates clear fully covered repair tiles. Remaining tiles are repaired only while the source is quiet and transport is free.
+
+Current experimental repair defaults:
 
 ```text
-[GOV][SUMMARY] keyframes=... backpressure-events=... dropped-source=...
+repair tile:       32x32
+idle before repair: 250 ms
+repair budget:      4096 kbit/s raw-equivalent pacing
 ```
 
-### Latency diagnostics
-
-Enable per-publish diagnostics with:
+The repair order is spatially progressive rather than top-to-bottom:
 
 ```text
---latency-trace on
+pass 0 -> sparse 4x4 grid across the whole damaged area
+pass 1 -> remaining even/even positions
+pass 2 -> checkerboard complement
+pass 3 -> remaining tiles
 ```
 
-This reports source-sequence collapse, keyframe state, diff/RFB processing time, and the currently observed transport queues. It is intentionally diagnostic and is off by default.
+Only one small repair tile is put in flight at a time. Any live framebuffer work naturally has priority over subsequent repair tiles.
+
+Useful telemetry:
+
+```text
+[ADAPT] client advertised RFB JPEG encoding 21; adaptive JPEG enabled
+[ADAPT] JPEG21 seq=... rect=... quality=80 bytes=... raw=... ratio=... repair=...
+[REPAIR] schedule pass=... tile=... remaining=...
+[REPAIR] exact pass=... tile=... remaining=...
+[CAPTURE] idle-gap=...; no repair/keyframe scheduled
+[ADAPT][SUMMARY] jpeg-updates=... jpeg-bytes=... raw-equivalent=... saved=... repair-tiles=...
+```
+
+The initial framebuffer is still sent losslessly. Legacy keyframe-related CLI options are currently retained for command-line compatibility, but source drops, backpressure, large changes and ordinary capture gaps no longer arm a repair keyframe in the production Mutter path.
+
+## Latest-only / backpressure governor
+
+When downstream transport is congested, new VNC updates are not manufactured. FrameBridge continues to receive current source state, and after recovery the publisher compares the last consumed source framebuffer directly with the newest one.
+
+High-water conditions currently include:
+
+```text
+external outq >= configured external SO_SNDBUF
+backend inq  >= configured backend SO_RCVBUF
+TCP unacked  >= 24
+```
+
+Once congestion is entered, publishing resumes only near the low-water state:
+
+```text
+external outq <= about 1/4 buffer
+backend inq  <= about 1/4 buffer
+TCP unacked  <= 8
+```
+
+This hysteresis prevents repeated pressure/clear oscillation.
+
+Do not tune socket buffer sizes, RA2 record size or coalescing delay as a first response to high-entropy image latency; 0.0.25 targets the much larger lossless-image payload directly.
 
 ## Build
 
@@ -129,10 +222,11 @@ make clean
 make -j20
 ```
 
-Expected pkg-config development dependencies:
+The main build uses development headers/libraries for:
 
 ```text
 libvncserver
+libjpeg
 openssl
 nettle
 glib-2.0
@@ -143,6 +237,8 @@ gstreamer-video-1.0
 libpipewire-0.3
 ```
 
+On Debian/Ubuntu the JPEG development package is normally `libjpeg-dev` (or the distribution-compatible libjpeg-turbo development package).
+
 The PAM helper additionally requires PAM development headers/libraries.
 
 Check the program version:
@@ -151,16 +247,54 @@ Check the program version:
 ./vnc-monitor-test --version
 ```
 
-Show all runtime options:
+Show runtime options/defaults:
 
 ```bash
 ./vnc-monitor-test --help
+./vnc-monitor-test --show-config
 ```
 
-Show resolved defaults:
+## Run
+
+Production-direction run:
 
 ```bash
-./vnc-monitor-test --show-config
+./vnc-monitor-test --mutter-cursor metadata
+```
+
+Important current settings:
+
+```text
+source=mutter
+capture-backend=pipewire
+framebuffer=1024x768
+max source FPS=60
+VNC publisher=source-driven
+latest-only=on
+diff-detect=on
+diff-tile-size=32
+Mutter cursor=metadata (production invocation)
+Mutter HW cursor=auto
+RFB backend=127.0.0.1:5903
+RA2r public port=5901
+RA2 record max=16384
+RA2 coalescing=on, 500 us
+view-only=on
+clipboard input=off
+file transfer=off
+```
+
+For detailed scheduler/latency diagnostics:
+
+```bash
+./vnc-monitor-test --mutter-cursor metadata --latency-trace on --frame-trace on
+```
+
+Synthetic source and GStreamer remain diagnostic paths:
+
+```bash
+./vnc-monitor-test --source test
+./vnc-monitor-test --capture-backend gstreamer
 ```
 
 ## PAM authentication helper
@@ -177,15 +311,9 @@ Install the privileged helper, PAM policy and systemd socket/service:
 make install-pam-service
 ```
 
-Do not run the whole Make process through `sudo`; the install target invokes `sudo` only for operations that need root privileges and keeps socket ownership tied to the invoking user.
+Do not run the whole Make process through `sudo`; the install target invokes `sudo` only for operations that require root privileges and keeps socket ownership tied to the invoking user.
 
-Status:
-
-```bash
-make pam-service-status
-```
-
-The production support components are:
+Production support components:
 
 ```text
 /usr/local/libexec/vnc-monitor-auth-helper
@@ -195,9 +323,7 @@ The production support components are:
 /run/vnc-monitor-auth.sock
 ```
 
-There is no forced-redraw GNOME Shell helper in the current architecture.
-
-Legacy 0.0.17/0.0.18 redraw/HW-cursor diagnostic leftovers can be removed with:
+There is no forced-redraw GNOME Shell helper/service in the current architecture. Old 0.0.17/0.0.18 redraw/HW-cursor diagnostic leftovers can be removed with:
 
 ```bash
 make cleanup-obsolete-support
@@ -205,83 +331,20 @@ make cleanup-obsolete-support
 
 This cleanup intentionally keeps the PAM authentication service/socket.
 
-## Run
-
-Normal production-direction test:
-
-```bash
-./vnc-monitor-test
-```
-
-Relevant defaults:
-
-```text
-source=mutter
-capture-backend=pipewire
-1024x768
-max source FPS=60
-latest-only=on
-keyframe=on
-keyframe interval=2000 ms
-keyframe after drop=on
-RFB backend=127.0.0.1:5903
-RA2r public port=5901
-RA2 record max=16384
-RA2 coalescing=on, 500 us
-view-only=on
-clipboard input=off
-file transfer=off
-```
-
-For the synthetic source:
-
-```bash
-./vnc-monitor-test --source test
-```
-
-For the old capture path:
-
-```bash
-./vnc-monitor-test --capture-backend gstreamer
-```
-
-For detailed latency/governor diagnostics:
-
-```bash
-./vnc-monitor-test --latency-trace on --frame-trace on
-```
-
-## GNOME / Mutter virtual-monitor path
-
-The real monitor is created inside the existing GNOME Wayland session:
-
-```text
-RemoteDesktop.CreateSession
-    -> ScreenCast.CreateSession(remote-desktop-session-id=...)
-    -> RecordVirtual(cursor-mode=..., is-platform=true)
-    -> RemoteDesktop.Session.Start
-    -> PipeWireStreamAdded(node_id)
-    -> native PipeWire capture
-```
-
-Stopping the RemoteDesktop session removes the virtual monitor.
-
-The project does not require X11 and does not create a separate remote-login desktop.
-
 ## View-only security boundary
 
-The external client receives RA2r-encrypted RFB. Authentication is performed through the local privileged PAM helper.
+The external connection is RA2r-encrypted and authenticated through the local privileged PAM helper.
 
 The internal LibVNCServer backend:
 
-- binds to `127.0.0.1` only;
+- binds only to `127.0.0.1`;
 - uses RFB security type `None` only on loopback;
 - is never intended to be reachable from the LAN.
 
 Server-side input policy is strict view-only:
 
-- keyboard input ignored;
-- pointer/touch input ignored;
+- keyboard ignored;
+- pointer/touch ignored;
 - client clipboard input disabled;
 - file transfer disabled.
 
@@ -293,26 +356,21 @@ The persistent RA2 RSA identity is created at runtime as:
 ./ra2-server-key.pem
 ```
 
-It is deliberately **not tracked by Git**. Treat it as a private key and keep it out of source-control archives.
+It is ignored by the current working tree and must remain private.
 
-If the key is deleted, the next run will create a new identity and the VNC client may ask to trust the server signature again.
+A private key existed in earlier Git history. Before publishing the repository, rewrite the Git history to remove it, generate a new RA2 server identity and re-confirm the new identity on the iPad.
 
 ## Versioning
 
-This project is still pre-alpha/prototype software. Until the interface and architecture settle, versions use:
+The project is pre-alpha/prototype software and currently uses:
 
 ```text
-0.0.x
+program version: 0.0.x
+git tag:         v0.0.x
 ```
 
-Examples:
+Current development version:
 
 ```text
-program version: 0.0.20
-git tag:         v0.0.20
-
-program version: 0.0.21
-git tag:         v0.0.21
+program version: 0.0.25
 ```
-
-The historical shorthand `V20`, `V19`, etc. should not be used for new releases or documentation.
