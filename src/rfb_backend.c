@@ -13,6 +13,9 @@
 #include <string.h>
 #include <time.h>
 
+#define KEYFRAME_IDLE_QUIET_SECONDS 0.500
+#define KEYFRAME_SIGNIFICANT_PERCENT 5.0
+
 static void
 ignore_keyboard(
     rfbBool down,
@@ -134,6 +137,33 @@ transport_backpressured(
         (ext >= cfg->external_send_buffer) ||
         (back >= cfg->backend_receive_buffer) ||
         (ua >= 24);
+}
+
+static int
+transport_recovered(
+    const RuntimeConfig *cfg,
+    int external_outq,
+    int backend_inq,
+    uint32_t unacked)
+{
+    /*
+     * Hysteresis: once congestion has been detected, do not resume publishing
+     * at the very first sample below the high-water mark. Let both userspace
+     * and kernel queues drain substantially first. This prevents the old
+     * enter/leave/enter oscillation visible with high-entropy screen content.
+     */
+    int external_low = cfg->external_send_buffer / 4;
+    int backend_low = cfg->backend_receive_buffer / 4;
+
+    if (external_low < 4096)
+        external_low = 4096;
+    if (backend_low < 4096)
+        backend_low = 4096;
+
+    return
+        external_outq <= external_low &&
+        backend_inq <= backend_low &&
+        unacked <= 8;
 }
 
 static void *
@@ -270,7 +300,15 @@ backend_thread(void *arg)
     int pending_source_frame = 0;
     double next_vnc_publish = 0.0;
 
-    /* 0.0.21: latest-only governor + full-frame resync policy. */
+    /*
+     * 0.0.24:
+     * - the framebuffer remains the last state submitted to LibVNCServer;
+     * - FrameDiff always compares the newest FrameBridge image against that
+     *   submitted reference, so skipped source frames do not require a full
+     *   resync;
+     * - congestion uses high/low-water hysteresis and never manufactures an
+     *   automatic full-screen frame while the queues are draining.
+     */
     int force_keyframe = cfg->keyframe ? 1 : 0;
     const char *keyframe_reason = "initial";
     double last_keyframe_at = start;
@@ -279,6 +317,8 @@ backend_thread(void *arg)
     uint64_t backpressure_events = 0;
     uint64_t keyframes = 0;
     uint64_t dropped_source_frames = 0;
+    int resync_pending = 0;
+    const char *resync_reason = NULL;
 
     size_t max_diff_rects =
         (size_t)(
@@ -422,14 +462,21 @@ backend_thread(void *arg)
             else if (changed > 0) {
                 double arrived = monotonic_seconds();
 
+                /*
+                 * A capture gap is diagnostic by itself. With FrameDiff based
+                 * on the last submitted framebuffer it does not imply that the
+                 * client needs a full frame. Preserve the aggressive legacy
+                 * behaviour only when explicitly requested.
+                 */
                 if (
                     last_source_arrival > 0.0 &&
                     (arrived - last_source_arrival) * 1000.0 >=
                         (double)cfg->capture_stall_ms &&
-                    cfg->keyframe
+                    cfg->keyframe &&
+                    cfg->keyframe_after_drop
                 ) {
-                    force_keyframe = 1;
-                    keyframe_reason = "capture-stall";
+                    resync_pending = 1;
+                    resync_reason = "capture-stall";
                 }
 
                 last_source_arrival = arrived;
@@ -447,6 +494,73 @@ backend_thread(void *arg)
         now = monotonic_seconds();
 
         if (!pending_source_frame) {
+            /*
+             * Full-frame repair is intentionally an IDLE operation in 0.0.24.
+             * Cursor-only traffic and window animation must never be forced
+             * through a full-screen ZRLE update. Once the source has gone
+             * quiet and the transport is genuinely drained, emit at most one
+             * pending repair keyframe.
+             */
+            if (
+                cfg->keyframe &&
+                resync_pending &&
+                last_source_arrival > 0.0 &&
+                now - last_source_arrival >= KEYFRAME_IDLE_QUIET_SECONDS &&
+                (now - last_keyframe_at) * 1000.0 >=
+                    (double)cfg->keyframe_interval_ms
+            ) {
+                int idle_external_outq = 0;
+                int idle_backend_inq = 0;
+                uint32_t idle_unacked = 0;
+                int idle_pressured =
+                    transport_backpressured(
+                        backend->stats,
+                        cfg,
+                        &idle_external_outq,
+                        &idle_backend_inq,
+                        &idle_unacked
+                    );
+
+                if (
+                    !idle_pressured &&
+                    transport_recovered(
+                        cfg,
+                        idle_external_outq,
+                        idle_backend_inq,
+                        idle_unacked
+                    )
+                ) {
+                    rfbMarkRectAsModified(
+                        screen,
+                        0,
+                        0,
+                        cfg->width,
+                        cfg->height
+                    );
+                    rfbProcessEvents(screen, 0);
+
+                    keyframes++;
+                    last_keyframe_at = now;
+
+                    fprintf(
+                        stderr,
+                        "[KF] seq=%llu reason=idle-%s full=%dx%d "
+                        "quiet=%.0fms outq=%dB backend_inq=%dB unacked=%u\n",
+                        (unsigned long long)last_bridge_sequence,
+                        resync_reason ? resync_reason : "resync",
+                        cfg->width,
+                        cfg->height,
+                        (now - last_source_arrival) * 1000.0,
+                        idle_external_outq,
+                        idle_backend_inq,
+                        idle_unacked
+                    );
+
+                    resync_pending = 0;
+                    resync_reason = NULL;
+                }
+            }
+
             pipeline_stats_maybe_report(backend->stats);
             continue;
         }
@@ -461,21 +575,11 @@ backend_thread(void *arg)
 
         if (
             cfg->keyframe &&
-            !force_keyframe &&
-            (now - last_keyframe_at) * 1000.0 >=
-                (double)cfg->keyframe_interval_ms
-        ) {
-            force_keyframe = 1;
-            keyframe_reason = "periodic";
-        }
-
-        if (
-            cfg->keyframe &&
             cfg->keyframe_after_drop &&
             observed_bridge_sequence > last_bridge_sequence + 1
         ) {
-            force_keyframe = 1;
-            keyframe_reason = "source-drop";
+            resync_pending = 1;
+            resync_reason = "source-drop";
         }
 
         int external_outq = 0;
@@ -490,10 +594,34 @@ backend_thread(void *arg)
                 &unacked
             );
 
+        /*
+         * High/low-water hysteresis. If we were already congested, staying
+         * below the entry threshold is not enough: wait until the queues are
+         * genuinely small before resuming.
+         */
+        if (
+            cfg->latest_only &&
+            backpressure_active &&
+            !pressured &&
+            !transport_recovered(
+                cfg,
+                external_outq,
+                backend_inq,
+                unacked
+            )
+        ) {
+            pressured = 1;
+        }
+
         if (cfg->latest_only && pressured) {
             if (!backpressure_active) {
                 backpressure_active = 1;
                 backpressure_events++;
+
+                if (cfg->keyframe && cfg->keyframe_after_drop) {
+                    resync_pending = 1;
+                    resync_reason = "backpressure";
+                }
 
                 if (cfg->verbose) {
                     fprintf(
@@ -509,14 +637,13 @@ backend_thread(void *arg)
 
             /*
              * Do not consume FrameBridge here. fb therefore remains the last
-             * submitted client reference state. When the queues recover we
-             * diff (or keyframe) directly from that state to the newest frame.
+             * submitted client reference state. When the queues recover,
+             * FrameDiff goes directly from that state to the newest frame.
+             *
+             * Crucially, do NOT force a full-screen keyframe here. The 0.0.23
+             * behaviour created a positive feedback loop:
+             * full frame -> backpressure -> full frame -> backpressure.
              */
-            if (cfg->keyframe && cfg->keyframe_after_drop) {
-                force_keyframe = 1;
-                keyframe_reason = "backpressure";
-            }
-
             pipeline_stats_maybe_report(backend->stats);
             continue;
         }
@@ -527,7 +654,12 @@ backend_thread(void *arg)
             if (cfg->verbose) {
                 fprintf(
                     stderr,
-                    "[GOV] backpressure cleared: publishing newest frame\n"
+                    "[GOV] backpressure cleared at low-water: "
+                    "outq=%dB backend_inq=%dB unacked=%u; "
+                    "publishing newest delta\n",
+                    external_outq,
+                    backend_inq,
+                    unacked
                 );
             }
         }
@@ -568,6 +700,8 @@ backend_thread(void *arg)
                 emitted_keyframe = 1;
                 keyframes++;
                 last_keyframe_at = now;
+                resync_pending = 0;
+                resync_reason = NULL;
 
                 fprintf(
                     stderr,
@@ -697,6 +831,31 @@ backend_thread(void *arg)
         if (sequence_delta > 1)
             dropped_source_frames += sequence_delta - 1;
 
+        /*
+         * Large real framebuffer changes arm one deferred repair keyframe.
+         * Small cursor-only deltas stay below this threshold, so moving the
+         * pointer over a static high-entropy image never schedules full-screen
+         * redraws.
+         */
+        if (
+            cfg->keyframe &&
+            !emitted_keyframe &&
+            published_pixels > 0
+        ) {
+            uint64_t total_pixels =
+                (uint64_t)cfg->width * (uint64_t)cfg->height;
+            double changed_percent =
+                total_pixels > 0
+                    ? (double)published_pixels * 100.0 /
+                        (double)total_pixels
+                    : 0.0;
+
+            if (changed_percent >= KEYFRAME_SIGNIFICANT_PERCENT) {
+                resync_pending = 1;
+                resync_reason = "large-change";
+            }
+        }
+
         double diff_ms =
             (pipeline_stats_now() - diff_started) * 1000.0;
 
@@ -750,10 +909,12 @@ backend_thread(void *arg)
 
     fprintf(
         stderr,
-        "[GOV][SUMMARY] keyframes=%llu backpressure-events=%llu dropped-source=%llu\n",
+        "[GOV][SUMMARY] keyframes=%llu backpressure-events=%llu "
+        "dropped-source=%llu resync-pending=%s\n",
         (unsigned long long)keyframes,
         (unsigned long long)backpressure_events,
-        (unsigned long long)dropped_source_frames
+        (unsigned long long)dropped_source_frames,
+        resync_pending ? "yes" : "no"
     );
 
     rfbShutdownServer(screen, TRUE);
