@@ -104,14 +104,6 @@ log_capture_summary(const PipewireCapture *capture)
 }
 
 static void
-signal_state(PipewireCapture *capture)
-{
-    pthread_mutex_lock(&capture->mutex);
-    pthread_cond_broadcast(&capture->cond);
-    pthread_mutex_unlock(&capture->mutex);
-}
-
-static void
 on_stream_state_changed(void *userdata,
                         enum pw_stream_state old,
                         enum pw_stream_state state,
