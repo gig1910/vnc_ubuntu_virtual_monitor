@@ -2,6 +2,7 @@
 #include "test_pattern.h"
 #include "benchmark.h"
 #include "frame_diff.h"
+#include "adaptive_rfb.h"
 #include "shutdown_signal.h"
 
 #include <rfb/rfb.h>
@@ -12,9 +13,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-#define KEYFRAME_IDLE_QUIET_SECONDS 0.500
-#define KEYFRAME_SIGNIFICANT_PERCENT 5.0
 
 static void
 ignore_keyboard(
@@ -128,11 +126,6 @@ transport_backpressured(
     if (unacked)
         *unacked = ua;
 
-    /*
-     * Linux commonly reports effective socket buffers larger than the value
-     * requested with SO_SNDBUF/SO_RCVBUF. Using the requested size as the
-     * threshold intentionally reacts before the kernel queues become full.
-     */
     return
         (ext >= cfg->external_send_buffer) ||
         (back >= cfg->backend_receive_buffer) ||
@@ -146,12 +139,6 @@ transport_recovered(
     int backend_inq,
     uint32_t unacked)
 {
-    /*
-     * Hysteresis: once congestion has been detected, do not resume publishing
-     * at the very first sample below the high-water mark. Let both userspace
-     * and kernel queues drain substantially first. This prevents the old
-     * enter/leave/enter oscillation visible with high-entropy screen content.
-     */
     int external_low = cfg->external_send_buffer / 4;
     int backend_low = cfg->backend_receive_buffer / 4;
 
@@ -164,6 +151,44 @@ transport_recovered(
         external_outq <= external_low &&
         backend_inq <= backend_low &&
         unacked <= 8;
+}
+
+static int
+transport_idle_ready(
+    RfbBackend *backend,
+    const RuntimeConfig *cfg,
+    int *external_outq,
+    int *backend_inq,
+    uint32_t *unacked)
+{
+    int ext = 0;
+    int back = 0;
+    uint32_t ua = 0;
+
+    int pressured =
+        transport_backpressured(
+            backend->stats,
+            cfg,
+            &ext,
+            &back,
+            &ua
+        );
+
+    if (external_outq)
+        *external_outq = ext;
+    if (backend_inq)
+        *backend_inq = back;
+    if (unacked)
+        *unacked = ua;
+
+    return
+        !pressured &&
+        transport_recovered(
+            cfg,
+            ext,
+            back,
+            ua
+        );
 }
 
 static void *
@@ -265,6 +290,21 @@ backend_thread(void *arg)
     screen->progressiveSliceHeight = 0;
     screen->maxRectsPerUpdate = 0;
 
+    AdaptiveRfbState *adaptive =
+        adaptive_rfb_create(
+            screen,
+            cfg->width,
+            cfg->height
+        );
+
+    if (!adaptive) {
+        fprintf(stderr, "Failed to initialize adaptive RFB transport\n");
+        rfbScreenCleanup(screen);
+        free(fb);
+        signal_ready(backend, 1);
+        return NULL;
+    }
+
     if (cfg->source_mode == FRAME_SOURCE_TEST) {
         test_pattern_reset();
         test_pattern_init(fb, cfg);
@@ -274,6 +314,7 @@ backend_thread(void *arg)
 
     if (!rfbIsActive(screen)) {
         fprintf(stderr, "LibVNCServer backend failed to start\n");
+        adaptive_rfb_destroy(adaptive);
         rfbScreenCleanup(screen);
         free(fb);
         signal_ready(backend, 1);
@@ -301,24 +342,22 @@ backend_thread(void *arg)
     double next_vnc_publish = 0.0;
 
     /*
-     * 0.0.24:
-     * - the framebuffer remains the last state submitted to LibVNCServer;
-     * - FrameDiff always compares the newest FrameBridge image against that
-     *   submitted reference, so skipped source frames do not require a full
-     *   resync;
-     * - congestion uses high/low-water hysteresis and never manufactures an
-     *   automatic full-screen frame while the queues are draining.
+     * 0.0.25 state model:
+     * - ordinary ZRLE updates are lossless and require no repair after source
+     *   drops or backpressure; newest-vs-reference diff is sufficient;
+     * - a JPEG21 update deliberately makes the client framebuffer approximate,
+     *   so adaptive_rfb keeps a separate repair bitmap;
+     * - only new heavy deltas join a pending JPEG. Small cursor/UI deltas keep
+     *   their lossless priority while that JPEG is waiting for an RFB request;
+     * - idle repair sends dispersed 32x32 lossless tiles at low priority.
      */
     int force_keyframe = cfg->keyframe ? 1 : 0;
     const char *keyframe_reason = "initial";
-    double last_keyframe_at = start;
     double last_source_arrival = 0.0;
     int backpressure_active = 0;
     uint64_t backpressure_events = 0;
     uint64_t keyframes = 0;
     uint64_t dropped_source_frames = 0;
-    int resync_pending = 0;
-    const char *resync_reason = NULL;
 
     size_t max_diff_rects =
         (size_t)(
@@ -338,6 +377,7 @@ backend_thread(void *arg)
 
     if (!diff_rects) {
         rfbShutdownServer(screen, TRUE);
+        adaptive_rfb_destroy(adaptive);
         rfbScreenCleanup(screen);
         free(fb);
         return NULL;
@@ -462,21 +502,17 @@ backend_thread(void *arg)
             else if (changed > 0) {
                 double arrived = monotonic_seconds();
 
-                /*
-                 * A capture gap is diagnostic by itself. With FrameDiff based
-                 * on the last submitted framebuffer it does not imply that the
-                 * client needs a full frame. Preserve the aggressive legacy
-                 * behaviour only when explicitly requested.
-                 */
                 if (
                     last_source_arrival > 0.0 &&
                     (arrived - last_source_arrival) * 1000.0 >=
                         (double)cfg->capture_stall_ms &&
-                    cfg->keyframe &&
-                    cfg->keyframe_after_drop
+                    cfg->verbose
                 ) {
-                    resync_pending = 1;
-                    resync_reason = "capture-stall";
+                    fprintf(
+                        stderr,
+                        "[CAPTURE] idle-gap=%.0fms; no repair/keyframe scheduled\n",
+                        (arrived - last_source_arrival) * 1000.0
+                    );
                 }
 
                 last_source_arrival = arrived;
@@ -485,7 +521,7 @@ backend_thread(void *arg)
             }
         }
 
-        /* Keep the RFB state machine responsive even during capture stalls. */
+        /* Keep RFB request processing alive even when capture is quiet. */
         rfbProcessEvents(screen, 0);
 
         if (stop || shutdown_signal_requested())
@@ -494,72 +530,39 @@ backend_thread(void *arg)
         now = monotonic_seconds();
 
         if (!pending_source_frame) {
-            /*
-             * Full-frame repair is intentionally an IDLE operation in 0.0.24.
-             * Cursor-only traffic and window animation must never be forced
-             * through a full-screen ZRLE update. Once the source has gone
-             * quiet and the transport is genuinely drained, emit at most one
-             * pending repair keyframe.
-             */
-            if (
-                cfg->keyframe &&
-                resync_pending &&
-                last_source_arrival > 0.0 &&
-                now - last_source_arrival >= KEYFRAME_IDLE_QUIET_SECONDS &&
-                (now - last_keyframe_at) * 1000.0 >=
-                    (double)cfg->keyframe_interval_ms
-            ) {
-                int idle_external_outq = 0;
-                int idle_backend_inq = 0;
-                uint32_t idle_unacked = 0;
-                int idle_pressured =
-                    transport_backpressured(
-                        backend->stats,
-                        cfg,
-                        &idle_external_outq,
-                        &idle_backend_inq,
-                        &idle_unacked
-                    );
+            int idle_external_outq = 0;
+            int idle_backend_inq = 0;
+            uint32_t idle_unacked = 0;
 
-                if (
-                    !idle_pressured &&
-                    transport_recovered(
-                        cfg,
-                        idle_external_outq,
-                        idle_backend_inq,
-                        idle_unacked
-                    )
-                ) {
-                    rfbMarkRectAsModified(
-                        screen,
-                        0,
-                        0,
-                        cfg->width,
-                        cfg->height
-                    );
-                    rfbProcessEvents(screen, 0);
+            int idle_ready =
+                transport_idle_ready(
+                    backend,
+                    cfg,
+                    &idle_external_outq,
+                    &idle_backend_inq,
+                    &idle_unacked
+                );
 
-                    keyframes++;
-                    last_keyframe_at = now;
+            int jpeg_rc =
+                adaptive_rfb_try_send_pending(
+                    adaptive,
+                    idle_ready,
+                    now
+                );
 
-                    fprintf(
-                        stderr,
-                        "[KF] seq=%llu reason=idle-%s full=%dx%d "
-                        "quiet=%.0fms outq=%dB backend_inq=%dB unacked=%u\n",
-                        (unsigned long long)last_bridge_sequence,
-                        resync_reason ? resync_reason : "resync",
-                        cfg->width,
-                        cfg->height,
-                        (now - last_source_arrival) * 1000.0,
-                        idle_external_outq,
-                        idle_backend_inq,
-                        idle_unacked
-                    );
-
-                    resync_pending = 0;
-                    resync_reason = NULL;
-                }
+            if (jpeg_rc < 0) {
+                fprintf(
+                    stderr,
+                    "[ADAPT] pending JPEG send failed\n"
+                );
             }
+
+            adaptive_rfb_try_schedule_repair(
+                adaptive,
+                idle_ready,
+                now,
+                last_source_arrival
+            );
 
             pipeline_stats_maybe_report(backend->stats);
             continue;
@@ -571,15 +574,6 @@ backend_thread(void *arg)
         ) {
             pipeline_stats_maybe_report(backend->stats);
             continue;
-        }
-
-        if (
-            cfg->keyframe &&
-            cfg->keyframe_after_drop &&
-            observed_bridge_sequence > last_bridge_sequence + 1
-        ) {
-            resync_pending = 1;
-            resync_reason = "source-drop";
         }
 
         int external_outq = 0;
@@ -594,11 +588,6 @@ backend_thread(void *arg)
                 &unacked
             );
 
-        /*
-         * High/low-water hysteresis. If we were already congested, staying
-         * below the entry threshold is not enough: wait until the queues are
-         * genuinely small before resuming.
-         */
         if (
             cfg->latest_only &&
             backpressure_active &&
@@ -618,11 +607,6 @@ backend_thread(void *arg)
                 backpressure_active = 1;
                 backpressure_events++;
 
-                if (cfg->keyframe && cfg->keyframe_after_drop) {
-                    resync_pending = 1;
-                    resync_reason = "backpressure";
-                }
-
                 if (cfg->verbose) {
                     fprintf(
                         stderr,
@@ -635,15 +619,6 @@ backend_thread(void *arg)
                 }
             }
 
-            /*
-             * Do not consume FrameBridge here. fb therefore remains the last
-             * submitted client reference state. When the queues recover,
-             * FrameDiff goes directly from that state to the newest frame.
-             *
-             * Crucially, do NOT force a full-screen keyframe here. The 0.0.23
-             * behaviour created a positive feedback loop:
-             * full frame -> backpressure -> full frame -> backpressure.
-             */
             pipeline_stats_maybe_report(backend->stats);
             continue;
         }
@@ -656,7 +631,7 @@ backend_thread(void *arg)
                     stderr,
                     "[GOV] backpressure cleared at low-water: "
                     "outq=%dB backend_inq=%dB unacked=%u; "
-                    "publishing newest delta\n",
+                    "publishing newest state\n",
                     external_outq,
                     backend_inq,
                     unacked
@@ -674,6 +649,8 @@ backend_thread(void *arg)
         uint64_t published_pixels = 0;
         uint64_t dirty_pixels = 0;
         int emitted_keyframe = 0;
+        int queued_jpeg = 0;
+        double changed_percent = 0.0;
 
         if (force_keyframe && cfg->keyframe) {
             int changed =
@@ -692,6 +669,14 @@ backend_thread(void *arg)
                     cfg->height
                 );
 
+                adaptive_rfb_note_lossless_rect(
+                    adaptive,
+                    0,
+                    0,
+                    cfg->width,
+                    cfg->height
+                );
+
                 published_rect_count = 1;
                 published_pixels =
                     (uint64_t)cfg->width *
@@ -699,15 +684,12 @@ backend_thread(void *arg)
                 dirty_pixels = published_pixels;
                 emitted_keyframe = 1;
                 keyframes++;
-                last_keyframe_at = now;
-                resync_pending = 0;
-                resync_reason = NULL;
 
                 fprintf(
                     stderr,
                     "[KF] seq=%llu reason=%s full=%dx%d\n",
                     (unsigned long long)last_bridge_sequence,
-                    keyframe_reason ? keyframe_reason : "resync",
+                    keyframe_reason ? keyframe_reason : "initial",
                     cfg->width,
                     cfg->height
                 );
@@ -741,32 +723,53 @@ backend_thread(void *arg)
                     );
 
                 if (changed > 0) {
-                    rfbMarkRectAsModified(
-                        screen,
-                        0,
-                        0,
-                        cfg->width,
-                        cfg->height
-                    );
-
                     published_rect_count = 1;
                     published_pixels =
                         (uint64_t)cfg->width *
                         (uint64_t)cfg->height;
                     dirty_pixels = published_pixels;
+                    changed_percent = 100.0;
+
+                    if (
+                        adaptive_rfb_should_queue_jpeg(
+                            adaptive,
+                            changed_percent
+                        )
+                    ) {
+                        adaptive_rfb_queue_jpeg_rect(
+                            adaptive,
+                            0,
+                            0,
+                            cfg->width,
+                            cfg->height,
+                            last_bridge_sequence,
+                            changed_percent
+                        );
+                        queued_jpeg = 1;
+                    }
+                    else {
+                        rfbMarkRectAsModified(
+                            screen,
+                            0,
+                            0,
+                            cfg->width,
+                            cfg->height
+                        );
+                        adaptive_rfb_note_lossless_rect(
+                            adaptive,
+                            0,
+                            0,
+                            cfg->width,
+                            cfg->height
+                        );
+                    }
                 }
             }
             else {
+                published_rect_count = rect_count;
+
                 for (int i = 0; i < rect_count; i++) {
                     FrameDiffRect *rect = &diff_rects[i];
-
-                    rfbMarkRectAsModified(
-                        screen,
-                        rect->x1,
-                        rect->y1,
-                        rect->x2,
-                        rect->y2
-                    );
 
                     uint64_t rect_pixels =
                         (uint64_t)(rect->x2 - rect->x1) *
@@ -776,7 +779,65 @@ backend_thread(void *arg)
                     published_pixels += rect_pixels;
                 }
 
-                published_rect_count = rect_count;
+                uint64_t total_pixels =
+                    (uint64_t)cfg->width *
+                    (uint64_t)cfg->height;
+
+                changed_percent =
+                    total_pixels > 0
+                        ? (double)published_pixels * 100.0 /
+                            (double)total_pixels
+                        : 0.0;
+
+                int heavy_delta =
+                    changed_percent >=
+                        ADAPTIVE_RFB_JPEG_THRESHOLD_PERCENT;
+
+                if (
+                    rect_count > 0 &&
+                    heavy_delta &&
+                    adaptive_rfb_should_queue_jpeg(
+                        adaptive,
+                        changed_percent
+                    )
+                ) {
+                    for (int i = 0; i < rect_count; i++) {
+                        FrameDiffRect *rect = &diff_rects[i];
+
+                        adaptive_rfb_queue_jpeg_rect(
+                            adaptive,
+                            rect->x1,
+                            rect->y1,
+                            rect->x2,
+                            rect->y2,
+                            last_bridge_sequence,
+                            changed_percent
+                        );
+                    }
+
+                    queued_jpeg = 1;
+                }
+                else {
+                    for (int i = 0; i < rect_count; i++) {
+                        FrameDiffRect *rect = &diff_rects[i];
+
+                        rfbMarkRectAsModified(
+                            screen,
+                            rect->x1,
+                            rect->y1,
+                            rect->x2,
+                            rect->y2
+                        );
+
+                        adaptive_rfb_note_lossless_rect(
+                            adaptive,
+                            rect->x1,
+                            rect->y1,
+                            rect->x2,
+                            rect->y2
+                        );
+                    }
+                }
             }
         }
         else {
@@ -788,19 +849,46 @@ backend_thread(void *arg)
                 );
 
             if (changed > 0) {
-                rfbMarkRectAsModified(
-                    screen,
-                    0,
-                    0,
-                    cfg->width,
-                    cfg->height
-                );
-
                 published_rect_count = 1;
                 published_pixels =
                     (uint64_t)cfg->width *
                     (uint64_t)cfg->height;
                 dirty_pixels = published_pixels;
+                changed_percent = 100.0;
+
+                if (
+                    adaptive_rfb_should_queue_jpeg(
+                        adaptive,
+                        changed_percent
+                    )
+                ) {
+                    adaptive_rfb_queue_jpeg_rect(
+                        adaptive,
+                        0,
+                        0,
+                        cfg->width,
+                        cfg->height,
+                        last_bridge_sequence,
+                        changed_percent
+                    );
+                    queued_jpeg = 1;
+                }
+                else {
+                    rfbMarkRectAsModified(
+                        screen,
+                        0,
+                        0,
+                        cfg->width,
+                        cfg->height
+                    );
+                    adaptive_rfb_note_lossless_rect(
+                        adaptive,
+                        0,
+                        0,
+                        cfg->width,
+                        cfg->height
+                    );
+                }
             }
         }
 
@@ -820,6 +908,23 @@ backend_thread(void *arg)
 
         double rfb_started = benchmark_now();
         rfbProcessEvents(screen, 0);
+
+        int adaptive_ready =
+            !pressured &&
+            transport_recovered(
+                cfg,
+                external_outq,
+                backend_inq,
+                unacked
+            );
+
+        int jpeg_sent =
+            adaptive_rfb_try_send_pending(
+                adaptive,
+                adaptive_ready,
+                monotonic_seconds()
+            );
+
         double rfb_ms =
             (benchmark_now() - rfb_started) * 1000.0;
 
@@ -830,31 +935,6 @@ backend_thread(void *arg)
 
         if (sequence_delta > 1)
             dropped_source_frames += sequence_delta - 1;
-
-        /*
-         * Large real framebuffer changes arm one deferred repair keyframe.
-         * Small cursor-only deltas stay below this threshold, so moving the
-         * pointer over a static high-entropy image never schedules full-screen
-         * redraws.
-         */
-        if (
-            cfg->keyframe &&
-            !emitted_keyframe &&
-            published_pixels > 0
-        ) {
-            uint64_t total_pixels =
-                (uint64_t)cfg->width * (uint64_t)cfg->height;
-            double changed_percent =
-                total_pixels > 0
-                    ? (double)published_pixels * 100.0 /
-                        (double)total_pixels
-                    : 0.0;
-
-            if (changed_percent >= KEYFRAME_SIGNIFICANT_PERCENT) {
-                resync_pending = 1;
-                resync_reason = "large-change";
-            }
-        }
 
         double diff_ms =
             (pipeline_stats_now() - diff_started) * 1000.0;
@@ -878,15 +958,23 @@ backend_thread(void *arg)
         );
 
         if (cfg->latency_trace) {
+            const char *mode =
+                emitted_keyframe
+                    ? "keyframe-zrle"
+                    : queued_jpeg
+                        ? (jpeg_sent > 0 ? "jpeg21" : "jpeg21-pending")
+                        : "zrle";
+
             fprintf(
                 stderr,
                 "[LATENCY] seq=%llu source_delta=%llu dropped=%llu "
-                "keyframe=%s diff=%.3fms rfb=%.3fms "
+                "mode=%s changed=%.1f%% diff=%.3fms rfb=%.3fms "
                 "outq=%dB backend_inq=%dB unacked=%u\n",
                 (unsigned long long)last_bridge_sequence,
                 (unsigned long long)sequence_delta,
                 (unsigned long long)(sequence_delta > 1 ? sequence_delta - 1 : 0),
-                emitted_keyframe ? "yes" : "no",
+                mode,
+                changed_percent,
                 diff_ms,
                 rfb_ms,
                 external_outq,
@@ -910,14 +998,16 @@ backend_thread(void *arg)
     fprintf(
         stderr,
         "[GOV][SUMMARY] keyframes=%llu backpressure-events=%llu "
-        "dropped-source=%llu resync-pending=%s\n",
+        "dropped-source=%llu\n",
         (unsigned long long)keyframes,
         (unsigned long long)backpressure_events,
-        (unsigned long long)dropped_source_frames,
-        resync_pending ? "yes" : "no"
+        (unsigned long long)dropped_source_frames
     );
 
+    adaptive_rfb_print_summary(adaptive);
+
     rfbShutdownServer(screen, TRUE);
+    adaptive_rfb_destroy(adaptive);
     rfbScreenCleanup(screen);
     free(diff_rects);
     free(fb);
