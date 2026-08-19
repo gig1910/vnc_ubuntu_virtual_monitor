@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "runtime_config.h"
+#include "config.h"
 
 #include <errno.h>
 #include <getopt.h>
@@ -119,12 +120,8 @@ parse_bool(
 const char *
 runtime_config_source_name(FrameSourceMode mode)
 {
-    return
-        mode == FRAME_SOURCE_TEST
-            ? "test"
-            : "mutter";
+    return mode == FRAME_SOURCE_TEST ? "test" : "mutter";
 }
-
 
 const char *
 runtime_config_capture_backend_name(CaptureBackend backend)
@@ -139,10 +136,12 @@ parse_capture_backend(const char *value, CaptureBackend *out)
         *out = CAPTURE_BACKEND_PIPEWIRE;
         return 0;
     }
+
     if (strcasecmp(value, "gstreamer") == 0 || strcasecmp(value, "gst") == 0) {
         *out = CAPTURE_BACKEND_GSTREAMER;
         return 0;
     }
+
     fprintf(stderr, "Invalid capture backend: %s (use pipewire or gstreamer)\n", value);
     return -1;
 }
@@ -162,12 +161,7 @@ parse_source_mode(
         return 0;
     }
 
-    fprintf(
-        stderr,
-        "Invalid source: %s (use mutter or test)\n",
-        value
-    );
-
+    fprintf(stderr, "Invalid source: %s (use mutter or test)\n", value);
     return -1;
 }
 
@@ -217,11 +211,9 @@ parse_benchmark_mode(
 
     fprintf(
         stderr,
-        "Invalid benchmark mode: %s "
-        "(use off, square-sweep or suite)\n",
+        "Invalid benchmark mode: %s (use off, square-sweep or suite)\n",
         value
     );
-
     return -1;
 }
 
@@ -240,12 +232,7 @@ parse_damage_mode(
         return 0;
     }
 
-    fprintf(
-        stderr,
-        "Invalid damage mode: %s (use rect or full)\n",
-        value
-    );
-
+    fprintf(stderr, "Invalid damage mode: %s (use rect or full)\n", value);
     return -1;
 }
 
@@ -259,6 +246,11 @@ runtime_config_defaults(RuntimeConfig *cfg)
         .mutter_cursor_mode = MUTTER_CURSOR_HIDDEN,
         .mutter_hardware_cursor_mode = MUTTER_HW_CURSOR_AUTO,
         .vnc_max_fps = 0,
+        .latest_only = 1,
+        .keyframe = 1,
+        .keyframe_interval_ms = 2000,
+        .keyframe_after_drop = 1,
+        .latency_trace = 0,
         .external_send_buffer = 65536,
         .backend_receive_buffer = 65536,
         .diff_detect = 1,
@@ -313,6 +305,7 @@ void
 runtime_config_usage(const char *argv0)
 {
     printf(
+        "VNC Monitor Server %s\n"
         "Usage: %s [options]\n"
         "\n"
         "Source:\n"
@@ -323,6 +316,10 @@ runtime_config_usage(const char *argv0)
         "  --mutter-hardware-cursor M   auto|enabled|disabled         [auto]\n"
         "  --vnc-fps source|N           Max VNC publish rate      [source]\n"
         "                              source/0 = every new source frame\n"
+        "  --latest-only on|off         Drop stale source states     [on]\n"
+        "  --keyframe on|off            Full-frame resync             [on]\n"
+        "  --keyframe-interval-ms N     Periodic resync interval     [2000]\n"
+        "  --keyframe-after-drop on|off Full resync after drop        [on]\n"
         "  --external-send-buffer N     RA2 TCP SO_SNDBUF bytes     [65536]\n"
         "  --backend-recv-buffer N      Backend TCP SO_RCVBUF bytes [65536]\n"
         "  --diff-detect on|off         Diff real frames by tiles    [on]\n"
@@ -331,6 +328,7 @@ runtime_config_usage(const char *argv0)
         "  --layout-resave on|off       Overwrite cached layout      [off]\n"
         "  --frame-stats on|off         Pipeline stats once/sec      [on]\n"
         "  --frame-trace on|off         One line per VNC publish     [off]\n"
+        "  --latency-trace on|off       Per-publish age diagnostics  [off]\n"
         "  --capture-trace on|off       One line per capture frame   [off]\n"
         "  --capture-stall-ms N         Capture stall threshold      [500]\n"
         "  --frame-stats-interval-ms N  Stats interval               [1000]\n"
@@ -381,13 +379,15 @@ runtime_config_usage(const char *argv0)
         "Diagnostics:\n"
         "  --verbose on|off            Extra diagnostics          [on]\n"
         "  --show-config               Print config and exit\n"
+        "  --version                   Print version and exit\n"
         "  -h, --help                  Show this help\n"
         "\n"
         "Examples:\n"
         "  %s --ra2-record-size 32768\n"
+        "  %s --keyframe-interval-ms 2000 --latest-only on\n"
         "  %s --benchmark square-sweep --benchmark-csv square.csv\n"
-        "  %s --benchmark suite --benchmark-step 10 --benchmark-csv suite.csv\n"
-        "  %s --benchmark suite --damage full --ra2-record-size 32768\n",
+        "  %s --benchmark suite --benchmark-step 10 --benchmark-csv suite.csv\n",
+        VNC_MONITOR_VERSION,
         argv0,
         argv0,
         argv0,
@@ -401,6 +401,7 @@ runtime_config_print(const RuntimeConfig *cfg)
 {
     printf(
         "Runtime configuration:\n"
+        "  version:            %s\n"
         "  source:             %s\n"
         "  capture backend:    %s\n"
         "  capture timeout:    %d ms\n"
@@ -408,6 +409,11 @@ runtime_config_print(const RuntimeConfig *cfg)
         "  Mutter HW cursor:   %s (requested)\n"
         "  VNC publisher:      source-driven\n"
         "  VNC max rate:       %s\n"
+        "  latest-only:        %s\n"
+        "  keyframe:           %s\n"
+        "  keyframe interval:  %d ms\n"
+        "  keyframe after drop:%s\n"
+        "  latency trace:      %s\n"
         "  external sndbuf:    %d bytes\n"
         "  backend rcvbuf:     %d bytes\n"
         "  diff detect:        %s\n"
@@ -442,12 +448,18 @@ runtime_config_print(const RuntimeConfig *cfg)
         "  benchmark square:   %d..%d step %d\n"
         "  benchmark CSV:      %s\n"
         "  verbose:            %s\n",
+        VNC_MONITOR_VERSION,
         runtime_config_source_name(cfg->source_mode),
         runtime_config_capture_backend_name(cfg->capture_backend),
         cfg->capture_timeout_ms,
         runtime_config_mutter_cursor_name(cfg->mutter_cursor_mode),
         runtime_config_mutter_hardware_cursor_name(cfg->mutter_hardware_cursor_mode),
         cfg->vnc_max_fps > 0 ? "rate-limited" : "unlimited/source",
+        cfg->latest_only ? "on" : "off",
+        cfg->keyframe ? "on" : "off",
+        cfg->keyframe_interval_ms,
+        cfg->keyframe_after_drop ? "on" : "off",
+        cfg->latency_trace ? "on" : "off",
         cfg->external_send_buffer,
         cfg->backend_receive_buffer,
         cfg->diff_detect ? "on" : "off",
@@ -503,10 +515,8 @@ runtime_config_mutter_cursor_name(
     switch (mode) {
         case MUTTER_CURSOR_HIDDEN:
             return "hidden";
-
         case MUTTER_CURSOR_EMBEDDED:
             return "embedded";
-
         case MUTTER_CURSOR_METADATA:
             return "metadata";
     }
@@ -543,25 +553,21 @@ parse_mutter_hardware_cursor(
         return 0;
     }
 
-    if (strcasecmp(value, "enabled") == 0 ||
-        strcasecmp(value, "on") == 0) {
+    if (strcasecmp(value, "enabled") == 0 || strcasecmp(value, "on") == 0) {
         *out = MUTTER_HW_CURSOR_ENABLED;
         return 0;
     }
 
-    if (strcasecmp(value, "disabled") == 0 ||
-        strcasecmp(value, "off") == 0) {
+    if (strcasecmp(value, "disabled") == 0 || strcasecmp(value, "off") == 0) {
         *out = MUTTER_HW_CURSOR_DISABLED;
         return 0;
     }
 
     fprintf(
         stderr,
-        "Invalid --mutter-hardware-cursor value: %s "
-        "(expected auto|enabled|disabled)\n",
+        "Invalid --mutter-hardware-cursor value: %s (expected auto|enabled|disabled)\n",
         value
     );
-
     return -1;
 }
 
@@ -573,8 +579,7 @@ parse_vnc_fps(
     if (!value || !out)
         return -1;
 
-    if (strcasecmp(value, "source") == 0 ||
-        strcasecmp(value, "unlimited") == 0) {
+    if (strcasecmp(value, "source") == 0 || strcasecmp(value, "unlimited") == 0) {
         *out = 0;
         return 0;
     }
@@ -607,11 +612,9 @@ parse_mutter_cursor(
 
     fprintf(
         stderr,
-        "Invalid --mutter-cursor value: %s "
-        "(expected hidden|embedded|metadata)\n",
+        "Invalid --mutter-cursor value: %s (expected hidden|embedded|metadata)\n",
         value
     );
-
     return -1;
 }
 
@@ -628,6 +631,11 @@ runtime_config_parse(
         OPT_MUTTER_CURSOR,
         OPT_MUTTER_HARDWARE_CURSOR,
         OPT_VNC_FPS,
+        OPT_LATEST_ONLY,
+        OPT_KEYFRAME,
+        OPT_KEYFRAME_INTERVAL_MS,
+        OPT_KEYFRAME_AFTER_DROP,
+        OPT_LATENCY_TRACE,
         OPT_EXTERNAL_SEND_BUFFER,
         OPT_BACKEND_RECV_BUFFER,
         OPT_DIFF_DETECT,
@@ -659,6 +667,7 @@ runtime_config_parse(
         OPT_FILE_TRANSFER,
         OPT_VERBOSE,
         OPT_SHOW_CONFIG,
+        OPT_VERSION,
         OPT_SQUARE_MIN,
         OPT_SQUARE_MAX,
         OPT_SQUARE_SPEED,
@@ -680,6 +689,11 @@ runtime_config_parse(
         {"mutter-cursor", required_argument, NULL, OPT_MUTTER_CURSOR},
         {"mutter-hardware-cursor", required_argument, NULL, OPT_MUTTER_HARDWARE_CURSOR},
         {"vnc-fps", required_argument, NULL, OPT_VNC_FPS},
+        {"latest-only", required_argument, NULL, OPT_LATEST_ONLY},
+        {"keyframe", required_argument, NULL, OPT_KEYFRAME},
+        {"keyframe-interval-ms", required_argument, NULL, OPT_KEYFRAME_INTERVAL_MS},
+        {"keyframe-after-drop", required_argument, NULL, OPT_KEYFRAME_AFTER_DROP},
+        {"latency-trace", required_argument, NULL, OPT_LATENCY_TRACE},
         {"external-send-buffer", required_argument, NULL, OPT_EXTERNAL_SEND_BUFFER},
         {"backend-recv-buffer", required_argument, NULL, OPT_BACKEND_RECV_BUFFER},
         {"diff-detect", required_argument, NULL, OPT_DIFF_DETECT},
@@ -711,6 +725,7 @@ runtime_config_parse(
         {"file-transfer", required_argument, NULL, OPT_FILE_TRANSFER},
         {"verbose", required_argument, NULL, OPT_VERBOSE},
         {"show-config", no_argument, NULL, OPT_SHOW_CONFIG},
+        {"version", no_argument, NULL, OPT_VERSION},
         {"square-min", required_argument, NULL, OPT_SQUARE_MIN},
         {"square-max", required_argument, NULL, OPT_SQUARE_MAX},
         {"square-speed", required_argument, NULL, OPT_SQUARE_SPEED},
@@ -728,26 +743,14 @@ runtime_config_parse(
     };
 
     for (;;) {
-        int c =
-            getopt_long(
-                argc,
-                argv,
-                "h",
-                options,
-                NULL
-            );
+        int c = getopt_long(argc, argv, "h", options, NULL);
 
         if (c == -1)
             break;
 
         switch (c) {
             case OPT_SOURCE:
-                if (
-                    parse_source_mode(
-                        optarg,
-                        &cfg->source_mode
-                    ) < 0
-                )
+                if (parse_source_mode(optarg, &cfg->source_mode) < 0)
                     return -1;
                 break;
 
@@ -757,35 +760,17 @@ runtime_config_parse(
                 break;
 
             case OPT_CAPTURE_TIMEOUT_MS:
-                if (
-                    parse_int(
-                        "capture-timeout-ms",
-                        optarg,
-                        100,
-                        60000,
-                        &cfg->capture_timeout_ms
-                    ) < 0
-                )
+                if (parse_int("capture-timeout-ms", optarg, 100, 60000, &cfg->capture_timeout_ms) < 0)
                     return -1;
                 break;
 
             case OPT_MUTTER_CURSOR:
-                if (
-                    parse_mutter_cursor(
-                        optarg,
-                        &cfg->mutter_cursor_mode
-                    ) < 0
-                )
+                if (parse_mutter_cursor(optarg, &cfg->mutter_cursor_mode) < 0)
                     return -1;
                 break;
 
             case OPT_MUTTER_HARDWARE_CURSOR:
-                if (
-                    parse_mutter_hardware_cursor(
-                        optarg,
-                        &cfg->mutter_hardware_cursor_mode
-                    ) < 0
-                )
+                if (parse_mutter_hardware_cursor(optarg, &cfg->mutter_hardware_cursor_mode) < 0)
                     return -1;
                 break;
 
@@ -794,134 +779,83 @@ runtime_config_parse(
                     return -1;
                 break;
 
+            case OPT_LATEST_ONLY:
+                if (parse_bool("latest-only", optarg, &cfg->latest_only) < 0)
+                    return -1;
+                break;
+
+            case OPT_KEYFRAME:
+                if (parse_bool("keyframe", optarg, &cfg->keyframe) < 0)
+                    return -1;
+                break;
+
+            case OPT_KEYFRAME_INTERVAL_MS:
+                if (parse_int("keyframe-interval-ms", optarg, 100, 600000, &cfg->keyframe_interval_ms) < 0)
+                    return -1;
+                break;
+
+            case OPT_KEYFRAME_AFTER_DROP:
+                if (parse_bool("keyframe-after-drop", optarg, &cfg->keyframe_after_drop) < 0)
+                    return -1;
+                break;
+
+            case OPT_LATENCY_TRACE:
+                if (parse_bool("latency-trace", optarg, &cfg->latency_trace) < 0)
+                    return -1;
+                break;
+
             case OPT_EXTERNAL_SEND_BUFFER:
-                if (
-                    parse_int(
-                        "external-send-buffer",
-                        optarg,
-                        4096,
-                        4194304,
-                        &cfg->external_send_buffer
-                    ) < 0
-                )
+                if (parse_int("external-send-buffer", optarg, 4096, 4194304, &cfg->external_send_buffer) < 0)
                     return -1;
                 break;
 
             case OPT_BACKEND_RECV_BUFFER:
-                if (
-                    parse_int(
-                        "backend-recv-buffer",
-                        optarg,
-                        4096,
-                        4194304,
-                        &cfg->backend_receive_buffer
-                    ) < 0
-                )
+                if (parse_int("backend-recv-buffer", optarg, 4096, 4194304, &cfg->backend_receive_buffer) < 0)
                     return -1;
                 break;
 
             case OPT_DIFF_DETECT:
-                if (
-                    parse_bool(
-                        "diff-detect",
-                        optarg,
-                        &cfg->diff_detect
-                    ) < 0
-                )
+                if (parse_bool("diff-detect", optarg, &cfg->diff_detect) < 0)
                     return -1;
                 break;
 
             case OPT_DIFF_TILE_SIZE:
-                if (
-                    parse_int(
-                        "diff-tile-size",
-                        optarg,
-                        8,
-                        256,
-                        &cfg->diff_tile_size
-                    ) < 0
-                )
+                if (parse_int("diff-tile-size", optarg, 8, 256, &cfg->diff_tile_size) < 0)
                     return -1;
                 break;
 
             case OPT_LAYOUT_REMEMBER:
-                if (
-                    parse_bool(
-                        "layout-remember",
-                        optarg,
-                        &cfg->layout_remember
-                    ) < 0
-                )
+                if (parse_bool("layout-remember", optarg, &cfg->layout_remember) < 0)
                     return -1;
                 break;
 
             case OPT_LAYOUT_RESAVE:
-                if (
-                    parse_bool(
-                        "layout-resave",
-                        optarg,
-                        &cfg->layout_resave
-                    ) < 0
-                )
+                if (parse_bool("layout-resave", optarg, &cfg->layout_resave) < 0)
                     return -1;
                 break;
 
             case OPT_FRAME_STATS:
-                if (
-                    parse_bool(
-                        "frame-stats",
-                        optarg,
-                        &cfg->frame_stats
-                    ) < 0
-                )
+                if (parse_bool("frame-stats", optarg, &cfg->frame_stats) < 0)
                     return -1;
                 break;
 
             case OPT_FRAME_TRACE:
-                if (
-                    parse_bool(
-                        "frame-trace",
-                        optarg,
-                        &cfg->frame_trace
-                    ) < 0
-                )
+                if (parse_bool("frame-trace", optarg, &cfg->frame_trace) < 0)
                     return -1;
                 break;
 
             case OPT_CAPTURE_TRACE:
-                if (
-                    parse_bool(
-                        "capture-trace",
-                        optarg,
-                        &cfg->capture_trace
-                    ) < 0
-                )
+                if (parse_bool("capture-trace", optarg, &cfg->capture_trace) < 0)
                     return -1;
                 break;
 
             case OPT_CAPTURE_STALL_MS:
-                if (
-                    parse_int(
-                        "capture-stall-ms",
-                        optarg,
-                        50,
-                        60000,
-                        &cfg->capture_stall_ms
-                    ) < 0
-                )
+                if (parse_int("capture-stall-ms", optarg, 50, 60000, &cfg->capture_stall_ms) < 0)
                     return -1;
                 break;
 
             case OPT_FRAME_STATS_INTERVAL_MS:
-                if (
-                    parse_int(
-                        "frame-stats-interval-ms",
-                        optarg,
-                        100,
-                        60000,
-                        &cfg->frame_stats_interval_ms
-                    ) < 0
-                )
+                if (parse_int("frame-stats-interval-ms", optarg, 100, 60000, &cfg->frame_stats_interval_ms) < 0)
                     return -1;
                 break;
 
@@ -955,39 +889,17 @@ runtime_config_parse(
                 break;
 
             case OPT_RA2_RECORD_SIZE:
-                if (
-                    parse_int(
-                        "ra2-record-size",
-                        optarg,
-                        1,
-                        65535,
-                        &cfg->ra2_stream_record_max
-                    ) < 0
-                )
+                if (parse_int("ra2-record-size", optarg, 1, 65535, &cfg->ra2_stream_record_max) < 0)
                     return -1;
                 break;
 
             case OPT_RA2_COALESCE:
-                if (
-                    parse_bool(
-                        "ra2-coalesce",
-                        optarg,
-                        &cfg->ra2_coalesce
-                    ) < 0
-                )
+                if (parse_bool("ra2-coalesce", optarg, &cfg->ra2_coalesce) < 0)
                     return -1;
                 break;
 
             case OPT_RA2_COALESCE_US:
-                if (
-                    parse_int(
-                        "ra2-coalesce-us",
-                        optarg,
-                        0,
-                        1000000,
-                        &cfg->ra2_coalesce_us
-                    ) < 0
-                )
+                if (parse_int("ra2-coalesce-us", optarg, 0, 1000000, &cfg->ra2_coalesce_us) < 0)
                     return -1;
                 break;
 
@@ -1070,67 +982,27 @@ runtime_config_parse(
                 break;
 
             case OPT_BENCHMARK_INTERVAL:
-                if (
-                    parse_double(
-                        "benchmark-interval",
-                        optarg,
-                        0.1,
-                        3600.0,
-                        &cfg->benchmark_interval_seconds
-                    ) < 0
-                )
+                if (parse_double("benchmark-interval", optarg, 0.1, 3600.0, &cfg->benchmark_interval_seconds) < 0)
                     return -1;
                 break;
 
             case OPT_BENCHMARK_STEP:
-                if (
-                    parse_double(
-                        "benchmark-step",
-                        optarg,
-                        0.25,
-                        3600.0,
-                        &cfg->benchmark_step_seconds
-                    ) < 0
-                )
+                if (parse_double("benchmark-step", optarg, 0.25, 3600.0, &cfg->benchmark_step_seconds) < 0)
                     return -1;
                 break;
 
             case OPT_BENCHMARK_SQUARE_MIN:
-                if (
-                    parse_int(
-                        "benchmark-square-min",
-                        optarg,
-                        1,
-                        16384,
-                        &cfg->benchmark_square_min
-                    ) < 0
-                )
+                if (parse_int("benchmark-square-min", optarg, 1, 16384, &cfg->benchmark_square_min) < 0)
                     return -1;
                 break;
 
             case OPT_BENCHMARK_SQUARE_MAX:
-                if (
-                    parse_int(
-                        "benchmark-square-max",
-                        optarg,
-                        1,
-                        16384,
-                        &cfg->benchmark_square_max
-                    ) < 0
-                )
+                if (parse_int("benchmark-square-max", optarg, 1, 16384, &cfg->benchmark_square_max) < 0)
                     return -1;
                 break;
 
             case OPT_BENCHMARK_SQUARE_STEP:
-                if (
-                    parse_int(
-                        "benchmark-square-step",
-                        optarg,
-                        1,
-                        16384,
-                        &cfg->benchmark_square_step
-                    ) < 0
-                )
+                if (parse_int("benchmark-square-step", optarg, 1, 16384, &cfg->benchmark_square_step) < 0)
                     return -1;
                 break;
 
@@ -1140,6 +1012,10 @@ runtime_config_parse(
 
             case OPT_SHOW_CONFIG:
                 runtime_config_print(cfg);
+                exit(0);
+
+            case OPT_VERSION:
+                printf("%s\n", VNC_MONITOR_VERSION);
                 exit(0);
 
             case 'h':
@@ -1152,19 +1028,12 @@ runtime_config_parse(
     }
 
     if (optind != argc) {
-        fprintf(
-            stderr,
-            "Unexpected positional argument: %s\n",
-            argv[optind]
-        );
+        fprintf(stderr, "Unexpected positional argument: %s\n", argv[optind]);
         return -1;
     }
 
     if (!cfg->enable_zrle && !cfg->enable_raw) {
-        fprintf(
-            stderr,
-            "At least one of --zrle or --raw must be enabled\n"
-        );
+        fprintf(stderr, "At least one of --zrle or --raw must be enabled\n");
         return -1;
     }
 
