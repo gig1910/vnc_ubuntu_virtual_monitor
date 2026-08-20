@@ -15,9 +15,9 @@ usage() {
 Usage: ./build-deb.sh [--clean] [--jobs N] [--output-dir DIR]
 
 Build a compiled Debian/Ubuntu binary package for the current architecture.
-The resulting .deb contains runtime binaries, config, PAM support and systemd
-units. Build/development packages are checked only on this build machine and
-are NOT added to the binary package Depends field.
+The resulting .deb contains the system broker, per-user GNOME session agent,
+config, PAM support and systemd units. Build/development packages are checked
+only on this build machine and are NOT added to binary package Depends.
 
 Options:
   --clean            Run make clean before compilation.
@@ -78,7 +78,7 @@ fi
 printf '\n===== VNC MONITOR: DEB BUILD PREFLIGHT =====\n'
 
 required_commands=(
-    make cc pkg-config nproc mktemp install sed
+    make cc pkg-config nproc mktemp install sed ln
     dpkg-deb dpkg-shlibdeps dpkg-architecture
 )
 missing_commands=()
@@ -197,7 +197,7 @@ if [[ -z "$upstream_version" ]]; then
     exit 1
 fi
 
-# Debian sorts '~' before the final release, so 0.1.0~beta.2 < 0.1.0.
+# Debian sorts '~' before the final release, so 0.1.0~beta.3 < 0.1.0.
 deb_upstream_version="${upstream_version/-beta./~beta.}"
 deb_upstream_version="${deb_upstream_version/-rc./~rc.}"
 deb_version="${deb_upstream_version}-${DEB_REVISION}"
@@ -221,6 +221,8 @@ printf '\n===== VNC MONITOR: PACKAGE STAGE =====\n'
 
 install -Dm0755 vnc-monitor \
     "$stage/usr/bin/vnc-monitor"
+install -Dm0755 vnc-monitor-broker \
+    "$stage/usr/libexec/vnc-monitor-broker"
 install -Dm0755 auth-helper/vnc-monitor-auth-helper \
     "$stage/usr/libexec/vnc-monitor-auth-helper"
 install -Dm0644 config/vnc-monitor.conf \
@@ -228,13 +230,12 @@ install -Dm0644 config/vnc-monitor.conf \
 install -Dm0644 auth-helper/vnc-monitor.pam \
     "$stage/etc/pam.d/vnc-monitor"
 
-# Package user service. Unlike the source-install unit, the executable is under
-# /usr/bin and no explicit --config is needed: the daemon itself loads
-# /etc/vnc-monitor/config.ini and then the user's optional override.
+# Package user agent. RuntimeDirectory gives the hardened service a writable
+# $XDG_RUNTIME_DIR/vnc-monitor for its broker control socket.
 mkdir -p "$stage/usr/lib/systemd/user"
 cat >"$stage/usr/lib/systemd/user/vnc-monitor.service" <<'EOF'
 [Unit]
-Description=VNC Monitor for the active GNOME Wayland session
+Description=VNC Monitor agent for the active GNOME Wayland session
 Documentation=https://github.com/gig1910/vnc_ubuntu_virtual_monitor
 PartOf=graphical-session.target
 After=graphical-session.target pipewire.service
@@ -243,27 +244,42 @@ Wants=pipewire.service
 [Service]
 Type=simple
 ExecStartPre=/usr/bin/mkdir -p %h/.config/vnc-monitor %h/.config/vnc-monitor-server %h/.cache/vnc-monitor
-ExecStart=/usr/bin/vnc-monitor
+ExecStart=/usr/bin/vnc-monitor --agent
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s
 UMask=0077
+RuntimeDirectory=vnc-monitor
+RuntimeDirectoryMode=0700
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config %h/.cache
+ReadWritePaths=%h/.config %h/.cache %t/vnc-monitor
 
 [Install]
 WantedBy=graphical-session.target
 EOF
 chmod 0644 "$stage/usr/lib/systemd/user/vnc-monitor.service"
 
-# Generic system PAM socket. The socket is intentionally not tied to the user
-# who built the package. The privileged helper enforces SO_PEERCRED and rejects
-# authentication requests whose username differs from the connecting process'
-# Unix account, so one local user cannot use the helper to authenticate another.
+# Ship the Wants symlink so every future graphical user session gets an agent
+# without per-account package-time home modifications.
+mkdir -p "$stage/usr/lib/systemd/user/graphical-session.target.wants"
+ln -s ../vnc-monitor.service \
+    "$stage/usr/lib/systemd/user/graphical-session.target.wants/vnc-monitor.service"
+
+# System broker: owns TCP/5901 (or system-configured port), queries logind
+# seat0.ActiveSession, and passes the accepted TCP descriptor to exactly that
+# active user's agent. Package path differs from source-install /usr/local.
 mkdir -p "$stage/usr/lib/systemd/system"
+sed 's#/usr/local/libexec/vnc-monitor-broker#/usr/libexec/vnc-monitor-broker#' \
+    systemd/vnc-monitor-broker.service \
+    >"$stage/usr/lib/systemd/system/vnc-monitor-broker.service"
+chmod 0644 "$stage/usr/lib/systemd/system/vnc-monitor-broker.service"
+
+# Generic system PAM socket. The privileged helper enforces SO_PEERCRED and
+# rejects authentication requests whose username differs from the connecting
+# user-agent process' Unix account.
 cat >"$stage/usr/lib/systemd/system/vnc-monitor-auth.socket" <<'EOF'
 [Unit]
 Description=VNC Monitor PAM authentication socket
@@ -299,13 +315,13 @@ install -Dm0644 docs/ARCHITECTURE.md \
 install -Dm0644 docs/TROUBLESHOOTING.md \
     "$stage/usr/share/doc/vnc-monitor/TROUBLESHOOTING.md"
 
-# Make dpkg preserve administrator edits to both system configuration files.
+# Preserve administrator edits to system policy/PAM files.
 cat >"$stage/DEBIAN/conffiles" <<'EOF'
 /etc/vnc-monitor/config.ini
 /etc/pam.d/vnc-monitor
 EOF
 
-# Determine only the runtime shared-library dependencies from the compiled ELF
+# Determine only runtime shared-library dependencies from all compiled ELF
 # files. No compiler, *-dev package, pkg-config or debhelper dependency is
 # propagated into the finished binary package.
 shlib_work="$work_dir/shlibdeps"
@@ -327,6 +343,7 @@ runtime_deps="$(
     cd "$shlib_work"
     dpkg-shlibdeps -O \
         -e"$stage/usr/bin/vnc-monitor" \
+        -e"$stage/usr/libexec/vnc-monitor-broker" \
         -e"$stage/usr/libexec/vnc-monitor-auth-helper" \
         | sed -n 's/^shlibs:Depends=//p'
 )"
@@ -345,10 +362,11 @@ Architecture: $architecture
 Maintainer: $DEB_MAINTAINER
 Depends: $runtime_deps, pipewire
 Description: GNOME Wayland virtual monitor over VNC
- VNC Monitor exposes a real Mutter virtual monitor from the active GNOME
- Wayland session through a view-only RA2r VNC server. It uses PipeWire capture,
- PAM authentication, adaptive JPEG/CopyRect transport and strong single-connect
- session ownership. A GNOME Wayland session is required at runtime.
+ VNC Monitor exposes a real Mutter virtual monitor from the active local GNOME
+ Wayland login session through a view-only RA2r VNC server. A root system broker
+ owns the public listener and routes each new connection only to the currently
+ active seat0 user's unprivileged session agent. Switch-user/logoff revokes the
+ bound connection instead of moving it to another login session.
 EOF
 
 cat >"$stage/DEBIAN/postinst" <<'EOF'
@@ -357,8 +375,9 @@ set -e
 
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload
-    systemctl enable vnc-monitor-auth.socket >/dev/null
+    systemctl enable vnc-monitor-auth.socket vnc-monitor-broker.service >/dev/null
     systemctl restart vnc-monitor-auth.socket
+    systemctl restart vnc-monitor-broker.service
 fi
 
 exit 0
@@ -372,6 +391,7 @@ set -e
 case "$1" in
     remove|deconfigure)
         if [ -d /run/systemd/system ]; then
+            systemctl disable --now vnc-monitor-broker.service >/dev/null 2>&1 || true
             systemctl disable --now vnc-monitor-auth.socket >/dev/null 2>&1 || true
         fi
         ;;
@@ -407,10 +427,12 @@ printf '\nRuntime Depends:\n  %s\n' "$runtime_deps"
 
 printf '\nBuilt package:\n  %s\n' "$out_file"
 printf '\nInstall with:\n  sudo apt install %q\n' "$out_file"
-printf '\nThen, as the GNOME desktop user, enable the user service once:\n'
+printf '\nThe agent is globally wanted by graphical-session.target for future logins.\n'
+printf 'For the already-running GNOME session after first install/upgrade, run:\n'
 printf '  systemctl --user daemon-reload\n'
-printf '  systemctl --user enable --now vnc-monitor.service\n'
+printf '  systemctl --user restart vnc-monitor.service\n'
 printf '\nIf this machine still has the old ./install.sh source installation, remove\n'
 printf 'its user/system unit overrides first (config and RA2 identity are preserved):\n'
 printf '  make uninstall-service\n'
+printf '  make uninstall-broker-service 2>/dev/null || true\n'
 printf '  make uninstall-pam-service\n'
