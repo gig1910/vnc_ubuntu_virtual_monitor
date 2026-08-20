@@ -101,12 +101,11 @@ height=768
 
 The beta intentionally serves **exactly one viewer at a time**. This is a fixed server policy, not a configurable client-count limit.
 
-The public listener stays active while the first session is running so a second TCP connection can be detected and rejected immediately instead of sitting in the listen backlog. The second socket is closed with an immediate reset and the active session is left untouched.
+The public listener stays active while the first session is running so a second TCP connection can be detected and rejected immediately instead of sitting in the listen backlog. The second socket is closed with an immediate reset and the active session is left untouched. The slot is reserved from `accept()`, so this also applies while the first viewer is still authenticating.
 
-The active viewer socket uses TCP liveness protection:
+Connection protection is configured under `[network]`:
 
 ```ini
-[network]
 client-keepalive-idle=15
 client-keepalive-interval=5
 client-keepalive-probes=3
@@ -116,7 +115,7 @@ client-handshake-timeout-ms=60000
 
 The keepalive/user-timeout settings detect a vanished Wi-Fi/LAN peer and automatically tear down the abandoned session, releasing the single-client slot and removing its virtual monitor. They are **not** application-idle timers: a healthy viewer showing a completely static desktop may remain connected indefinitely.
 
-`client-handshake-timeout-ms` protects the slot before authentication: blocking network I/O during RA2/PAM negotiation may not wait forever. After successful authentication the receive/send timeout is removed and the normal long-lived session is governed only by TCP liveness.
+`client-handshake-timeout-ms` is a single monotonic deadline for the bounded unauthenticated RA2/auth-helper `io_*` phase. It is not reset by each received byte, so a silent or trickle-slow client cannot monopolize the only slot forever. After successful authentication the deadline is cleared completely; the long-lived VNC session is governed only by TCP liveness.
 
 ## Runtime behaviour
 
@@ -148,7 +147,7 @@ While connected:
 ```text
 second viewer -> immediate reject/reset
 lost active peer -> TCP keepalive/user-timeout -> automatic session teardown
-stalled unauthenticated peer -> handshake socket timeout -> slot release
+stalled unauthenticated peer -> monotonic handshake deadline -> slot release
 ```
 
 Disconnect:
@@ -188,7 +187,7 @@ Available levels:
 ```text
 error   only errors
 info    lifecycle/connect/disconnect/rejected extra clients
-debug   negotiation/capture/transport/TCP liveness settings
+debug   negotiation/capture/transport/TCP liveness and handshake deadline
 trace   per-update transport diagnostics
 ```
 
