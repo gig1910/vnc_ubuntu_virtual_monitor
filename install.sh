@@ -12,9 +12,11 @@ usage() {
 Usage: ./install.sh [--clean] [--jobs N]
 
 Build and install the complete VNC Monitor beta stack:
-  - vnc-monitor binary;
-  - persistent ~/.config/vnc-monitor/config.ini (created once, then preserved);
-  - vnc-monitor.service (systemd user service);
+  - vnc-monitor user-session agent;
+  - vnc-monitor-broker system listener/session gate;
+  - /etc/vnc-monitor/config.ini system baseline (created once, preserved);
+  - ~/.config/vnc-monitor/config.ini user override (created once, preserved);
+  - vnc-monitor.service (systemd user service, --agent mode);
   - PAM auth helper;
   - vnc-monitor-auth.socket + vnc-monitor-auth@.service (system units).
 
@@ -26,7 +28,7 @@ Options:
   -h, --help    Show this help.
 
 Run this script as the logged-in GNOME desktop user, not as root.
-The script invokes sudo only for the PAM helper/systemd system units.
+The script invokes sudo only for the broker/PAM/systemd system files.
 EOF
 }
 
@@ -59,8 +61,9 @@ done
 if ((EUID == 0)); then
     cat >&2 <<'EOF'
 Do not run install.sh as root.
-The main daemon is a systemd user service and must belong to the logged-in
-GNOME Wayland user. sudo is requested internally only for PAM/system units.
+The capture/RA2 daemon is a systemd user agent and must belong to the logged-in
+GNOME Wayland user. sudo is requested internally only for broker/PAM/system
+support.
 EOF
     exit 1
 fi
@@ -102,7 +105,11 @@ fi
 required_source_files=(
     Makefile
     config/vnc-monitor.conf
+    include/broker_protocol.h
+    src/broker.c
+    src/broker_protocol.c
     systemd/vnc-monitor.service
+    systemd/vnc-monitor-broker.service
     auth-helper/vnc-monitor-auth-helper.c
     auth-helper/vnc-monitor-auth.socket.in
     auth-helper/vnc-monitor-auth@.service
@@ -251,23 +258,21 @@ if ((CLEAN)); then
     make clean
 fi
 
-# Compile everything before asking for sudo. pam-service also renders the
-# socket unit with the invoking desktop user's uid/gid ownership settings.
+# all builds both the user agent and system broker. pam-service also renders
+# the source-install socket unit with this desktop user's uid/gid restriction.
 make -j"$JOBS" all auth-helper pam-service
 
 printf '\n===== VNC MONITOR: INSTALL =====\n'
-# This target installs both privilege domains. It deliberately runs as the
-# desktop user; only its PAM/system-unit sub-steps invoke sudo themselves.
+# install-service deliberately restarts the old standalone daemon as --agent
+# before starting the broker so an upgrade releases TCP/5901 deterministically.
 make install-service
 
-# enable --now is a no-op for an already-running unit. Explicit restarts make
-# upgrades deterministic: the newly installed helper/unit and daemon binary
-# are the versions actually serving the next connection.
 printf '\n===== VNC MONITOR: ACTIVATE INSTALLED VERSION =====\n'
 sudo systemctl restart vnc-monitor-auth.socket
 systemctl --user restart vnc-monitor.service
+sudo systemctl restart vnc-monitor-broker.service
 
-printf '\n===== VNC MONITOR: EFFECTIVE CONFIG =====\n'
+printf '\n===== VNC MONITOR: EFFECTIVE AGENT CONFIG =====\n'
 "$HOME/.local/bin/vnc-monitor" \
     --config "$HOME/.config/vnc-monitor/config.ini" \
     --show-config
@@ -276,8 +281,11 @@ printf '\n===== VNC MONITOR: FINAL STATUS =====\n'
 make status-support
 
 printf '\nInstallation complete.\n'
-printf 'Config:        %s\n' "$HOME/.config/vnc-monitor/config.ini"
-printf 'User daemon:   vnc-monitor.service\n'
+printf 'System config: %s\n' "/etc/vnc-monitor/config.ini"
+printf 'User config:   %s\n' "$HOME/.config/vnc-monitor/config.ini"
+printf 'System broker: vnc-monitor-broker.service\n'
+printf 'User agent:    vnc-monitor.service\n'
 printf 'System auth:   vnc-monitor-auth.socket -> vnc-monitor-auth@.service\n'
-printf 'Viewer port:   TCP/5901 (unless overridden in config)\n'
-printf 'Live log:      journalctl --user -u vnc-monitor.service -f\n'
+printf 'Viewer port:   [network] port from /etc/vnc-monitor/config.ini\n'
+printf 'Broker log:    journalctl -u vnc-monitor-broker.service -f\n'
+printf 'Agent log:     journalctl --user -u vnc-monitor.service -f\n'
