@@ -4,18 +4,75 @@ This document describes the supported `0.1.0-beta.2` deployment model on a GNOME
 
 ## Runtime model
 
-VNC Monitor is split into two privilege domains:
+VNC Monitor has two privilege domains:
 
 - `vnc-monitor.service` is a **systemd user service** running as the logged-in GNOME user so it can reach session D-Bus, Mutter RemoteDesktop/ScreenCast and PipeWire;
-- `vnc-monitor-auth.socket` + `vnc-monitor-auth@.service` are **system units** exposing the small privileged PAM helper through `/run/vnc-monitor-auth.sock`.
+- `vnc-monitor-auth.socket` + `vnc-monitor-auth@.service` are **system units** exposing the privileged PAM helper through `/run/vnc-monitor-auth.sock`.
 
-Do not convert the main daemon to a root system service.
+Do not convert the main daemon into a root system service.
 
 The public server is intentionally **STRONG SINGLE CONNECT**. Exactly one accepted viewer owns the display session. The public listener remains responsive while that session runs only so additional connections can be immediately reset/rejected.
 
 The internal LibVNCServer backend is session-scoped: `127.0.0.1:5903` exists only after successful RA2r/PAM authentication and is removed on disconnect.
 
-## Unified installer
+## Configuration layers
+
+The daemon reads configuration in this order:
+
+```text
+built-in defaults
+    < /etc/vnc-monitor/config.ini
+    < ~/.config/vnc-monitor/config.ini
+    < command-line options
+```
+
+Both persistent files are optional.
+
+An explicit:
+
+```bash
+vnc-monitor --config /path/to/file.ini
+```
+
+replaces the normal per-user override path but does **not** disable the system baseline:
+
+```text
+built-ins < /etc/vnc-monitor/config.ini < --config FILE < CLI
+```
+
+The parser is strict. Unknown sections/keys and invalid values are startup errors.
+
+Repository template:
+
+```text
+config/vnc-monitor.conf
+```
+
+The `.deb` installs that template as:
+
+```text
+/etc/vnc-monitor/config.ini
+```
+
+and marks it as a package conffile so administrator edits are preserved by dpkg upgrade semantics.
+
+Source installation creates the per-user file once:
+
+```text
+~/.config/vnc-monitor/config.ini
+```
+
+and preserves it on later source upgrades. Package installation does not create or overwrite files in user home directories.
+
+Show the effective configuration:
+
+```bash
+vnc-monitor --show-config
+```
+
+The output lists both config paths and shows the final effective values.
+
+## Source install / upgrade
 
 Run from the repository as the logged-in GNOME desktop user:
 
@@ -27,18 +84,13 @@ Do **not** run it through `sudo`. The script invokes `sudo` itself only for the 
 
 The installer:
 
-1. checks all required commands and development libraries before changing anything;
-2. builds the daemon, PAM helper and generated PAM socket unit;
-3. creates `~/.config/vnc-monitor/config.ini` only when it does not already exist;
-4. installs/updates both privilege domains;
-5. restarts the auth socket and user daemon only after successful build/install;
-6. prints the effective parsed configuration and final service status.
-
-Default parallelism is:
-
-```text
-make -j"$(nproc)"
-```
+1. checks required commands and development libraries before changing anything;
+2. builds with all logical CPUs by default (`make -j"$(nproc)"`);
+3. builds the daemon, PAM helper and source-install socket unit;
+4. creates `~/.config/vnc-monitor/config.ini` only when absent;
+5. installs/updates both privilege domains;
+6. restarts the auth socket and user daemon only after successful build/install;
+7. prints effective config and final service status.
 
 Clean rebuild:
 
@@ -46,7 +98,7 @@ Clean rebuild:
 ./install.sh --clean
 ```
 
-Optional manual limit:
+Optional job limit:
 
 ```bash
 ./install.sh --jobs 8
@@ -56,11 +108,11 @@ JOBS=8 ./install.sh
 
 The installer intentionally does not run `git pull`.
 
-## Dependency preflight
+### Source build dependency preflight
 
 Required commands include `make`, `cc`, `pkg-config`, `nproc`, `mktemp`, `install`, `sed`, `systemctl` and `sudo`.
 
-The following development modules are verified through `pkg-config --exists` and their versions are printed:
+Development modules checked through `pkg-config --exists`:
 
 - `libvncserver`;
 - `openssl`;
@@ -72,9 +124,9 @@ The following development modules are verified through `pkg-config --exists` and
 - `gstreamer-video-1.0`;
 - `libpipewire-0.3`.
 
-libjpeg and PAM are checked with real compile/link probes against `-ljpeg` and `-lpam`.
+libjpeg and PAM are checked by real compile/link probes against `-ljpeg` and `-lpam`.
 
-Typical Ubuntu development packages are:
+Typical Ubuntu **build** packages are:
 
 ```bash
 sudo apt install \
@@ -84,70 +136,179 @@ sudo apt install \
   libpipewire-0.3-dev libjpeg-dev libpam0g-dev
 ```
 
-The probes, not the package names, are authoritative.
+These are build-machine requirements, not runtime dependencies of a compiled package.
 
-## Install / upgrade
+## Build a binary Debian/Ubuntu package
 
-```bash
-git switch 0.1.0-beta
-git pull --ff-only
-./install.sh
-```
-
-The installer is idempotent for an existing deployment. It does not uninstall first: the old daemon keeps running during compilation, files are replaced only after a successful build, and then the installed services are restarted.
-
-An active VNC connection is naturally disconnected by the final daemon restart during an upgrade.
-
-Because beta.2 changes headers and session lifecycle substantially, use one clean build when first moving to it:
+Build as a normal user:
 
 ```bash
-git pull --ff-only
-./install.sh --clean
+./build-deb.sh
 ```
 
-## Persistent configuration
+The builder does not use `sudo`.
 
-Repository template:
+Default parallelism is:
 
 ```text
-config/vnc-monitor.conf
+make -j"$(nproc)"
 ```
 
-Installed file:
+Optional clean build:
+
+```bash
+./build-deb.sh --clean
+```
+
+Optional job/output overrides:
+
+```bash
+./build-deb.sh --jobs 8
+./build-deb.sh --output-dir /tmp/packages
+# or
+JOBS=8 OUT_DIR=/tmp/packages ./build-deb.sh
+```
+
+The package revision can be changed without modifying the application version:
+
+```bash
+DEB_REVISION=2 ./build-deb.sh
+```
+
+### Binary package build preflight
+
+In addition to the project compiler/library checks, the package builder requires:
+
+- `dpkg-deb`;
+- `dpkg-shlibdeps`;
+- `dpkg-architecture`.
+
+On Ubuntu these packaging tools are normally provided by `dpkg` / `dpkg-dev`.
+
+The builder extracts `VNC_MONITOR_VERSION` from `include/config.h` and converts prerelease ordering to Debian form. For example:
+
+```text
+0.1.0-beta.2 -> 0.1.0~beta.2-1
+```
+
+The tilde keeps the beta version ordered before a later final `0.1.0` package.
+
+### What is inside the `.deb`
+
+Main files:
+
+```text
+/usr/bin/vnc-monitor
+/usr/libexec/vnc-monitor-auth-helper
+
+/usr/lib/systemd/user/vnc-monitor.service
+/usr/lib/systemd/system/vnc-monitor-auth.socket
+/usr/lib/systemd/system/vnc-monitor-auth@.service
+
+/etc/vnc-monitor/config.ini
+/etc/pam.d/vnc-monitor
+
+/usr/share/doc/vnc-monitor/...
+```
+
+The package service runs `/usr/bin/vnc-monitor`. It relies on the daemon's normal layered config loading and therefore does not hard-code `--config`.
+
+The package PAM socket is generic and does not contain the username of the machine that built the package. Its Unix socket is locally reachable, while the root helper uses `SO_PEERCRED` and rejects any authentication request whose requested username does not match the Unix account owning the connecting process.
+
+### Runtime dependencies
+
+`build-deb.sh` runs `dpkg-shlibdeps` against the two compiled ELF executables:
+
+```text
+/usr/bin/vnc-monitor
+/usr/libexec/vnc-monitor-auth-helper
+```
+
+The generated shared-library dependencies are written to the package `Depends` field, along with the required PipeWire runtime.
+
+Compiler/build tooling and development packages are **not** runtime dependencies of the finished `.deb`:
+
+```text
+NOT runtime dependencies:
+  build-essential
+  gcc / make
+  pkg-config
+  dpkg-dev
+  lib*-dev
+```
+
+Inspect the finished metadata with:
+
+```bash
+dpkg-deb --info dist/vnc-monitor_*.deb
+```
+
+### Install the `.deb`
+
+Typical output filename:
+
+```text
+dist/vnc-monitor_0.1.0~beta.2-1_amd64.deb
+```
+
+Install through apt so runtime dependencies are resolved:
+
+```bash
+sudo apt install ./dist/vnc-monitor_0.1.0~beta.2-1_amd64.deb
+```
+
+The package post-install step reloads system units and enables/restarts:
+
+```text
+vnc-monitor-auth.socket
+```
+
+The GNOME-facing daemon remains a user service and is deliberately not globally enabled for every account. Enable it once as the intended desktop user:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now vnc-monitor.service
+```
+
+This avoids having multiple simultaneously logged-in desktop users all trying to bind the same public TCP port.
+
+## Migrating an existing source installation to `.deb`
+
+A source installation places overrides in higher-priority systemd paths:
+
+```text
+~/.config/systemd/user/vnc-monitor.service
+/etc/systemd/system/vnc-monitor-auth.socket
+/etc/systemd/system/vnc-monitor-auth@.service
+```
+
+Those would override units installed by the package under `/usr/lib/systemd/...`.
+
+Before the first package installation, remove only the source-installed service files/binaries:
+
+```bash
+make uninstall-service
+make uninstall-pam-service
+```
+
+These targets preserve the user's:
 
 ```text
 ~/.config/vnc-monitor/config.ini
+~/.config/vnc-monitor/ra2-server-key.pem
+~/.config/vnc-monitor-server/
+~/.cache/vnc-monitor/
 ```
 
-The installed file is mode `0600` and is **created once, then preserved on upgrades**.
-
-Configuration precedence:
-
-```text
-built-in defaults < config.ini < command-line options
-```
-
-The user service starts:
-
-```text
-%h/.local/bin/vnc-monitor --config %h/.config/vnc-monitor/config.ini
-```
-
-Show the effective configuration without starting a server:
+Then install and enable the package service:
 
 ```bash
-~/.local/bin/vnc-monitor \
-  --config ~/.config/vnc-monitor/config.ini \
-  --show-config
+sudo apt install ./dist/vnc-monitor_0.1.0~beta.2-1_amd64.deb
+systemctl --user daemon-reload
+systemctl --user enable --now vnc-monitor.service
 ```
 
-The parser is strict: unknown sections/keys and invalid values are startup errors.
-
-After editing the config:
-
-```bash
-systemctl --user restart vnc-monitor.service
-```
+The existing per-user config remains a higher-priority override above the new `/etc/vnc-monitor/config.ini` baseline.
 
 ## Supported production config
 
@@ -196,27 +357,23 @@ level=info
 
 Paths accept absolute paths, `~/...`, and `$HOME/...`.
 
-Older installed configs do not have to be rewritten when new optional keys are introduced: missing keys inherit built-in defaults.
+Missing optional keys inherit the value from the previous configuration layer, ultimately falling back to built-in defaults.
 
 ## Strong single-connect policy
 
 The slot is reserved immediately at `accept()`, before RA2/PAM completes. Therefore a second connection cannot race the first during authentication.
 
-The active session runs in one client worker. The main listener continues accepting only to enforce the policy. If another client arrives while the slot is owned, its socket is closed with an immediate reset and an `info` log entry is emitted:
+The active session runs in one client worker. The main listener continues accepting only to enforce the policy. If another client arrives while the slot is owned, its socket is immediately reset and an `info` log entry is emitted:
 
 ```text
 Rejected additional client: ADDRESS (strong single-connect policy)
 ```
 
-This is not multi-client support: there is still exactly one virtual monitor, one capture pipeline and one adaptive RFB session.
+This is not multi-client support: there is still exactly one virtual monitor, capture pipeline and adaptive RFB session.
 
 ## Lost-client protection
 
-There are two distinct protections because established and unauthenticated connections fail differently.
-
 ### Established session: TCP liveness
-
-The accepted external socket requires:
 
 ```ini
 client-keepalive-idle=15
@@ -225,13 +382,9 @@ client-keepalive-probes=3
 client-user-timeout-ms=20000
 ```
 
-These map to Linux `SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, and `TCP_USER_TIMEOUT` when available.
+These map to Linux TCP keepalive/user-timeout controls. They detect transport failure and are **not** application-idle timers. A healthy viewer displaying a static image may stay connected indefinitely.
 
-They are **transport liveness**, not application-idle timers. A healthy viewer displaying a completely static image may remain connected indefinitely because its TCP stack still responds.
-
-If Wi-Fi/LAN connectivity disappears without FIN/RST, kernel TCP failure eventually propagates through the RA2 relay. The session worker then stops LibVNCServer, capture and Mutter, and releases the sole client slot.
-
-Exact wall-clock detection time depends on TCP/network state; the defaults are intended to recover in the order of tens of seconds rather than leave a half-open session indefinitely.
+If Wi-Fi/LAN connectivity disappears without FIN/RST, TCP failure propagates through the RA2 relay. The session then stops LibVNCServer, capture and Mutter and releases the sole slot.
 
 ### Unauthenticated/stalled client: handshake deadline
 
@@ -239,11 +392,9 @@ Exact wall-clock detection time depends on TCP/network state; the defaults are i
 client-handshake-timeout-ms=60000
 ```
 
-This is one **monotonic deadline** for the bounded handshake `io_*` phase. It is not reset by each individual byte, so a silent or trickle-slow client cannot reserve the sole slot forever.
+This is one monotonic deadline for the bounded handshake `io_*` phase. It is not reset by individual bytes, so a silent or trickle-slow peer cannot reserve the sole slot forever.
 
-The deadline participates directly in the project's `poll()`-based I/O wrapper and therefore covers external RA2 reads/writes plus auth-helper request/response waits that use `io_*` in the same worker.
-
-After successful authentication the deadline is cleared completely. The long-lived VNC session is then governed only by TCP liveness, not by an application inactivity timeout.
+After successful authentication the deadline is cleared completely.
 
 ## Display size: auto vs fixed
 
@@ -256,25 +407,11 @@ width=1024
 height=768
 ```
 
-`width` / `height` are the initial/fallback dimensions.
+`width` / `height` are initial/fallback dimensions.
 
-A viewer advertising RFB `ExtendedDesktopSize` can send `SetDesktopSize`. For a valid one-screen request beta.2 coordinates:
+A viewer advertising RFB `ExtendedDesktopSize` can send `SetDesktopSize`. For a valid one-screen request the server coordinates Mutter/PipeWire, FrameBridge, adaptive transport and LibVNCServer framebuffer resize without changing the persistent fallback for the next session.
 
-1. Mutter virtual monitor/capture;
-2. FrameBridge storage;
-3. adaptive JPEG/repair/CopyRect size-dependent state;
-4. LibVNCServer framebuffer through `rfbNewFramebuffer()`;
-5. dimension-specific layout cache.
-
-The RFB connection stays open. JPEG21 capability is preserved; CopyRect exactness/reference state is invalidated and rebuilt for the new dimensions.
-
-Only one screen at `(0,0)` spanning the framebuffer is accepted.
-
-### Older clients
-
-`NewFBSize` / `DesktopSize` (`-223`) only allows a viewer to **receive** a server-side size change. It does not communicate preferred dimensions.
-
-A viewer must advertise `ExtendedDesktopSize` (`-308`) and send `SetDesktopSize` to drive auto sizing. Otherwise the configured fallback is used.
+A viewer supporting only `NewFBSize` can receive a server-side size change but cannot tell the server what size it wants, so it stays on the configured fallback.
 
 ### `mode=fixed`
 
@@ -289,15 +426,13 @@ The configured dimensions are mandatory and client `SetDesktopSize` requests are
 
 ## RA2 identity
 
-Current identity path:
+Per-user identity path:
 
 ```text
 ~/.config/vnc-monitor/ra2-server-key.pem
 ```
 
-Older development versions used `./ra2-server-key.pem`. If the installed identity does not yet exist, the installation path migrates the legacy key when available; otherwise the server creates a persistent identity on first use.
-
-The identity is mode `0600`; its config directory is mode `0700`.
+It remains in the user's home for both source and package installations. It is mode `0600` and is not installed into `/etc` or embedded in the package.
 
 ## Service lifecycle
 
@@ -326,6 +461,8 @@ On clean disconnect, dead-peer detection, handshake failure/deadline, or daemon 
 
 ## Service commands
 
+User daemon:
+
 ```bash
 systemctl --user status vnc-monitor.service
 systemctl --user restart vnc-monitor.service
@@ -339,68 +476,31 @@ PAM layer:
 systemctl status vnc-monitor-auth.socket
 ```
 
-Combined project helper:
+For source installs, combined project status is also available through:
 
 ```bash
 make status-support
 ```
 
-## Logging
-
-Configure normally through:
-
-```ini
-[logging]
-level=debug
-```
-
-Values: `error`, `info`, `debug`, `trace` or `0..3`.
-
-At `info`, lifecycle and rejected extra clients are visible. At `debug`, negotiated capture/transport state and effective TCP liveness/deadline values are shown. Use `trace` only for short diagnostics.
-
-CLI `--verbose` overrides the file for foreground tests.
-
-## Firewall
-
-The external viewer connects to `[network] port` (TCP/5901 by default). The internal backend uses `[network] backend-bind:backend-port` (`127.0.0.1:5903` by default) only during an authenticated session and must not be exposed externally.
-
-## Layout cache
-
-Mutter layout state remains under the historical beta namespace:
-
-```text
-~/.config/vnc-monitor-server/
-```
-
-Cache files are dimension-specific, so newly requested framebuffer sizes can learn independent GNOME placement.
-
-## Manual development install
-
-```bash
-make -j"$(nproc)"
-make install-service
-```
-
-For normal deployment prefer `./install.sh` because it also performs dependency preflight, deterministic upgrade restart and effective-config validation.
-
 ## Uninstall
 
-Remove user daemon/service while preserving config/identity/layout:
+### Source installation
 
 ```bash
 make uninstall-service
-```
-
-Remove PAM support separately:
-
-```bash
 make uninstall-pam-service
 ```
 
-Delete user config, identity and layout only when explicitly intended:
+Delete user config/identity/layout only when explicitly intended:
 
 ```bash
 make purge-config
 ```
 
-Deleting/changing the RA2 identity can require the viewer to accept a new server key.
+### Binary package
+
+```bash
+sudo apt remove vnc-monitor
+```
+
+Package removal does not delete per-user config, RA2 identity or layout/cache data from home directories.
