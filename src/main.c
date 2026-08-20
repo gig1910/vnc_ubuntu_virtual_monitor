@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "config.h"
 #include "ra2.h"
 #include "rfb_backend.h"
