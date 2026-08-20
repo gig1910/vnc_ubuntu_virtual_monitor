@@ -76,30 +76,37 @@ configure_external_socket(int client_fd, const RuntimeConfig *cfg)
 
 static void
 serve_client(int client_fd,
-             const RuntimeConfig *cfg,
+             const RuntimeConfig *base_cfg,
              FrameBridge *frames,
              PipelineStats *pipeline_stats)
 {
+    /* Client-driven resize is session-local; configured fallback stays intact. */
+    RuntimeConfig cfg = *base_cfg;
     Ra2Session session;
 
-    if (ra2_server_handshake(client_fd, &session, cfg) < 0) {
+    if (ra2_server_handshake(client_fd, &session, &cfg) < 0) {
         LOG_ERROR("RA2r handshake failed");
+        return;
+    }
+
+    if (frame_bridge_resize(frames, cfg.width, cfg.height) < 0) {
+        LOG_ERROR("Could not prepare FrameBridge at %dx%d", cfg.width, cfg.height);
+        ra2_session_clear(&session);
         return;
     }
 
     RealMonitor real = {0};
     MonitorLayoutCache layout_cache = {0};
+    RfbBackend backend = {0};
+    int backend_started = 0;
 
     frame_bridge_clear(frames);
 
-    if (monitor_layout_cache_prepare(&layout_cache, cfg) < 0) {
+    if (monitor_layout_cache_prepare(&layout_cache, &cfg) < 0) {
         LOG_DEBUG("Monitor-layout cache preparation failed; continuing without cached layout");
     }
 
-    int source_ready =
-        real_monitor_start(&real, cfg, frames, pipeline_stats) == 0;
-
-    if (!source_ready) {
+    if (real_monitor_start(&real, &cfg, frames, pipeline_stats) < 0) {
         LOG_ERROR("Virtual monitor/capture source failed; closing client");
         monitor_layout_cache_clear(&layout_cache);
         ra2_session_clear(&session);
@@ -107,20 +114,37 @@ serve_client(int client_fd,
     }
 
     if (monitor_layout_cache_apply(&layout_cache,
-                                   cfg,
-                                   cfg->capture_timeout_ms) < 0) {
+                                   &cfg,
+                                   cfg.capture_timeout_ms) < 0) {
         LOG_DEBUG("Cached monitor layout could not be applied; using Mutter's current layout");
     }
 
     if (vnc_log_enabled(VNC_LOG_DEBUG))
-        (void)monitor_layout_log_matching_modes(&layout_cache, cfg);
+        (void)monitor_layout_log_matching_modes(&layout_cache, &cfg);
+
+    if (rfb_backend_start(&backend,
+                          &cfg,
+                          frames,
+                          pipeline_stats,
+                          &real,
+                          &layout_cache) < 0) {
+        LOG_ERROR("Failed to start per-session LibVNCServer backend");
+        goto out;
+    }
+
+    backend_started = 1;
 
     (void)rfb_proxy_run(client_fd,
                         &session,
-                        cfg,
+                        &cfg,
                         pipeline_stats);
 
-    if (monitor_layout_cache_save(&layout_cache, cfg) < 0)
+out:
+    /* Stop the backend first: its SetDesktopSize hook references real/layout. */
+    if (backend_started)
+        rfb_backend_stop(&backend);
+
+    if (monitor_layout_cache_save(&layout_cache, &cfg) < 0)
         LOG_DEBUG("Monitor layout was not saved");
 
     real_monitor_stop(&real);
@@ -167,24 +191,11 @@ main(int argc, char **argv)
         return 1;
     }
 
-    RfbBackend backend;
-    if (rfb_backend_start(&backend,
-                          &cfg,
-                          &frames,
-                          &pipeline_stats) < 0) {
-        LOG_ERROR("Failed to start internal LibVNCServer backend");
-        frame_bridge_destroy(&frames);
-        shutdown_signal_cleanup();
-        pipeline_stats_destroy(&pipeline_stats);
-        return 1;
-    }
-
     int listen_fd = create_public_listener(&cfg);
     if (listen_fd < 0) {
         LOG_ERROR("Could not create public listener on TCP/%d: %s",
                   cfg.public_port,
                   strerror(errno));
-        rfb_backend_stop(&backend);
         frame_bridge_destroy(&frames);
         shutdown_signal_cleanup();
         pipeline_stats_destroy(&pipeline_stats);
@@ -194,9 +205,12 @@ main(int argc, char **argv)
     if (shutdown_signal_register_fd(listen_fd) < 0)
         LOG_DEBUG("Could not register public listener for shutdown");
 
-    LOG_INFO("VNC Monitor %s ready on TCP/%d (Wayland virtual monitor is created on client connection)",
+    LOG_INFO("VNC Monitor %s ready on TCP/%d (screen=%s fallback=%dx%d; virtual monitor is created on client connection)",
              VNC_MONITOR_VERSION,
-             cfg.public_port);
+             cfg.public_port,
+             runtime_config_screen_size_mode_name(cfg.screen_size_mode),
+             cfg.width,
+             cfg.height);
 
     while (!shutdown_signal_requested()) {
         fd_set readfds;
@@ -267,7 +281,6 @@ main(int argc, char **argv)
 
     shutdown_signal_unregister_fd(listen_fd);
     close(listen_fd);
-    rfb_backend_stop(&backend);
     frame_bridge_destroy(&frames);
     shutdown_signal_cleanup();
     pipeline_stats_destroy(&pipeline_stats);
