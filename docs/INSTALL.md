@@ -21,15 +21,16 @@ The preferred beta installation entrypoint is the executable repository-root scr
 
 It performs the complete build and installation of both service layers in the correct privilege context:
 
-1. builds `vnc-monitor`, the PAM helper and generated PAM socket unit;
-2. installs/updates the PAM helper plus `vnc-monitor-auth.socket` / `vnc-monitor-auth@.service` using the Makefile's scoped `sudo` operations;
-3. installs `~/.local/bin/vnc-monitor` and `~/.config/systemd/user/vnc-monitor.service`;
-4. explicitly restarts both the auth socket and user daemon so an upgrade immediately runs the newly installed binaries/units;
-5. prints the final status of both layers.
+1. performs a dependency preflight before any compilation or service changes;
+2. builds `vnc-monitor`, the PAM helper and generated PAM socket unit;
+3. installs/updates the PAM helper plus `vnc-monitor-auth.socket` / `vnc-monitor-auth@.service` using the Makefile's scoped `sudo` operations;
+4. installs `~/.local/bin/vnc-monitor` and `~/.config/systemd/user/vnc-monitor.service`;
+5. explicitly restarts both the auth socket and user daemon so an upgrade immediately runs the newly installed binaries/units;
+6. prints the final status of both layers.
 
 The script must be run as the logged-in GNOME desktop user, **not** through `sudo`.
 
-Default parallelism is 20 jobs:
+Default parallelism is the number of logical CPUs reported by `nproc`:
 
 ```bash
 ./install.sh
@@ -41,7 +42,7 @@ Clean rebuild:
 ./install.sh --clean
 ```
 
-Override build parallelism:
+Override build parallelism only when needed:
 
 ```bash
 ./install.sh --jobs 8
@@ -51,20 +52,49 @@ JOBS=8 ./install.sh
 
 The installer intentionally does **not** run `git pull`; updating source code and installing it remain separate operations.
 
-## Build dependencies
+## Dependency preflight
 
-The build uses `pkg-config` for:
+`install.sh` verifies dependencies before it runs `make`.
 
-- LibVNCServer;
-- OpenSSL;
-- nettle;
-- GLib/GIO;
-- GStreamer + app/video libraries;
-- PipeWire development files;
-- libjpeg;
-- PAM development files for the auth helper.
+Required commands are checked first:
 
-On the target machine the exact package names depend on the Ubuntu release. `pkg-config` errors from `make` are the authoritative indication of a missing development package.
+- `make`;
+- `cc`;
+- `pkg-config`;
+- `nproc`;
+- `mktemp`;
+- `install`;
+- `sed`;
+- `systemctl`;
+- `sudo`.
+
+The following development libraries are verified through `pkg-config --exists` and their versions are printed:
+
+- `libvncserver`;
+- `openssl`;
+- `nettle`;
+- `glib-2.0`;
+- `gio-2.0`;
+- `gstreamer-1.0`;
+- `gstreamer-app-1.0`;
+- `gstreamer-video-1.0`;
+- `libpipewire-0.3`.
+
+libjpeg and PAM are checked with real compile/link probes against `-ljpeg` and `-lpam`. This verifies both development headers and linker-visible libraries rather than relying on distribution package names.
+
+The installer also verifies that the systemd user manager is reachable from the current shell. If any preflight check fails, the script exits before compilation and before changing either service layer.
+
+Typical Ubuntu development packages are:
+
+```bash
+sudo apt install \
+  build-essential pkg-config \
+  libvncserver-dev libssl-dev nettle-dev libglib2.0-dev \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  libpipewire-0.3-dev libjpeg-dev libpam0g-dev
+```
+
+The checks themselves, rather than the package names above, are authoritative because package/provider names can differ between Ubuntu releases.
 
 ## First beta build
 
@@ -72,7 +102,7 @@ After switching from a pre-beta checkout, perform one clean build because source
 
 ```bash
 git switch 0.1.0-beta
-git pull
+git pull --ff-only
 ./install.sh --clean
 ```
 
@@ -83,7 +113,7 @@ git pull --ff-only
 ./install.sh
 ```
 
-`-MMD -MP` dependency files are generated automatically, so header changes rebuild their dependants.
+The installer uses `make -j"$(nproc)"` by default. `-MMD -MP` dependency files are generated automatically, so header changes rebuild their dependants.
 
 ## Preserve the existing RA2 identity
 
@@ -108,6 +138,7 @@ The file must remain mode `0600`; the directory is mode `0700`.
 For development/debugging, the underlying Makefile target remains supported:
 
 ```bash
+make -j"$(nproc)"
 make install-service
 ```
 
@@ -122,7 +153,7 @@ The target performs:
 5. install `~/.config/systemd/user/vnc-monitor.service`;
 6. run `systemctl --user enable --now vnc-monitor.service`.
 
-For upgrades, `./install.sh` is preferred because it also explicitly restarts already-active units after installation.
+For upgrades, `./install.sh` is preferred because it also performs the dependency preflight and explicitly restarts already-active units after installation.
 
 ## Service behaviour
 
