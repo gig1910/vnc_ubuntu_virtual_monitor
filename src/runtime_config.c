@@ -241,6 +241,8 @@ apply_setting(RuntimeConfig *cfg, const char *name, const char *value)
         return parse_int(name, value, 1, 20, &cfg->client_keepalive_probes);
     if (strcmp(name, "client-user-timeout-ms") == 0)
         return parse_int(name, value, 1000, 600000, &cfg->client_user_timeout_ms);
+    if (strcmp(name, "client-handshake-timeout-ms") == 0)
+        return parse_int(name, value, 1000, 600000, &cfg->client_handshake_timeout_ms);
     if (strcmp(name, "diff-detect") == 0)
         return parse_bool(name, value, &cfg->diff_detect);
     if (strcmp(name, "diff-tile-size") == 0)
@@ -327,6 +329,7 @@ static const ConfigBinding config_bindings[] = {
     {"network", "client-keepalive-interval", "client-keepalive-interval"},
     {"network", "client-keepalive-probes", "client-keepalive-probes"},
     {"network", "client-user-timeout-ms", "client-user-timeout-ms"},
+    {"network", "client-handshake-timeout-ms", "client-handshake-timeout-ms"},
 
     {"ra2", "record-size", "ra2-record-size"},
     {"ra2", "coalesce", "ra2-coalesce"},
@@ -532,6 +535,7 @@ runtime_config_defaults(RuntimeConfig *cfg)
     cfg->client_keepalive_interval_s = 5;
     cfg->client_keepalive_probes = 3;
     cfg->client_user_timeout_ms = 20000;
+    cfg->client_handshake_timeout_ms = 60000;
     cfg->diff_detect = 1;
     cfg->diff_tile_size = 32;
     cfg->layout_remember = 1;
@@ -592,6 +596,7 @@ runtime_config_usage(const char *argv0)
         "  --client-keepalive-interval N Seconds between keepalive probes [5]\n"
         "  --client-keepalive-probes N  Failed probes before dead peer [3]\n"
         "  --client-user-timeout-ms N   Max unacknowledged TCP time [20000]\n"
+        "  --client-handshake-timeout-ms N RA2/PAM phase timeout [60000]\n"
         "\n"
         "Virtual monitor:\n"
         "  --screen-mode MODE           auto|fixed [auto]\n"
@@ -648,6 +653,7 @@ runtime_config_print(const RuntimeConfig *cfg)
         "  connection policy: strong single-connect\n"
         "  TCP keepalive:     idle=%ds interval=%ds probes=%d\n"
         "  TCP user timeout:  %d ms\n"
+        "  handshake timeout: %d ms\n"
         "  screen mode:       %s\n"
         "  framebuffer:       %dx%d (%s)\n"
         "  RA2 record max:    %d bytes\n"
@@ -677,6 +683,7 @@ runtime_config_print(const RuntimeConfig *cfg)
         cfg->client_keepalive_interval_s,
         cfg->client_keepalive_probes,
         cfg->client_user_timeout_ms,
+        cfg->client_handshake_timeout_ms,
         runtime_config_screen_size_mode_name(cfg->screen_size_mode),
         cfg->width,
         cfg->height,
@@ -713,6 +720,7 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
         OPT_CLIENT_KEEPALIVE_INTERVAL,
         OPT_CLIENT_KEEPALIVE_PROBES,
         OPT_CLIENT_USER_TIMEOUT_MS,
+        OPT_CLIENT_HANDSHAKE_TIMEOUT_MS,
         OPT_DIFF_DETECT,
         OPT_DIFF_TILE_SIZE,
         OPT_LAYOUT_REMEMBER,
@@ -751,6 +759,7 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
         {"client-keepalive-interval", required_argument, NULL, OPT_CLIENT_KEEPALIVE_INTERVAL},
         {"client-keepalive-probes", required_argument, NULL, OPT_CLIENT_KEEPALIVE_PROBES},
         {"client-user-timeout-ms", required_argument, NULL, OPT_CLIENT_USER_TIMEOUT_MS},
+        {"client-handshake-timeout-ms", required_argument, NULL, OPT_CLIENT_HANDSHAKE_TIMEOUT_MS},
         {"diff-detect", required_argument, NULL, OPT_DIFF_DETECT},
         {"diff-tile-size", required_argument, NULL, OPT_DIFF_TILE_SIZE},
         {"layout-remember", required_argument, NULL, OPT_LAYOUT_REMEMBER},
@@ -821,6 +830,7 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
             case OPT_CLIENT_KEEPALIVE_INTERVAL: setting = "client-keepalive-interval"; break;
             case OPT_CLIENT_KEEPALIVE_PROBES: setting = "client-keepalive-probes"; break;
             case OPT_CLIENT_USER_TIMEOUT_MS: setting = "client-user-timeout-ms"; break;
+            case OPT_CLIENT_HANDSHAKE_TIMEOUT_MS: setting = "client-handshake-timeout-ms"; break;
             case OPT_DIFF_DETECT: setting = "diff-detect"; break;
             case OPT_DIFF_TILE_SIZE: setting = "diff-tile-size"; break;
             case OPT_LAYOUT_REMEMBER: setting = "layout-remember"; break;
