@@ -158,7 +158,7 @@ For VNC the broker currently owns a duplicate of the client TCP fd and can revok
 
 WebRTC media uses independent ICE/DTLS sockets, so revocation cannot rely on closing the HTTPS/WSS connection alone.
 
-Protocol v2 therefore treats the broker-agent control channel as the authoritative lifetime guard. On any policy revocation the broker must explicitly terminate the control session; the agent must then synchronously:
+The broker-agent control channel therefore becomes the authoritative lifetime guard for WebRTC. On any policy revocation the broker must explicitly terminate the control session; the agent must then synchronously:
 
 1. close `webrtcbin` / ICE transports;
 2. stop the capture pipeline;
@@ -168,22 +168,27 @@ Protocol v2 therefore treats the broker-agent control channel as the authoritati
 
 The same control-channel-loss rule should also remain a fail-safe if the broker crashes or restarts.
 
-## Broker protocol v2
+## Transport discriminator and wire compatibility
 
-Protocol v2 introduces an explicit transport discriminator:
+The existing fixed-size broker handoff remains **wire version 1** for compatibility with beta.3 processes during upgrade.
+
+The old 16-bit reserved field is repurposed as a transport discriminator:
 
 ```text
-VNC_BROKER_TRANSPORT_VNC
-VNC_BROKER_TRANSPORT_WEBRTC
+0 = legacy VNC handoff from beta.3
+1 = VNC_BROKER_TRANSPORT_VNC
+2 = VNC_BROKER_TRANSPORT_WEBRTC
 ```
+
+A new agent treats both `0` and `1` as VNC. An old beta.3 agent still ignores this field and therefore continues to accept a new broker's VNC handoff. This avoids creating an avoidable broker/agent upgrade-order dependency.
 
 VNC handoff keeps the existing accepted TCP fd via `SCM_RIGHTS`.
 
-WebRTC handoff intentionally carries no browser fd because HTTPS/WSS terminates in the broker. Subsequent WebRTC authentication/signalling messages will extend the broker-agent control protocol rather than tunnelling browser TLS through the user agent.
+WebRTC handoff intentionally carries no browser fd because HTTPS/WSS terminates in the broker. Later authentication/signalling messages will require an extended broker-agent message layer, but that extension should be introduced without sacrificing legacy VNC handoff compatibility.
 
 ## Planned implementation order
 
-1. Transport-aware broker protocol without changing existing VNC behaviour. **Started in this branch.**
+1. Transport-aware broker handoff without changing existing VNC behaviour or wire compatibility. **Started in this branch.**
 2. Replace broker `active` boolean with one transport-neutral global session state machine.
 3. Add broker HTTPS listener, TLS configuration and static login page.
 4. Add broker-agent PAM request/reply messages for web authentication.
