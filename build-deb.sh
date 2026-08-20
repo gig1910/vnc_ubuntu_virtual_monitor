@@ -219,19 +219,12 @@ mkdir -p "$stage/DEBIAN"
 
 printf '\n===== VNC MONITOR: PACKAGE STAGE =====\n'
 
-install -Dm0755 vnc-monitor \
-    "$stage/usr/bin/vnc-monitor"
-install -Dm0755 vnc-monitor-broker \
-    "$stage/usr/libexec/vnc-monitor-broker"
-install -Dm0755 auth-helper/vnc-monitor-auth-helper \
-    "$stage/usr/libexec/vnc-monitor-auth-helper"
-install -Dm0644 config/vnc-monitor.conf \
-    "$stage/etc/vnc-monitor/config.ini"
-install -Dm0644 auth-helper/vnc-monitor.pam \
-    "$stage/etc/pam.d/vnc-monitor"
+install -Dm0755 vnc-monitor "$stage/usr/bin/vnc-monitor"
+install -Dm0755 vnc-monitor-broker "$stage/usr/libexec/vnc-monitor-broker"
+install -Dm0755 auth-helper/vnc-monitor-auth-helper "$stage/usr/libexec/vnc-monitor-auth-helper"
+install -Dm0644 config/vnc-monitor.conf "$stage/etc/vnc-monitor/config.ini"
+install -Dm0644 auth-helper/vnc-monitor.pam "$stage/etc/pam.d/vnc-monitor"
 
-# Package user agent. RuntimeDirectory gives the hardened service a writable
-# $XDG_RUNTIME_DIR/vnc-monitor for its broker control socket.
 mkdir -p "$stage/usr/lib/systemd/user"
 cat >"$stage/usr/lib/systemd/user/vnc-monitor.service" <<'EOF'
 [Unit]
@@ -262,24 +255,14 @@ WantedBy=graphical-session.target
 EOF
 chmod 0644 "$stage/usr/lib/systemd/user/vnc-monitor.service"
 
-# Ship the Wants symlink so every future graphical user session gets an agent
-# without per-account package-time home modifications.
 mkdir -p "$stage/usr/lib/systemd/user/graphical-session.target.wants"
-ln -s ../vnc-monitor.service \
-    "$stage/usr/lib/systemd/user/graphical-session.target.wants/vnc-monitor.service"
+ln -s ../vnc-monitor.service "$stage/usr/lib/systemd/user/graphical-session.target.wants/vnc-monitor.service"
 
-# System broker: owns TCP/5901 (or system-configured port), queries logind
-# seat0.ActiveSession, and passes the accepted TCP descriptor to exactly that
-# active user's agent. Package path differs from source-install /usr/local.
 mkdir -p "$stage/usr/lib/systemd/system"
 sed 's#/usr/local/libexec/vnc-monitor-broker#/usr/libexec/vnc-monitor-broker#' \
-    systemd/vnc-monitor-broker.service \
-    >"$stage/usr/lib/systemd/system/vnc-monitor-broker.service"
+    systemd/vnc-monitor-broker.service >"$stage/usr/lib/systemd/system/vnc-monitor-broker.service"
 chmod 0644 "$stage/usr/lib/systemd/system/vnc-monitor-broker.service"
 
-# Generic system PAM socket. The privileged helper enforces SO_PEERCRED and
-# rejects authentication requests whose username differs from the connecting
-# user-agent process' Unix account.
 cat >"$stage/usr/lib/systemd/system/vnc-monitor-auth.socket" <<'EOF'
 [Unit]
 Description=VNC Monitor PAM authentication socket
@@ -296,34 +279,22 @@ EOF
 chmod 0644 "$stage/usr/lib/systemd/system/vnc-monitor-auth.socket"
 
 sed 's#/usr/local/libexec/vnc-monitor-auth-helper#/usr/libexec/vnc-monitor-auth-helper#' \
-    auth-helper/vnc-monitor-auth@.service \
-    >"$stage/usr/lib/systemd/system/vnc-monitor-auth@.service"
+    auth-helper/vnc-monitor-auth@.service >"$stage/usr/lib/systemd/system/vnc-monitor-auth@.service"
 chmod 0644 "$stage/usr/lib/systemd/system/vnc-monitor-auth@.service"
 
-install -Dm0644 README.md \
-    "$stage/usr/share/doc/vnc-monitor/README.md"
-install -Dm0644 CHANGELOG.md \
-    "$stage/usr/share/doc/vnc-monitor/CHANGELOG.md"
-install -Dm0644 SECURITY.md \
-    "$stage/usr/share/doc/vnc-monitor/SECURITY.md"
-install -Dm0644 LICENSE \
-    "$stage/usr/share/doc/vnc-monitor/LICENSE"
-install -Dm0644 docs/INSTALL.md \
-    "$stage/usr/share/doc/vnc-monitor/INSTALL.md"
-install -Dm0644 docs/ARCHITECTURE.md \
-    "$stage/usr/share/doc/vnc-monitor/ARCHITECTURE.md"
-install -Dm0644 docs/TROUBLESHOOTING.md \
-    "$stage/usr/share/doc/vnc-monitor/TROUBLESHOOTING.md"
+install -Dm0644 README.md "$stage/usr/share/doc/vnc-monitor/README.md"
+install -Dm0644 CHANGELOG.md "$stage/usr/share/doc/vnc-monitor/CHANGELOG.md"
+install -Dm0644 SECURITY.md "$stage/usr/share/doc/vnc-monitor/SECURITY.md"
+install -Dm0644 LICENSE "$stage/usr/share/doc/vnc-monitor/LICENSE"
+install -Dm0644 docs/INSTALL.md "$stage/usr/share/doc/vnc-monitor/INSTALL.md"
+install -Dm0644 docs/ARCHITECTURE.md "$stage/usr/share/doc/vnc-monitor/ARCHITECTURE.md"
+install -Dm0644 docs/TROUBLESHOOTING.md "$stage/usr/share/doc/vnc-monitor/TROUBLESHOOTING.md"
 
-# Preserve administrator edits to system policy/PAM files.
 cat >"$stage/DEBIAN/conffiles" <<'EOF'
 /etc/vnc-monitor/config.ini
 /etc/pam.d/vnc-monitor
 EOF
 
-# Determine only runtime shared-library dependencies from all compiled ELF
-# files. No compiler, *-dev package, pkg-config or debhelper dependency is
-# propagated into the finished binary package.
 shlib_work="$work_dir/shlibdeps"
 mkdir -p "$shlib_work/debian"
 cat >"$shlib_work/debian/control" <<'EOF'
@@ -377,7 +348,13 @@ if [ -d /run/systemd/system ]; then
     systemctl daemon-reload
     systemctl enable vnc-monitor-auth.socket vnc-monitor-broker.service >/dev/null
     systemctl restart vnc-monitor-auth.socket
-    systemctl restart vnc-monitor-broker.service
+
+    # beta.2 had a per-user standalone daemon that could still own the public
+    # port until the already-running user's manager reloads/restarts beta.3 as
+    # --agent. Do not fail the package transaction on that temporary conflict.
+    # The broker unit retries without StartLimit exhaustion and will bind after
+    # the current graphical user restarts the packaged agent.
+    systemctl restart vnc-monitor-broker.service >/dev/null 2>&1 || true
 fi
 
 exit 0
@@ -431,6 +408,7 @@ printf '\nThe agent is globally wanted by graphical-session.target for future lo
 printf 'For the already-running GNOME session after first install/upgrade, run:\n'
 printf '  systemctl --user daemon-reload\n'
 printf '  systemctl --user restart vnc-monitor.service\n'
+printf '  sudo systemctl restart vnc-monitor-broker.service\n'
 printf '\nIf this machine still has the old ./install.sh source installation, remove\n'
 printf 'its user/system unit overrides first (config and RA2 identity are preserved):\n'
 printf '  make uninstall-service\n'
