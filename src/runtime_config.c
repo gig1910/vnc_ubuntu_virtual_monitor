@@ -6,13 +6,54 @@
 
 #include <errno.h>
 #include <getopt.h>
-#include <limits.h>
+#include <glib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
-static char default_ra2_key[PATH_MAX];
+static int
+copy_text(const char *name, char *out, size_t out_size, const char *value)
+{
+    if (!value || !*value) {
+        fprintf(stderr, "Invalid %s: empty value\n", name);
+        return -1;
+    }
+
+    int n = snprintf(out, out_size, "%s", value);
+    if (n < 0 || (size_t)n >= out_size) {
+        fprintf(stderr, "Invalid %s: value is too long\n", name);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+expand_path(const char *name, char *out, size_t out_size, const char *value)
+{
+    const char *home = getenv("HOME");
+
+    if (value && home && *home && value[0] == '~' && value[1] == '/') {
+        int n = snprintf(out, out_size, "%s/%s", home, value + 2);
+        if (n < 0 || (size_t)n >= out_size) {
+            fprintf(stderr, "Invalid %s: expanded path is too long\n", name);
+            return -1;
+        }
+        return 0;
+    }
+
+    if (value && home && *home && strncmp(value, "$HOME/", 6) == 0) {
+        int n = snprintf(out, out_size, "%s/%s", home, value + 6);
+        if (n < 0 || (size_t)n >= out_size) {
+            fprintf(stderr, "Invalid %s: expanded path is too long\n", name);
+            return -1;
+        }
+        return 0;
+    }
+
+    return copy_text(name, out, out_size, value);
+}
 
 static int
 parse_int(const char *name, const char *value, int min_value, int max_value, int *out)
@@ -39,14 +80,16 @@ parse_int(const char *name, const char *value, int min_value, int max_value, int
 static int
 parse_bool(const char *name, const char *value, int *out)
 {
-    if (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
-        strcasecmp(value, "yes") == 0 || strcasecmp(value, "on") == 0) {
+    if (value &&
+        (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
+         strcasecmp(value, "yes") == 0 || strcasecmp(value, "on") == 0)) {
         *out = 1;
         return 0;
     }
 
-    if (strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
-        strcasecmp(value, "no") == 0 || strcasecmp(value, "off") == 0) {
+    if (value &&
+        (strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
+         strcasecmp(value, "no") == 0 || strcasecmp(value, "off") == 0)) {
         *out = 0;
         return 0;
     }
@@ -67,19 +110,21 @@ runtime_config_capture_backend_name(CaptureBackend backend)
 static int
 parse_capture_backend(const char *value, CaptureBackend *out)
 {
-    if (strcasecmp(value, "pipewire") == 0 || strcasecmp(value, "native") == 0) {
+    if (value &&
+        (strcasecmp(value, "pipewire") == 0 || strcasecmp(value, "native") == 0)) {
         *out = CAPTURE_BACKEND_PIPEWIRE;
         return 0;
     }
 
-    if (strcasecmp(value, "gstreamer") == 0 || strcasecmp(value, "gst") == 0) {
+    if (value &&
+        (strcasecmp(value, "gstreamer") == 0 || strcasecmp(value, "gst") == 0)) {
         *out = CAPTURE_BACKEND_GSTREAMER;
         return 0;
     }
 
     fprintf(stderr,
             "Invalid capture backend: %s (use pipewire or gstreamer)\n",
-            value);
+            value ? value : "(null)");
     return -1;
 }
 
@@ -101,31 +146,58 @@ runtime_config_mutter_cursor_name(MutterCursorMode mode)
 static int
 parse_mutter_cursor(const char *value, MutterCursorMode *out)
 {
-    if (strcmp(value, "hidden") == 0) {
+    if (value && strcmp(value, "hidden") == 0) {
         *out = MUTTER_CURSOR_HIDDEN;
         return 0;
     }
 
-    if (strcmp(value, "embedded") == 0) {
+    if (value && strcmp(value, "embedded") == 0) {
         *out = MUTTER_CURSOR_EMBEDDED;
         return 0;
     }
 
-    if (strcmp(value, "metadata") == 0) {
+    if (value && strcmp(value, "metadata") == 0) {
         *out = MUTTER_CURSOR_METADATA;
         return 0;
     }
 
     fprintf(stderr,
-            "Invalid --mutter-cursor value: %s (expected hidden|embedded|metadata)\n",
-            value);
+            "Invalid mutter-cursor value: %s (expected hidden|embedded|metadata)\n",
+            value ? value : "(null)");
+    return -1;
+}
+
+const char *
+runtime_config_screen_size_mode_name(ScreenSizeMode mode)
+{
+    return mode == SCREEN_SIZE_FIXED ? "fixed" : "auto";
+}
+
+static int
+parse_screen_size_mode(const char *value, ScreenSizeMode *out)
+{
+    if (value &&
+        (strcasecmp(value, "auto") == 0 || strcasecmp(value, "client") == 0)) {
+        *out = SCREEN_SIZE_AUTO;
+        return 0;
+    }
+
+    if (value && strcasecmp(value, "fixed") == 0) {
+        *out = SCREEN_SIZE_FIXED;
+        return 0;
+    }
+
+    fprintf(stderr,
+            "Invalid screen-mode: %s (use auto or fixed)\n",
+            value ? value : "(null)");
     return -1;
 }
 
 static int
 parse_vnc_fps(const char *value, int *out)
 {
-    if (strcasecmp(value, "source") == 0 || strcasecmp(value, "unlimited") == 0) {
+    if (value &&
+        (strcasecmp(value, "source") == 0 || strcasecmp(value, "unlimited") == 0)) {
         *out = 0;
         return 0;
     }
@@ -144,61 +216,330 @@ apply_log_level(RuntimeConfig *cfg)
     cfg->frame_stats_interval_ms = 1000;
 }
 
+static int
+apply_setting(RuntimeConfig *cfg, const char *name, const char *value)
+{
+    if (strcmp(name, "capture-backend") == 0)
+        return parse_capture_backend(value, &cfg->capture_backend);
+    if (strcmp(name, "capture-timeout-ms") == 0)
+        return parse_int(name, value, 100, 60000, &cfg->capture_timeout_ms);
+    if (strcmp(name, "mutter-cursor") == 0)
+        return parse_mutter_cursor(value, &cfg->mutter_cursor_mode);
+    if (strcmp(name, "vnc-fps") == 0)
+        return parse_vnc_fps(value, &cfg->vnc_max_fps);
+    if (strcmp(name, "latest-only") == 0)
+        return parse_bool(name, value, &cfg->latest_only);
+    if (strcmp(name, "external-send-buffer") == 0)
+        return parse_int(name, value, 4096, 4194304, &cfg->external_send_buffer);
+    if (strcmp(name, "backend-recv-buffer") == 0)
+        return parse_int(name, value, 4096, 4194304, &cfg->backend_receive_buffer);
+    if (strcmp(name, "diff-detect") == 0)
+        return parse_bool(name, value, &cfg->diff_detect);
+    if (strcmp(name, "diff-tile-size") == 0)
+        return parse_int(name, value, 8, 256, &cfg->diff_tile_size);
+    if (strcmp(name, "layout-remember") == 0)
+        return parse_bool(name, value, &cfg->layout_remember);
+    if (strcmp(name, "layout-resave") == 0)
+        return parse_bool(name, value, &cfg->layout_resave);
+    if (strcmp(name, "port") == 0)
+        return parse_int(name, value, 1, 65535, &cfg->public_port);
+    if (strcmp(name, "backend-port") == 0)
+        return parse_int(name, value, 1, 65535, &cfg->backend_port);
+    if (strcmp(name, "backend-bind") == 0)
+        return copy_text(name, cfg->backend_bind, sizeof(cfg->backend_bind), value);
+    if (strcmp(name, "screen-mode") == 0)
+        return parse_screen_size_mode(value, &cfg->screen_size_mode);
+    if (strcmp(name, "width") == 0)
+        return parse_int(name, value, 64, 16384, &cfg->width);
+    if (strcmp(name, "height") == 0)
+        return parse_int(name, value, 64, 16384, &cfg->height);
+    if (strcmp(name, "fps") == 0)
+        return parse_int(name, value, 1, 240, &cfg->max_fps);
+    if (strcmp(name, "ra2-record-size") == 0)
+        return parse_int(name, value, 1, 65535, &cfg->ra2_stream_record_max);
+    if (strcmp(name, "ra2-coalesce") == 0)
+        return parse_bool(name, value, &cfg->ra2_coalesce);
+    if (strcmp(name, "ra2-coalesce-us") == 0)
+        return parse_int(name, value, 0, 1000000, &cfg->ra2_coalesce_us);
+    if (strcmp(name, "ra2-key") == 0)
+        return expand_path(name, cfg->ra2_key_file, sizeof(cfg->ra2_key_file), value);
+    if (strcmp(name, "auth-socket") == 0)
+        return expand_path(name, cfg->auth_socket, sizeof(cfg->auth_socket), value);
+    if (strcmp(name, "zrle") == 0)
+        return parse_bool(name, value, &cfg->enable_zrle);
+    if (strcmp(name, "raw") == 0)
+        return parse_bool(name, value, &cfg->enable_raw);
+    if (strcmp(name, "cursor") == 0)
+        return parse_bool(name, value, &cfg->enable_cursor);
+    if (strcmp(name, "newfbsize") == 0)
+        return parse_bool(name, value, &cfg->enable_newfbsize);
+    if (strcmp(name, "verbose") == 0) {
+        if (vnc_log_parse_level(value, &cfg->verbose) < 0) {
+            fprintf(stderr,
+                    "Invalid verbose level: %s (use 0|error, 1|info, 2|debug, 3|trace)\n",
+                    value ? value : "(null)");
+            return -1;
+        }
+        return 0;
+    }
+
+    fprintf(stderr, "Unknown configuration setting: %s\n", name);
+    return -1;
+}
+
+typedef struct {
+    const char *group;
+    const char *key;
+    const char *setting;
+} ConfigBinding;
+
+static const ConfigBinding config_bindings[] = {
+    {"capture", "backend", "capture-backend"},
+    {"capture", "timeout-ms", "capture-timeout-ms"},
+    {"capture", "cursor", "mutter-cursor"},
+    {"capture", "fps", "fps"},
+
+    {"display", "mode", "screen-mode"},
+    {"display", "width", "width"},
+    {"display", "height", "height"},
+    {"display", "layout-remember", "layout-remember"},
+    {"display", "layout-resave", "layout-resave"},
+
+    {"transport", "vnc-fps", "vnc-fps"},
+    {"transport", "latest-only", "latest-only"},
+    {"transport", "diff-detect", "diff-detect"},
+    {"transport", "diff-tile-size", "diff-tile-size"},
+
+    {"network", "port", "port"},
+    {"network", "backend-port", "backend-port"},
+    {"network", "backend-bind", "backend-bind"},
+    {"network", "external-send-buffer", "external-send-buffer"},
+    {"network", "backend-recv-buffer", "backend-recv-buffer"},
+
+    {"ra2", "record-size", "ra2-record-size"},
+    {"ra2", "coalesce", "ra2-coalesce"},
+    {"ra2", "coalesce-us", "ra2-coalesce-us"},
+    {"ra2", "key", "ra2-key"},
+    {"ra2", "auth-socket", "auth-socket"},
+
+    {"rfb", "zrle", "zrle"},
+    {"rfb", "raw", "raw"},
+    {"rfb", "cursor", "cursor"},
+    {"rfb", "newfbsize", "newfbsize"},
+
+    {"logging", "level", "verbose"}
+};
+
+static const ConfigBinding *
+find_config_binding(const char *group, const char *key)
+{
+    for (size_t i = 0; i < sizeof(config_bindings) / sizeof(config_bindings[0]); i++) {
+        if (strcmp(config_bindings[i].group, group) == 0 &&
+            strcmp(config_bindings[i].key, key) == 0)
+            return &config_bindings[i];
+    }
+
+    return NULL;
+}
+
+static int
+load_config_file(RuntimeConfig *cfg, int explicit_config)
+{
+    GKeyFile *keyfile = g_key_file_new();
+    GError *error = NULL;
+
+    if (!g_key_file_load_from_file(keyfile,
+                                   cfg->config_file,
+                                   G_KEY_FILE_NONE,
+                                   &error)) {
+        if (!explicit_config &&
+            error && error->domain == G_FILE_ERROR && error->code == G_FILE_ERROR_NOENT) {
+            g_clear_error(&error);
+            g_key_file_free(keyfile);
+            return 0;
+        }
+
+        fprintf(stderr,
+                "Cannot load config %s: %s\n",
+                cfg->config_file,
+                error ? error->message : "unknown error");
+        g_clear_error(&error);
+        g_key_file_free(keyfile);
+        return -1;
+    }
+
+    gsize group_count = 0;
+    gchar **groups = g_key_file_get_groups(keyfile, &group_count);
+
+    for (gsize gi = 0; gi < group_count; gi++) {
+        gsize key_count = 0;
+        GError *keys_error = NULL;
+        gchar **keys = g_key_file_get_keys(keyfile, groups[gi], &key_count, &keys_error);
+
+        if (!keys) {
+            fprintf(stderr,
+                    "Cannot read config group [%s]: %s\n",
+                    groups[gi],
+                    keys_error ? keys_error->message : "unknown error");
+            g_clear_error(&keys_error);
+            g_strfreev(groups);
+            g_key_file_free(keyfile);
+            return -1;
+        }
+
+        for (gsize ki = 0; ki < key_count; ki++) {
+            const ConfigBinding *binding = find_config_binding(groups[gi], keys[ki]);
+            if (!binding) {
+                fprintf(stderr,
+                        "Unknown config key %s/%s in %s\n",
+                        groups[gi],
+                        keys[ki],
+                        cfg->config_file);
+                g_strfreev(keys);
+                g_strfreev(groups);
+                g_key_file_free(keyfile);
+                return -1;
+            }
+
+            GError *value_error = NULL;
+            gchar *value = g_key_file_get_string(keyfile,
+                                                 groups[gi],
+                                                 keys[ki],
+                                                 &value_error);
+            if (!value) {
+                fprintf(stderr,
+                        "Cannot read config value %s/%s: %s\n",
+                        groups[gi],
+                        keys[ki],
+                        value_error ? value_error->message : "unknown error");
+                g_clear_error(&value_error);
+                g_strfreev(keys);
+                g_strfreev(groups);
+                g_key_file_free(keyfile);
+                return -1;
+            }
+
+            g_strstrip(value);
+            if (apply_setting(cfg, binding->setting, value) < 0) {
+                fprintf(stderr,
+                        "While reading %s [%s] %s\n",
+                        cfg->config_file,
+                        groups[gi],
+                        keys[ki]);
+                g_free(value);
+                g_strfreev(keys);
+                g_strfreev(groups);
+                g_key_file_free(keyfile);
+                return -1;
+            }
+            g_free(value);
+        }
+
+        g_strfreev(keys);
+    }
+
+    g_strfreev(groups);
+    g_key_file_free(keyfile);
+    return 0;
+}
+
+static int
+prescan_config_path(RuntimeConfig *cfg, int argc, char **argv, int *explicit_config)
+{
+    *explicit_config = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --config\n");
+                return -1;
+            }
+            if (expand_path("config", cfg->config_file, sizeof(cfg->config_file), argv[++i]) < 0)
+                return -1;
+            *explicit_config = 1;
+        }
+        else if (strncmp(argv[i], "--config=", 9) == 0) {
+            if (expand_path("config", cfg->config_file, sizeof(cfg->config_file), argv[i] + 9) < 0)
+                return -1;
+            *explicit_config = 1;
+        }
+    }
+
+    return 0;
+}
+
 void
 runtime_config_defaults(RuntimeConfig *cfg)
 {
-    const char *home = getenv("HOME");
+    memset(cfg, 0, sizeof(*cfg));
 
-    if (home && *home) {
-        snprintf(default_ra2_key,
-                 sizeof(default_ra2_key),
+    const char *home = getenv("HOME");
+    const char *config_home = getenv("XDG_CONFIG_HOME");
+
+    if (config_home && *config_home) {
+        snprintf(cfg->config_file,
+                 sizeof(cfg->config_file),
+                 "%s/vnc-monitor/config.ini",
+                 config_home);
+        snprintf(cfg->ra2_key_file,
+                 sizeof(cfg->ra2_key_file),
+                 "%s/vnc-monitor/ra2-server-key.pem",
+                 config_home);
+    }
+    else if (home && *home) {
+        snprintf(cfg->config_file,
+                 sizeof(cfg->config_file),
+                 "%s/.config/vnc-monitor/config.ini",
+                 home);
+        snprintf(cfg->ra2_key_file,
+                 sizeof(cfg->ra2_key_file),
                  "%s/.config/vnc-monitor/ra2-server-key.pem",
                  home);
     }
     else {
-        snprintf(default_ra2_key,
-                 sizeof(default_ra2_key),
-                 "./ra2-server-key.pem");
+        snprintf(cfg->config_file, sizeof(cfg->config_file), "./vnc-monitor.ini");
+        snprintf(cfg->ra2_key_file, sizeof(cfg->ra2_key_file), "./ra2-server-key.pem");
     }
 
-    *cfg = (RuntimeConfig) {
-        .capture_backend = CAPTURE_BACKEND_PIPEWIRE,
-        .capture_timeout_ms = 5000,
-        .mutter_cursor_mode = MUTTER_CURSOR_METADATA,
-        .vnc_max_fps = 0,
-        .latest_only = 1,
+    snprintf(cfg->auth_socket,
+             sizeof(cfg->auth_socket),
+             "/run/vnc-monitor-auth.sock");
+    snprintf(cfg->backend_bind,
+             sizeof(cfg->backend_bind),
+             "127.0.0.1");
 
-        .external_send_buffer = 65536,
-        .backend_receive_buffer = 65536,
-        .diff_detect = 1,
-        .diff_tile_size = 32,
-        .layout_remember = 1,
-        .layout_resave = 0,
+    cfg->capture_backend = CAPTURE_BACKEND_PIPEWIRE;
+    cfg->capture_timeout_ms = 5000;
+    cfg->mutter_cursor_mode = MUTTER_CURSOR_METADATA;
+    cfg->vnc_max_fps = 0;
+    cfg->latest_only = 1;
 
-        .public_port = 5901,
-        .backend_port = 5903,
-        .width = 1024,
-        .height = 768,
-        .max_fps = 60,
-        .ra2_stream_record_max = 16384,
-        .ra2_coalesce = 1,
-        .ra2_coalesce_us = 500,
+    cfg->external_send_buffer = 65536;
+    cfg->backend_receive_buffer = 65536;
+    cfg->diff_detect = 1;
+    cfg->diff_tile_size = 32;
+    cfg->layout_remember = 1;
+    cfg->layout_resave = 0;
 
-        .enable_zrle = 1,
-        .enable_raw = 1,
-        .enable_cursor = 1,
-        .enable_newfbsize = 1,
+    cfg->public_port = 5901;
+    cfg->backend_port = 5903;
+    cfg->screen_size_mode = SCREEN_SIZE_AUTO;
+    cfg->width = 1024;
+    cfg->height = 768;
+    cfg->max_fps = 60;
+    cfg->ra2_stream_record_max = 16384;
+    cfg->ra2_coalesce = 1;
+    cfg->ra2_coalesce_us = 500;
 
-        .enable_clipboard = 0,
-        .enable_file_transfer = 0,
-        .view_only = 1,
+    cfg->enable_zrle = 1;
+    cfg->enable_raw = 1;
+    cfg->enable_cursor = 1;
+    cfg->enable_newfbsize = 1;
 
-        .verbose = VNC_LOG_INFO,
-
-        .auth_socket = "/run/vnc-monitor-auth.sock",
-        .ra2_key_file = default_ra2_key,
-        .backend_bind = "127.0.0.1"
-    };
+    cfg->enable_clipboard = 0;
+    cfg->enable_file_transfer = 0;
+    cfg->view_only = 1;
+    cfg->verbose = VNC_LOG_INFO;
 
     apply_log_level(cfg);
 }
@@ -210,44 +551,49 @@ runtime_config_usage(const char *argv0)
         "VNC Monitor %s\n"
         "Usage: %s [options]\n"
         "\n"
+        "Configuration:\n"
+        "  --config FILE                INI config [~/.config/vnc-monitor/config.ini]\n"
+        "  Config is loaded after built-in defaults; CLI options override it.\n"
+        "\n"
         "Wayland capture:\n"
-        "  --capture-backend MODE       pipewire|gstreamer        [pipewire]\n"
-        "  --capture-timeout-ms N       Wait for first frame       [5000]\n"
-        "  --mutter-cursor MODE         hidden|embedded|metadata [metadata]\n"
-        "  --vnc-fps source|N           Max publish rate          [source]\n"
-        "  --latest-only on|off         Keep newest source state      [on]\n"
-        "  --diff-detect on|off         Tile diff detection           [on]\n"
-        "  --diff-tile-size N           Diff tile size                 [32]\n"
-        "  --layout-remember on|off     Restore saved GNOME layout     [on]\n"
-        "  --layout-resave on|off       Replace saved layout          [off]\n"
+        "  --capture-backend MODE       pipewire|gstreamer\n"
+        "  --capture-timeout-ms N       Wait for first frame\n"
+        "  --mutter-cursor MODE         hidden|embedded|metadata\n"
+        "  --vnc-fps source|N           Max publish rate\n"
+        "  --latest-only on|off         Keep newest source state\n"
+        "  --diff-detect on|off         Tile diff detection\n"
+        "  --diff-tile-size N           Diff tile size\n"
+        "  --layout-remember on|off     Restore saved GNOME layout\n"
+        "  --layout-resave on|off       Replace saved layout\n"
         "\n"
         "Network:\n"
-        "  --port N                     Public RA2r VNC port         [5901]\n"
-        "  --backend-port N             Internal RFB port            [5903]\n"
-        "  --backend-bind ADDR          Internal bind address   [127.0.0.1]\n"
-        "  --external-send-buffer N    External TCP SO_SNDBUF      [65536]\n"
-        "  --backend-recv-buffer N     Backend TCP SO_RCVBUF       [65536]\n"
+        "  --port N                     Public RA2r VNC port\n"
+        "  --backend-port N             Internal RFB port\n"
+        "  --backend-bind ADDR          Internal bind address\n"
+        "  --external-send-buffer N     External TCP SO_SNDBUF\n"
+        "  --backend-recv-buffer N      Backend TCP SO_RCVBUF\n"
         "\n"
         "Virtual monitor:\n"
-        "  --width N                    Width                       [1024]\n"
-        "  --height N                   Height                       [768]\n"
-        "  --fps N                      Maximum capture FPS           [60]\n"
+        "  --screen-mode MODE           auto|fixed [auto]\n"
+        "  --width N                    Initial/fallback width [1024]\n"
+        "  --height N                   Initial/fallback height [768]\n"
+        "  --fps N                      Maximum capture FPS [60]\n"
         "\n"
         "RA2r:\n"
-        "  --ra2-record-size N          Max encrypted payload      [16384]\n"
-        "  --ra2-coalesce on|off        Merge backend reads            [on]\n"
-        "  --ra2-coalesce-us N          Max merge delay, usec          [500]\n"
+        "  --ra2-record-size N          Max encrypted payload\n"
+        "  --ra2-coalesce on|off        Merge backend reads\n"
+        "  --ra2-coalesce-us N          Max merge delay, usec\n"
         "  --ra2-key FILE               Persistent RSA identity\n"
         "  --auth-socket PATH           PAM helper socket\n"
         "\n"
         "RFB compatibility:\n"
-        "  --zrle on|off                Advertise/allow ZRLE           [on]\n"
-        "  --raw on|off                 Advertise/allow Raw            [on]\n"
-        "  --cursor on|off              Cursor extension               [on]\n"
-        "  --newfbsize on|off           NewFBSize extension            [on]\n"
+        "  --zrle on|off                Advertise/allow ZRLE\n"
+        "  --raw on|off                 Advertise/allow Raw\n"
+        "  --cursor on|off              Cursor extension\n"
+        "  --newfbsize on|off           NewFBSize extension\n"
         "\n"
         "Logging:\n"
-        "  --verbose LEVEL              0|error, 1|info, 2|debug, 3|trace [info]\n"
+        "  --verbose LEVEL              0|error, 1|info, 2|debug, 3|trace\n"
         "\n"
         "Security is fixed in beta: view-only, clipboard input disabled,\n"
         "file transfer disabled. These are not runtime switches.\n"
@@ -265,10 +611,11 @@ runtime_config_print(const RuntimeConfig *cfg)
 {
     printf(
         "VNC Monitor %s configuration:\n"
+        "  config file:       %s\n"
         "  capture backend:   %s\n"
         "  capture timeout:   %d ms\n"
         "  Mutter cursor:     %s\n"
-        "  source max FPS:    %d\n"
+        "  capture max FPS:   %d\n"
         "  VNC max rate:      %s\n"
         "  latest-only:       %s\n"
         "  diff detect:       %s (%d px tiles)\n"
@@ -276,7 +623,8 @@ runtime_config_print(const RuntimeConfig *cfg)
         "  layout resave:     %s\n"
         "  public port:       %d\n"
         "  backend:           %s:%d\n"
-        "  framebuffer:       %dx%d\n"
+        "  screen mode:       %s\n"
+        "  framebuffer:       %dx%d (%s)\n"
         "  RA2 record max:    %d bytes\n"
         "  RA2 coalesce:      %s (%d us)\n"
         "  RA2 key:           %s\n"
@@ -286,6 +634,7 @@ runtime_config_print(const RuntimeConfig *cfg)
         "  security:          view-only, clipboard=off, file-transfer=off\n"
         "  log level:         %s (%d)\n",
         VNC_MONITOR_VERSION,
+        cfg->config_file,
         runtime_config_capture_backend_name(cfg->capture_backend),
         cfg->capture_timeout_ms,
         runtime_config_mutter_cursor_name(cfg->mutter_cursor_mode),
@@ -299,8 +648,10 @@ runtime_config_print(const RuntimeConfig *cfg)
         cfg->public_port,
         cfg->backend_bind,
         cfg->backend_port,
+        runtime_config_screen_size_mode_name(cfg->screen_size_mode),
         cfg->width,
         cfg->height,
+        cfg->screen_size_mode == SCREEN_SIZE_FIXED ? "fixed" : "initial/fallback",
         cfg->ra2_stream_record_max,
         cfg->ra2_coalesce ? "on" : "off",
         cfg->ra2_coalesce_us,
@@ -321,7 +672,8 @@ int
 runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
 {
     enum {
-        OPT_CAPTURE_BACKEND = 1000,
+        OPT_CONFIG = 1000,
+        OPT_CAPTURE_BACKEND,
         OPT_CAPTURE_TIMEOUT_MS,
         OPT_MUTTER_CURSOR,
         OPT_VNC_FPS,
@@ -335,6 +687,7 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
         OPT_PORT,
         OPT_BACKEND_PORT,
         OPT_BACKEND_BIND,
+        OPT_SCREEN_MODE,
         OPT_WIDTH,
         OPT_HEIGHT,
         OPT_FPS,
@@ -353,6 +706,7 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
     };
 
     static const struct option options[] = {
+        {"config", required_argument, NULL, OPT_CONFIG},
         {"capture-backend", required_argument, NULL, OPT_CAPTURE_BACKEND},
         {"capture-timeout-ms", required_argument, NULL, OPT_CAPTURE_TIMEOUT_MS},
         {"mutter-cursor", required_argument, NULL, OPT_MUTTER_CURSOR},
@@ -367,6 +721,7 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
         {"port", required_argument, NULL, OPT_PORT},
         {"backend-port", required_argument, NULL, OPT_BACKEND_PORT},
         {"backend-bind", required_argument, NULL, OPT_BACKEND_BIND},
+        {"screen-mode", required_argument, NULL, OPT_SCREEN_MODE},
         {"width", required_argument, NULL, OPT_WIDTH},
         {"height", required_argument, NULL, OPT_HEIGHT},
         {"fps", required_argument, NULL, OPT_FPS},
@@ -386,131 +741,69 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
         {NULL, 0, NULL, 0}
     };
 
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0) {
+            printf("%s\n", VNC_MONITOR_VERSION);
+            exit(0);
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            runtime_config_usage(argv[0]);
+            exit(0);
+        }
+    }
+
+    int explicit_config = 0;
+    if (prescan_config_path(cfg, argc, argv, &explicit_config) < 0)
+        return -1;
+
+    if (load_config_file(cfg, explicit_config) < 0)
+        return -1;
+
+    int show_config = 0;
+    optind = 1;
+
     for (;;) {
         int c = getopt_long(argc, argv, "h", options, NULL);
         if (c == -1)
             break;
 
+        const char *setting = NULL;
+
         switch (c) {
-            case OPT_CAPTURE_BACKEND:
-                if (parse_capture_backend(optarg, &cfg->capture_backend) < 0)
-                    return -1;
+            case OPT_CONFIG:
+                /* Already handled before loading the config file. */
                 break;
-            case OPT_CAPTURE_TIMEOUT_MS:
-                if (parse_int("capture-timeout-ms", optarg, 100, 60000,
-                              &cfg->capture_timeout_ms) < 0)
-                    return -1;
-                break;
-            case OPT_MUTTER_CURSOR:
-                if (parse_mutter_cursor(optarg, &cfg->mutter_cursor_mode) < 0)
-                    return -1;
-                break;
-            case OPT_VNC_FPS:
-                if (parse_vnc_fps(optarg, &cfg->vnc_max_fps) < 0)
-                    return -1;
-                break;
-            case OPT_LATEST_ONLY:
-                if (parse_bool("latest-only", optarg, &cfg->latest_only) < 0)
-                    return -1;
-                break;
-            case OPT_EXTERNAL_SEND_BUFFER:
-                if (parse_int("external-send-buffer", optarg, 4096, 4194304,
-                              &cfg->external_send_buffer) < 0)
-                    return -1;
-                break;
-            case OPT_BACKEND_RECV_BUFFER:
-                if (parse_int("backend-recv-buffer", optarg, 4096, 4194304,
-                              &cfg->backend_receive_buffer) < 0)
-                    return -1;
-                break;
-            case OPT_DIFF_DETECT:
-                if (parse_bool("diff-detect", optarg, &cfg->diff_detect) < 0)
-                    return -1;
-                break;
-            case OPT_DIFF_TILE_SIZE:
-                if (parse_int("diff-tile-size", optarg, 8, 256,
-                              &cfg->diff_tile_size) < 0)
-                    return -1;
-                break;
-            case OPT_LAYOUT_REMEMBER:
-                if (parse_bool("layout-remember", optarg, &cfg->layout_remember) < 0)
-                    return -1;
-                break;
-            case OPT_LAYOUT_RESAVE:
-                if (parse_bool("layout-resave", optarg, &cfg->layout_resave) < 0)
-                    return -1;
-                break;
-            case OPT_PORT:
-                if (parse_int("port", optarg, 1, 65535, &cfg->public_port) < 0)
-                    return -1;
-                break;
-            case OPT_BACKEND_PORT:
-                if (parse_int("backend-port", optarg, 1, 65535, &cfg->backend_port) < 0)
-                    return -1;
-                break;
-            case OPT_BACKEND_BIND:
-                cfg->backend_bind = optarg;
-                break;
-            case OPT_WIDTH:
-                if (parse_int("width", optarg, 64, 16384, &cfg->width) < 0)
-                    return -1;
-                break;
-            case OPT_HEIGHT:
-                if (parse_int("height", optarg, 64, 16384, &cfg->height) < 0)
-                    return -1;
-                break;
-            case OPT_FPS:
-                if (parse_int("fps", optarg, 1, 240, &cfg->max_fps) < 0)
-                    return -1;
-                break;
-            case OPT_RA2_RECORD_SIZE:
-                if (parse_int("ra2-record-size", optarg, 1, 65535,
-                              &cfg->ra2_stream_record_max) < 0)
-                    return -1;
-                break;
-            case OPT_RA2_COALESCE:
-                if (parse_bool("ra2-coalesce", optarg, &cfg->ra2_coalesce) < 0)
-                    return -1;
-                break;
-            case OPT_RA2_COALESCE_US:
-                if (parse_int("ra2-coalesce-us", optarg, 0, 1000000,
-                              &cfg->ra2_coalesce_us) < 0)
-                    return -1;
-                break;
-            case OPT_RA2_KEY:
-                cfg->ra2_key_file = optarg;
-                break;
-            case OPT_AUTH_SOCKET:
-                cfg->auth_socket = optarg;
-                break;
-            case OPT_ZRLE:
-                if (parse_bool("zrle", optarg, &cfg->enable_zrle) < 0)
-                    return -1;
-                break;
-            case OPT_RAW:
-                if (parse_bool("raw", optarg, &cfg->enable_raw) < 0)
-                    return -1;
-                break;
-            case OPT_CURSOR:
-                if (parse_bool("cursor", optarg, &cfg->enable_cursor) < 0)
-                    return -1;
-                break;
-            case OPT_NEWFBSIZE:
-                if (parse_bool("newfbsize", optarg, &cfg->enable_newfbsize) < 0)
-                    return -1;
-                break;
-            case OPT_VERBOSE:
-                if (vnc_log_parse_level(optarg, &cfg->verbose) < 0) {
-                    fprintf(stderr,
-                            "Invalid --verbose level: %s (use 0|error, 1|info, 2|debug, 3|trace)\n",
-                            optarg);
-                    return -1;
-                }
-                break;
+            case OPT_CAPTURE_BACKEND: setting = "capture-backend"; break;
+            case OPT_CAPTURE_TIMEOUT_MS: setting = "capture-timeout-ms"; break;
+            case OPT_MUTTER_CURSOR: setting = "mutter-cursor"; break;
+            case OPT_VNC_FPS: setting = "vnc-fps"; break;
+            case OPT_LATEST_ONLY: setting = "latest-only"; break;
+            case OPT_EXTERNAL_SEND_BUFFER: setting = "external-send-buffer"; break;
+            case OPT_BACKEND_RECV_BUFFER: setting = "backend-recv-buffer"; break;
+            case OPT_DIFF_DETECT: setting = "diff-detect"; break;
+            case OPT_DIFF_TILE_SIZE: setting = "diff-tile-size"; break;
+            case OPT_LAYOUT_REMEMBER: setting = "layout-remember"; break;
+            case OPT_LAYOUT_RESAVE: setting = "layout-resave"; break;
+            case OPT_PORT: setting = "port"; break;
+            case OPT_BACKEND_PORT: setting = "backend-port"; break;
+            case OPT_BACKEND_BIND: setting = "backend-bind"; break;
+            case OPT_SCREEN_MODE: setting = "screen-mode"; break;
+            case OPT_WIDTH: setting = "width"; break;
+            case OPT_HEIGHT: setting = "height"; break;
+            case OPT_FPS: setting = "fps"; break;
+            case OPT_RA2_RECORD_SIZE: setting = "ra2-record-size"; break;
+            case OPT_RA2_COALESCE: setting = "ra2-coalesce"; break;
+            case OPT_RA2_COALESCE_US: setting = "ra2-coalesce-us"; break;
+            case OPT_RA2_KEY: setting = "ra2-key"; break;
+            case OPT_AUTH_SOCKET: setting = "auth-socket"; break;
+            case OPT_ZRLE: setting = "zrle"; break;
+            case OPT_RAW: setting = "raw"; break;
+            case OPT_CURSOR: setting = "cursor"; break;
+            case OPT_NEWFBSIZE: setting = "newfbsize"; break;
+            case OPT_VERBOSE: setting = "verbose"; break;
             case OPT_SHOW_CONFIG:
-                apply_log_level(cfg);
-                runtime_config_print(cfg);
-                exit(0);
+                show_config = 1;
+                break;
             case OPT_VERSION:
                 printf("%s\n", VNC_MONITOR_VERSION);
                 exit(0);
@@ -520,6 +813,9 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
             default:
                 return -1;
         }
+
+        if (setting && apply_setting(cfg, setting, optarg) < 0)
+            return -1;
     }
 
     if (optind != argc) {
@@ -533,5 +829,11 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
     }
 
     apply_log_level(cfg);
+
+    if (show_config) {
+        runtime_config_print(cfg);
+        exit(0);
+    }
+
     return 0;
 }
