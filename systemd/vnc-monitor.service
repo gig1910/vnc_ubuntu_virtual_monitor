@@ -1,0 +1,26 @@
+[Unit]
+Description=VNC Monitor for the active GNOME Wayland session
+Documentation=https://github.com/gig1910/vnc_ubuntu_virtual_monitor
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vnc-monitor --verbose info
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+UMask=0077
+
+# The daemon must read the user's installed binary and write only its own
+# identity/cache. Session D-Bus and PipeWire live under XDG_RUNTIME_DIR and are
+# intentionally not isolated away.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/vnc-monitor %h/.config/vnc-monitor-server %h/.cache/vnc-monitor
+
+[Install]
+WantedBy=graphical-session.target
