@@ -21,7 +21,9 @@ Configuration, dynamic-display and single-session hardening release.
 - effective-config output at the end of `install.sh`;
 - explicit **strong single-connect** session ownership: one active viewer owns the virtual monitor and additional connections are immediately reset/rejected;
 - external-client TCP liveness protection using `SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT` and `TCP_USER_TIMEOUT` when available;
-- configurable dead-peer timing under `[network]` with defaults `15s / 5s / 3 probes / 20000ms`.
+- configurable dead-peer timing under `[network]` with defaults `15s / 5s / 3 probes / 20000ms`;
+- `client-handshake-timeout-ms` (default 60000) as one monotonic deadline for the bounded unauthenticated RA2/auth-helper `io_*` phase, preventing silent or trickle-slow clients from monopolizing the single slot;
+- thread-local monotonic `io_*` deadline support that participates directly in the wrapper's `poll()` waits.
 
 ### Changed
 
@@ -30,6 +32,8 @@ Configuration, dynamic-display and single-session hardening release.
 - client-requested size changes are session-local and do not mutate the persistent fallback used by the next viewer;
 - the public listener remains responsive during the active session solely to reject extra clients immediately; this does not enable multi-client streaming;
 - a lost/half-open active TCP peer now tears itself down through kernel liveness detection instead of potentially holding the only session slot indefinitely;
+- the single-client slot is reserved from `accept()`, so a second client is rejected even while the first is negotiating authentication;
+- the handshake I/O deadline is cleared after successful authentication, so a healthy long-lived/static VNC session has no application-idle timeout;
 - daemon shutdown waits for the only active client worker to finish before shared framebuffer/statistics state is destroyed;
 - systemd user service starts the daemon with the persistent config instead of hard-coding log level arguments;
 - installer creates the default config once and preserves local edits on later upgrades;
