@@ -50,6 +50,7 @@ PAM_HELPER := auth-helper/vnc-monitor-auth-helper
 PAM_SOCKET_TEMPLATE := auth-helper/vnc-monitor-auth.socket.in
 PAM_SOCKET_GENERATED := $(PAM_BUILD_DIR)/vnc-monitor-auth.socket
 CONFIG_TEMPLATE := config/vnc-monitor.conf
+WEB_CONFIG_TEMPLATE := config/web.conf
 
 USER_BIN_DIR := $(HOME)/.local/bin
 USER_SYSTEMD_DIR := $(HOME)/.config/systemd/user
@@ -63,6 +64,7 @@ LEGACY_RA2_KEY := ./ra2-server-key.pem
 
 SYSTEM_CONFIG_DIR := /etc/vnc-monitor
 SYSTEM_CONFIG_FILE := $(SYSTEM_CONFIG_DIR)/config.ini
+SYSTEM_WEB_CONFIG_FILE := $(SYSTEM_CONFIG_DIR)/web.ini
 BROKER_BIN := /usr/local/libexec/vnc-monitor-broker
 BROKER_SERVICE := /etc/systemd/system/vnc-monitor-broker.service
 
@@ -158,9 +160,27 @@ install-broker-service: $(BROKER_TARGET)
 	else \
 		printf '%s\n' 'Preserving existing system config: $(SYSTEM_CONFIG_FILE)'; \
 	fi
+	@if [ ! -e "$(SYSTEM_WEB_CONFIG_FILE)" ]; then \
+		sudo install -Dm0644 "$(WEB_CONFIG_TEMPLATE)" "$(SYSTEM_WEB_CONFIG_FILE)"; \
+		printf '%s\n' 'Created web config: $(SYSTEM_WEB_CONFIG_FILE)'; \
+	else \
+		printf '%s\n' 'Preserving existing web config: $(SYSTEM_WEB_CONFIG_FILE)'; \
+	fi
 	sudo systemctl daemon-reload
 	sudo systemctl enable --now vnc-monitor-broker.service
 	@$(MAKE) --no-print-directory broker-service-status
+
+broker-service-status:
+	@printf '%s\n' '===== BROKER SERVICE ====='
+	@systemctl is-enabled vnc-monitor-broker.service 2>/dev/null || true
+	@systemctl is-active vnc-monitor-broker.service 2>/dev/null || true
+	@systemctl status vnc-monitor-broker.service --no-pager -l 2>/dev/null | sed -n '1,18p' || true
+
+uninstall-broker-service:
+	-sudo systemctl disable --now vnc-monitor-broker.service
+	sudo rm -f "$(BROKER_BIN)" "$(BROKER_SERVICE)"
+	sudo systemctl daemon-reload
+	@echo 'System broker removed. /etc/vnc-monitor/config.ini and web.ini were preserved.'
 
 install: all
 	install -Dm0755 "$(TARGET)" "$(USER_BIN_DIR)/vnc-monitor"
