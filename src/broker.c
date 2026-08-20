@@ -3,6 +3,7 @@
 #include "broker_protocol.h"
 #include "config.h"
 #include "log.h"
+#include "web_server.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -27,6 +28,7 @@
 #define LOGIN1_SESSION_IFACE     "org.freedesktop.login1.Session"
 #define DBUS_PROPERTIES_IFACE    "org.freedesktop.DBus.Properties"
 #define SYSTEM_CONFIG_FILE       "/etc/vnc-monitor/config.ini"
+#define WEB_CONFIG_FILE          "/etc/vnc-monitor/web.ini"
 #define BROKER_DEFAULT_PORT      5901
 #define BROKER_AGENT_DIR         "vnc-monitor"
 #define BROKER_AGENT_SOCKET      "agent.sock"
@@ -60,6 +62,8 @@ typedef struct {
     guint periodic_source;
     guint sigterm_source;
     guint sigint_source;
+
+    WebServer *web_server;
 
     BrokerSessionState state;
     int client_fd;
@@ -115,6 +119,19 @@ broker_session_set_state(Broker *broker, BrokerSessionState state)
               broker_session_state_name(broker->state),
               broker_session_state_name(state));
     broker->state = state;
+}
+
+static gboolean
+broker_web_slot_busy(gpointer user_data)
+{
+    return broker_session_owns_slot((const Broker *)user_data) ? TRUE : FALSE;
+}
+
+static const char *
+broker_web_slot_state(gpointer user_data)
+{
+    const Broker *broker = user_data;
+    return broker ? broker_session_state_name(broker->state) : "unknown";
 }
 
 static int
@@ -766,7 +783,8 @@ main(int argc, char **argv)
         (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         printf("VNC Monitor broker %s\n"
                "Usage: %s [--version]\n"
-               "Public port is read only from /etc/vnc-monitor/config.ini [network] port.\n",
+               "VNC port is read only from /etc/vnc-monitor/config.ini [network] port.\n"
+               "Optional HTTPS settings are read only from /etc/vnc-monitor/web.ini.\n",
                VNC_MONITOR_VERSION,
                argv[0]);
         return 0;
@@ -814,6 +832,19 @@ main(int argc, char **argv)
     }
 
     broker.loop = g_main_loop_new(NULL, FALSE);
+
+    WebServerHooks web_hooks = {
+        .slot_busy = broker_web_slot_busy,
+        .slot_state = broker_web_slot_state
+    };
+
+    int web_rc = web_server_start(&broker.web_server,
+                                  WEB_CONFIG_FILE,
+                                  &web_hooks,
+                                  &broker);
+    if (web_rc < 0) {
+        LOG_ERROR("Broker HTTPS endpoint is unavailable; continuing with VNC listener only");
+    }
 
     broker.listener_source = g_unix_fd_add(broker.listener_fd,
                                             G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL,
@@ -880,6 +911,11 @@ main(int argc, char **argv)
         if (broker.client_fd >= 0)
             (void)shutdown(broker.client_fd, SHUT_RDWR);
         clear_session(&broker, 0);
+    }
+
+    if (broker.web_server) {
+        web_server_stop(broker.web_server);
+        broker.web_server = NULL;
     }
 
     if (broker.listener_fd >= 0)
