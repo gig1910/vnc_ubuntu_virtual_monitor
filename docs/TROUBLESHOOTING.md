@@ -7,29 +7,63 @@ systemctl --user status vnc-monitor.service --no-pager -l
 journalctl --user -u vnc-monitor.service -n 100 --no-pager
 ```
 
-For protocol/capture details temporarily switch the service to `--verbose debug`; use `trace` only for short frame-level diagnostics.
+The service reads:
 
-## Service is not listening on TCP/5901
+```text
+~/.config/vnc-monitor/config.ini
+```
+
+Show exactly what the parser sees:
+
+```bash
+~/.local/bin/vnc-monitor \
+  --config ~/.config/vnc-monitor/config.ini \
+  --show-config
+```
+
+For protocol/capture details set `[logging] level=debug` in the config and restart the service. Use `trace` only for short frame-level diagnostics. CLI `--verbose` remains useful for foreground tests.
+
+## Service fails immediately after editing config
+
+Run `--show-config` as above. The beta.2 parser is intentionally strict: an unknown section/key, invalid boolean/range, bad `display.mode`, or malformed path is an error rather than a silently ignored setting.
+
+The repository default is available at:
+
+```text
+config/vnc-monitor.conf
+```
+
+The installer never overwrites an existing installed config during an upgrade.
+
+## Service is not listening on the configured public port
 
 Check:
 
 ```bash
 systemctl --user status vnc-monitor.service --no-pager -l
-ss -ltnp | grep ':5901'
+ss -ltnp | grep vnc-monitor
 ```
 
 Typical causes:
 
 - the user service was not installed/enabled;
-- another process already owns TCP/5901;
+- another process already owns the configured `[network] port`;
 - the binary under `~/.local/bin/vnc-monitor` is missing or stale;
+- config validation failed;
 - a hardening/path error prevents service startup.
 
-Reinstall after a successful build:
+Normal repair/upgrade path:
 
 ```bash
-make install-service
+git pull --ff-only
+./install.sh
 ```
+
+## Why TCP/5903 is not listening while idle
+
+This is intentional in beta.2. The internal LibVNCServer backend is session-scoped and is started only **after** RA2r/PAM authentication. It is removed again on disconnect.
+
+The persistent idle listener is the public `[network] port` (5901 by default).
 
 ## Service is running but the client cannot authenticate
 
@@ -52,13 +86,13 @@ The beta identity path is:
 ~/.config/vnc-monitor/ra2-server-key.pem
 ```
 
-Older development versions used `./ra2-server-key.pem` in the checkout. `make install` migrates that key only when the beta destination does not already exist.
+Older development versions used `./ra2-server-key.pem` in the checkout. Installation migrates that key only when the beta destination does not already exist.
 
-Do not casually delete/regenerate this file: the old viewer may pin or prompt for the server identity.
+Do not casually delete/regenerate this file: a viewer may pin or prompt for the server identity.
 
 ## Authentication succeeds but no virtual monitor appears
 
-Run with `--verbose debug` and inspect Mutter/session errors.
+Use `debug` logging and inspect Mutter/session errors.
 
 The daemon must run as the **logged-in GNOME user**, not as a root system service. It needs the user's session D-Bus and PipeWire environment.
 
@@ -77,7 +111,10 @@ Native PipeWire is the production default. To distinguish a native-capture probl
 
 ```bash
 systemctl --user stop vnc-monitor.service
-~/.local/bin/vnc-monitor --capture-backend gstreamer --verbose debug
+~/.local/bin/vnc-monitor \
+  --config ~/.config/vnc-monitor/config.ini \
+  --capture-backend gstreamer \
+  --verbose debug
 ```
 
 Restore the service afterwards:
@@ -86,47 +123,88 @@ Restore the service afterwards:
 systemctl --user start vnc-monitor.service
 ```
 
-Do not run two instances simultaneously on the same ports.
+Do not run two instances simultaneously on the same public port.
+
+## Client does not change the screen size in `display.mode=auto`
+
+First confirm the effective setting:
+
+```bash
+~/.local/bin/vnc-monitor --show-config | grep -E 'screen mode|framebuffer'
+```
+
+`auto` is not display-size guessing. RFB has to provide a client request.
+
+A viewer must advertise `ExtendedDesktopSize` (`-308`) and send `SetDesktopSize` (client message 251) to request dimensions. A client advertising only `NewFBSize`/`DesktopSize` (`-223`) can **receive** a server resize but cannot tell the server its preferred size.
+
+Such clients stay at the configured `[display] width` / `height` fallback.
+
+At `debug`, a capable client request should eventually produce either:
+
+```text
+Accepted client framebuffer resize: WIDTHxHEIGHT
+```
+
+or a clear rejection/failure message.
+
+## Client resize is rejected
+
+Check:
+
+- `[display] mode=auto` rather than `fixed`;
+- requested dimensions are within 64..16384;
+- the request contains exactly one screen at `(0,0)` spanning the requested framebuffer;
+- Mutter/PipeWire can actually create/capture the requested mode;
+- memory allocation did not fail.
+
+`fixed` mode deliberately returns RFB `ResizeProhibited`.
+
+If a new Mutter/PipeWire size cannot be created, the server attempts to restore the previous monitor size before rejecting the request.
+
+## Resize succeeds but GNOME placement changes
+
+Layout caches are dimension-specific. A previously unseen framebuffer size can therefore initially use Mutter's default placement.
+
+Arrange it once in GNOME; on disconnect the layout for those dimensions is saved. Later sessions at that same size can restore it when `[display] layout-remember=on`.
 
 ## Cursor is missing or does not update
 
 Default cursor mode is:
 
-```text
---mutter-cursor metadata
+```ini
+[capture]
+cursor=metadata
 ```
 
-This uses PipeWire `SPA_META_Cursor` and is the tested production path. Embedded cursor mode is retained only as a compatibility choice; it previously failed to generate frames for cursor-only motion on the target setup.
+This uses PipeWire `SPA_META_Cursor` and is the tested production path. Embedded cursor mode is retained as a compatibility choice; it previously failed to generate frames for cursor-only motion on the target setup.
 
 ## GUI movement is jerky
 
-At `trace`, look for `COPY` records. The old iPad advertises CopyRect and normal window dragging should often move most pixels locally on the client.
+At `trace`, look for `COPY` records. Normal window dragging should often move most pixels locally when the viewer advertises CopyRect.
 
 If no CopyRect is selected:
 
 - the change may not be a pure translation;
 - the source may be outside the ±256 px search radius;
-- the exact 32x32 verification may reject the candidate;
-- the viewer may be in a negotiated state where CopyRect is unavailable.
+- exact 32x32 verification may reject the candidate;
+- the viewer may not support CopyRect.
 
 Fallback to JPEG21 is safe and expected.
 
-## Full-screen video is much slower than local video playback on the iPad
+After a framebuffer resize the CopyRect reference is intentionally invalidated and must be re-established from a delivered frame before CopyRect can be used again.
 
-This is a known beta limitation, not evidence of network saturation by itself.
+## Full-screen video is much slower than local video playback
 
-The current VNC path sends independent JPEG21 rectangles. The old viewer must decode/draw each framebuffer update and then continue its RFB request cycle. Local video playback can use a dedicated hardware H.264 pipeline and is therefore not comparable.
+This can be viewer-side rather than LAN/server saturation. The VNC path sends framebuffer updates; local video playback can use a dedicated video decoder pipeline and is not directly comparable.
 
-Before blaming bandwidth, inspect `debug`/`trace` telemetry for:
+Inspect `debug`/`trace` telemetry for:
 
 - external output queue;
 - backend input queue;
 - TCP unacked packets;
 - RTT;
 - JPEG bytes and rectangle area;
-- source-frames coalesced per update.
-
-The established target-iPad tests showed large-motion performance constrained primarily on the viewer side rather than by LAN bandwidth or server JPEG encoding.
+- source frames coalesced per update.
 
 ## Image becomes sharp after motion stops
 
@@ -136,36 +214,27 @@ Expected behaviour. Active regions are intentionally lossy JPEG. During idle tim
 
 This remains an open beta issue. A repair tile may have been scheduled from an earlier source state just before new motion resumes.
 
-Do not hide a reproducible case. Capture a short `--verbose trace` log around the event; this is the main repair-scheduler correctness item still under observation.
+Capture a short `trace` log around a reproducible event; this is the main repair-scheduler correctness item still under observation.
 
 ## Layout is not restored
 
-The existing layout-cache namespace from the development versions is deliberately retained in beta so already learned layouts keep working.
-
-Check that the service can write its allowed user config paths and that:
+The layout-cache namespace from development versions is retained:
 
 ```text
---layout-remember on
+~/.config/vnc-monitor-server/
 ```
 
-is in effect.
-
-To intentionally learn a replacement layout, use one foreground/service run with:
-
-```text
---layout-resave on
-```
-
-then return it to `off`.
+Check `[display] layout-remember=on`. To intentionally learn a replacement layout, temporarily set `layout-resave=on`, complete a session, then return it to `off`.
 
 ## Need maximum diagnostic detail
 
-Use:
+Stop the service and run:
 
 ```bash
-~/.local/bin/vnc-monitor --verbose trace 2>&1 | tee vnc-monitor-trace.log
+systemctl --user stop vnc-monitor.service
+~/.local/bin/vnc-monitor \
+  --config ~/.config/vnc-monitor/config.ini \
+  --verbose trace 2>&1 | tee vnc-monitor-trace.log
 ```
-
-Stop the systemd user service first so the foreground process can bind the public/backend ports.
 
 Trace output can be large. It is intentionally not the service default.
