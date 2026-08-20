@@ -32,14 +32,15 @@ typedef struct {
     int backend_receive_buffer;
 
     /*
-     * External client liveness policy. These are TCP keepalive/user-timeout
-     * controls, not application-idle timers: a healthy viewer may display a
-     * static desktop indefinitely without being disconnected.
+     * External client liveness policy. Keepalive/user-timeout are transport
+     * liveness controls, not application-idle timers. Handshake timeout only
+     * limits the unauthenticated RA2/PAM negotiation phase.
      */
     int client_keepalive_idle_s;
     int client_keepalive_interval_s;
     int client_keepalive_probes;
     int client_user_timeout_ms;
+    int client_handshake_timeout_ms;
 
     int diff_detect;
     int diff_tile_size;
