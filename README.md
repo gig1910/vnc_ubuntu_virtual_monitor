@@ -111,9 +111,12 @@ client-keepalive-idle=15
 client-keepalive-interval=5
 client-keepalive-probes=3
 client-user-timeout-ms=20000
+client-handshake-timeout-ms=60000
 ```
 
-These settings detect a vanished Wi-Fi/LAN peer and automatically tear down the abandoned session, releasing the single-client slot and removing its virtual monitor. They are **not** application-idle timers: a healthy viewer showing a completely static desktop may remain connected indefinitely.
+The keepalive/user-timeout settings detect a vanished Wi-Fi/LAN peer and automatically tear down the abandoned session, releasing the single-client slot and removing its virtual monitor. They are **not** application-idle timers: a healthy viewer showing a completely static desktop may remain connected indefinitely.
+
+`client-handshake-timeout-ms` protects the slot before authentication: blocking network I/O during RA2/PAM negotiation may not wait forever. After successful authentication the receive/send timeout is removed and the normal long-lived session is governed only by TCP liveness.
 
 ## Runtime behaviour
 
@@ -145,6 +148,7 @@ While connected:
 ```text
 second viewer -> immediate reject/reset
 lost active peer -> TCP keepalive/user-timeout -> automatic session teardown
+stalled unauthenticated peer -> handshake socket timeout -> slot release
 ```
 
 Disconnect:
