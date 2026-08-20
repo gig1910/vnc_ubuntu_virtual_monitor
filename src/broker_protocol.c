@@ -8,10 +8,18 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+static int
+transport_is_vnc(uint16_t transport)
+{
+    return transport == VNC_BROKER_TRANSPORT_LEGACY_VNC ||
+           transport == VNC_BROKER_TRANSPORT_VNC;
+}
+
 const char *
 vnc_broker_transport_name(uint16_t transport)
 {
     switch (transport) {
+        case VNC_BROKER_TRANSPORT_LEGACY_VNC:
         case VNC_BROKER_TRANSPORT_VNC:
             return "vnc";
         case VNC_BROKER_TRANSPORT_WEBRTC:
@@ -159,13 +167,13 @@ vnc_broker_recv_handoff(int control_fd,
     if (handoff->magic != VNC_BROKER_PROTOCOL_MAGIC ||
         handoff->version != VNC_BROKER_PROTOCOL_VERSION ||
         handoff->session_id[0] == '\0' ||
-        (handoff->transport != VNC_BROKER_TRANSPORT_VNC &&
+        (!transport_is_vnc(handoff->transport) &&
          handoff->transport != VNC_BROKER_TRANSPORT_WEBRTC)) {
         errno = EPROTO;
         goto fail;
     }
 
-    if ((handoff->transport == VNC_BROKER_TRANSPORT_VNC && received_fd < 0) ||
+    if ((transport_is_vnc(handoff->transport) && received_fd < 0) ||
         (handoff->transport == VNC_BROKER_TRANSPORT_WEBRTC && received_fd >= 0)) {
         errno = EPROTO;
         goto fail;
