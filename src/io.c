@@ -2,8 +2,131 @@
 #include "shutdown_signal.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
+
+static _Thread_local int io_deadline_active = 0;
+static _Thread_local struct timespec io_deadline;
+
+int
+io_deadline_set_ms(int timeout_ms)
+{
+    if (timeout_ms <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return -1;
+
+    io_deadline = now;
+    io_deadline.tv_sec += timeout_ms / 1000;
+    io_deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+
+    if (io_deadline.tv_nsec >= 1000000000L) {
+        io_deadline.tv_sec++;
+        io_deadline.tv_nsec -= 1000000000L;
+    }
+
+    io_deadline_active = 1;
+    return 0;
+}
+
+void
+io_deadline_clear(void)
+{
+    io_deadline_active = 0;
+    io_deadline.tv_sec = 0;
+    io_deadline.tv_nsec = 0;
+}
+
+static int
+io_deadline_remaining_ms(void)
+{
+    if (!io_deadline_active)
+        return -1;
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return 0;
+
+    time_t seconds = io_deadline.tv_sec - now.tv_sec;
+    long nanoseconds = io_deadline.tv_nsec - now.tv_nsec;
+
+    if (nanoseconds < 0) {
+        seconds--;
+        nanoseconds += 1000000000L;
+    }
+
+    if (seconds < 0 || (seconds == 0 && nanoseconds <= 0))
+        return 0;
+
+    long long remaining_ms =
+        (long long)seconds * 1000LL +
+        ((long long)nanoseconds + 999999LL) / 1000000LL;
+
+    if (remaining_ms < 1)
+        remaining_ms = 1;
+    if (remaining_ms > INT_MAX)
+        remaining_ms = INT_MAX;
+
+    return (int)remaining_ms;
+}
+
+static int
+socket_wait_timeout_ms(int fd, short events)
+{
+    int option = events & POLLOUT ? SO_SNDTIMEO : SO_RCVTIMEO;
+    struct timeval timeout = {0};
+    socklen_t timeout_len = sizeof(timeout);
+
+    if (getsockopt(fd,
+                   SOL_SOCKET,
+                   option,
+                   &timeout,
+                   &timeout_len) < 0) {
+        /* Non-socket descriptors keep the historical infinite wait. */
+        return -1;
+    }
+
+    if (timeout.tv_sec == 0 && timeout.tv_usec == 0)
+        return -1;
+
+    long long timeout_ms =
+        (long long)timeout.tv_sec * 1000LL +
+        ((long long)timeout.tv_usec + 999LL) / 1000LL;
+
+    if (timeout_ms < 1)
+        timeout_ms = 1;
+    if (timeout_ms > INT_MAX)
+        timeout_ms = INT_MAX;
+
+    return (int)timeout_ms;
+}
+
+static int
+combined_wait_timeout_ms(int fd, short events)
+{
+    int socket_timeout = socket_wait_timeout_ms(fd, events);
+    int deadline_timeout = io_deadline_remaining_ms();
+
+    if (deadline_timeout == 0)
+        return 0;
+
+    if (socket_timeout < 0)
+        return deadline_timeout;
+    if (deadline_timeout < 0)
+        return socket_timeout;
+
+    return socket_timeout < deadline_timeout
+        ? socket_timeout
+        : deadline_timeout;
+}
 
 static int
 wait_fd_or_shutdown(
@@ -32,12 +155,24 @@ wait_fd_or_shutdown(
             nfds = 2;
         }
 
-        int rc = poll(fds, nfds, -1);
+        /*
+         * Normal long-lived protocol I/O waits indefinitely and is interrupted
+         * by the process shutdown pipe. Bounded protocol phases can install a
+         * thread-local monotonic deadline; socket SO_RCVTIMEO/SO_SNDTIMEO are
+         * also honored when present. The earliest limit wins.
+         */
+        int timeout_ms = combined_wait_timeout_ms(fd, events);
+        int rc = poll(fds, nfds, timeout_ms);
 
         if (rc < 0) {
             if (errno == EINTR)
                 continue;
 
+            return -1;
+        }
+
+        if (rc == 0) {
+            errno = ETIMEDOUT;
             return -1;
         }
 

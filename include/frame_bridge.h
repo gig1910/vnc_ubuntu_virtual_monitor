@@ -19,6 +19,12 @@ int frame_bridge_init(
     int width,
     int height);
 
+/* Reallocate the bridge atomically and invalidate the previous frame. */
+int frame_bridge_resize(
+    FrameBridge *bridge,
+    int width,
+    int height);
+
 void frame_bridge_clear(FrameBridge *bridge);
 void frame_bridge_destroy(FrameBridge *bridge);
 

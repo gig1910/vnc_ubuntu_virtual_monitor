@@ -1,42 +1,75 @@
 #define _GNU_SOURCE
 
 #include "runtime_config.h"
+#include "config.h"
+#include "log.h"
 
 #include <errno.h>
 #include <getopt.h>
+#include <glib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 static int
-parse_int(
-    const char *name,
-    const char *value,
-    int min_value,
-    int max_value,
-    int *out)
+copy_text(const char *name, char *out, size_t out_size, const char *value)
+{
+    if (!value || !*value) {
+        fprintf(stderr, "Invalid %s: empty value\n", name);
+        return -1;
+    }
+
+    int n = snprintf(out, out_size, "%s", value);
+    if (n < 0 || (size_t)n >= out_size) {
+        fprintf(stderr, "Invalid %s: value is too long\n", name);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+expand_path(const char *name, char *out, size_t out_size, const char *value)
+{
+    const char *home = getenv("HOME");
+
+    if (value && home && *home && value[0] == '~' && value[1] == '/') {
+        int n = snprintf(out, out_size, "%s/%s", home, value + 2);
+        if (n < 0 || (size_t)n >= out_size) {
+            fprintf(stderr, "Invalid %s: expanded path is too long\n", name);
+            return -1;
+        }
+        return 0;
+    }
+
+    if (value && home && *home && strncmp(value, "$HOME/", 6) == 0) {
+        int n = snprintf(out, out_size, "%s/%s", home, value + 6);
+        if (n < 0 || (size_t)n >= out_size) {
+            fprintf(stderr, "Invalid %s: expanded path is too long\n", name);
+            return -1;
+        }
+        return 0;
+    }
+
+    return copy_text(name, out, out_size, value);
+}
+
+static int
+parse_int(const char *name, const char *value, int min_value, int max_value, int *out)
 {
     errno = 0;
     char *end = NULL;
     long v = strtol(value, &end, 10);
 
-    if (
-        !value || !*value ||
-        errno != 0 ||
-        !end ||
-        *end != '\0' ||
-        v < min_value ||
-        v > max_value
-    ) {
-        fprintf(
-            stderr,
-            "Invalid %s: %s (expected %d..%d)\n",
-            name,
-            value ? value : "(null)",
-            min_value,
-            max_value
-        );
-
+    if (!value || !*value || errno != 0 || !end || *end != '\0' ||
+        v < min_value || v > max_value) {
+        fprintf(stderr,
+                "Invalid %s: %s (expected %d..%d)\n",
+                name,
+                value ? value : "(null)",
+                min_value,
+                max_value);
         return -1;
     }
 
@@ -45,86 +78,28 @@ parse_int(
 }
 
 static int
-parse_double(
-    const char *name,
-    const char *value,
-    double min_value,
-    double max_value,
-    double *out)
+parse_bool(const char *name, const char *value, int *out)
 {
-    errno = 0;
-    char *end = NULL;
-    double v = strtod(value, &end);
-
-    if (
-        !value || !*value ||
-        errno != 0 ||
-        !end ||
-        *end != '\0' ||
-        v < min_value ||
-        v > max_value
-    ) {
-        fprintf(
-            stderr,
-            "Invalid %s: %s (expected %.3f..%.3f)\n",
-            name,
-            value ? value : "(null)",
-            min_value,
-            max_value
-        );
-
-        return -1;
-    }
-
-    *out = v;
-    return 0;
-}
-
-static int
-parse_bool(
-    const char *name,
-    const char *value,
-    int *out)
-{
-    if (
-        strcmp(value, "1") == 0 ||
-        strcasecmp(value, "true") == 0 ||
-        strcasecmp(value, "yes") == 0 ||
-        strcasecmp(value, "on") == 0
-    ) {
+    if (value &&
+        (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
+         strcasecmp(value, "yes") == 0 || strcasecmp(value, "on") == 0)) {
         *out = 1;
         return 0;
     }
 
-    if (
-        strcmp(value, "0") == 0 ||
-        strcasecmp(value, "false") == 0 ||
-        strcasecmp(value, "no") == 0 ||
-        strcasecmp(value, "off") == 0
-    ) {
+    if (value &&
+        (strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
+         strcasecmp(value, "no") == 0 || strcasecmp(value, "off") == 0)) {
         *out = 0;
         return 0;
     }
 
-    fprintf(
-        stderr,
-        "Invalid %s: %s (use on/off, true/false or 1/0)\n",
-        name,
-        value
-    );
-
+    fprintf(stderr,
+            "Invalid %s: %s (use on/off, true/false or 1/0)\n",
+            name,
+            value ? value : "(null)");
     return -1;
 }
-
-const char *
-runtime_config_source_name(FrameSourceMode mode)
-{
-    return
-        mode == FRAME_SOURCE_TEST
-            ? "test"
-            : "mutter";
-}
-
 
 const char *
 runtime_config_capture_backend_name(CaptureBackend backend)
@@ -135,446 +110,94 @@ runtime_config_capture_backend_name(CaptureBackend backend)
 static int
 parse_capture_backend(const char *value, CaptureBackend *out)
 {
-    if (strcasecmp(value, "pipewire") == 0 || strcasecmp(value, "native") == 0) {
+    if (value &&
+        (strcasecmp(value, "pipewire") == 0 || strcasecmp(value, "native") == 0)) {
         *out = CAPTURE_BACKEND_PIPEWIRE;
         return 0;
     }
-    if (strcasecmp(value, "gstreamer") == 0 || strcasecmp(value, "gst") == 0) {
+
+    if (value &&
+        (strcasecmp(value, "gstreamer") == 0 || strcasecmp(value, "gst") == 0)) {
         *out = CAPTURE_BACKEND_GSTREAMER;
         return 0;
     }
-    fprintf(stderr, "Invalid capture backend: %s (use pipewire or gstreamer)\n", value);
-    return -1;
-}
 
-static int
-parse_source_mode(
-    const char *value,
-    FrameSourceMode *out)
-{
-    if (strcasecmp(value, "mutter") == 0) {
-        *out = FRAME_SOURCE_MUTTER;
-        return 0;
-    }
-
-    if (strcasecmp(value, "test") == 0) {
-        *out = FRAME_SOURCE_TEST;
-        return 0;
-    }
-
-    fprintf(
-        stderr,
-        "Invalid source: %s (use mutter or test)\n",
-        value
-    );
-
+    fprintf(stderr,
+            "Invalid capture backend: %s (use pipewire or gstreamer)\n",
+            value ? value : "(null)");
     return -1;
 }
 
 const char *
-runtime_config_benchmark_name(BenchmarkMode mode)
+runtime_config_mutter_cursor_name(MutterCursorMode mode)
 {
     switch (mode) {
-        case BENCHMARK_OFF:
-            return "off";
-        case BENCHMARK_SQUARE_SWEEP:
-            return "square-sweep";
-        case BENCHMARK_SUITE:
-            return "suite";
+        case MUTTER_CURSOR_HIDDEN:
+            return "hidden";
+        case MUTTER_CURSOR_EMBEDDED:
+            return "embedded";
+        case MUTTER_CURSOR_METADATA:
+            return "metadata";
         default:
             return "unknown";
     }
 }
 
-const char *
-runtime_config_damage_name(DamageMode mode)
+static int
+parse_mutter_cursor(const char *value, MutterCursorMode *out)
 {
-    return mode == DAMAGE_FULL ? "full" : "rect";
+    if (value && strcmp(value, "hidden") == 0) {
+        *out = MUTTER_CURSOR_HIDDEN;
+        return 0;
+    }
+
+    if (value && strcmp(value, "embedded") == 0) {
+        *out = MUTTER_CURSOR_EMBEDDED;
+        return 0;
+    }
+
+    if (value && strcmp(value, "metadata") == 0) {
+        *out = MUTTER_CURSOR_METADATA;
+        return 0;
+    }
+
+    fprintf(stderr,
+            "Invalid mutter-cursor value: %s (expected hidden|embedded|metadata)\n",
+            value ? value : "(null)");
+    return -1;
+}
+
+const char *
+runtime_config_screen_size_mode_name(ScreenSizeMode mode)
+{
+    return mode == SCREEN_SIZE_FIXED ? "fixed" : "auto";
 }
 
 static int
-parse_benchmark_mode(
-    const char *value,
-    BenchmarkMode *out)
+parse_screen_size_mode(const char *value, ScreenSizeMode *out)
 {
-    if (strcasecmp(value, "off") == 0) {
-        *out = BENCHMARK_OFF;
+    if (value &&
+        (strcasecmp(value, "auto") == 0 || strcasecmp(value, "client") == 0)) {
+        *out = SCREEN_SIZE_AUTO;
         return 0;
     }
 
-    if (
-        strcasecmp(value, "square") == 0 ||
-        strcasecmp(value, "square-sweep") == 0
-    ) {
-        *out = BENCHMARK_SQUARE_SWEEP;
+    if (value && strcasecmp(value, "fixed") == 0) {
+        *out = SCREEN_SIZE_FIXED;
         return 0;
     }
 
-    if (strcasecmp(value, "suite") == 0) {
-        *out = BENCHMARK_SUITE;
-        return 0;
-    }
-
-    fprintf(
-        stderr,
-        "Invalid benchmark mode: %s "
-        "(use off, square-sweep or suite)\n",
-        value
-    );
-
+    fprintf(stderr,
+            "Invalid screen-mode: %s (use auto or fixed)\n",
+            value ? value : "(null)");
     return -1;
 }
 
 static int
-parse_damage_mode(
-    const char *value,
-    DamageMode *out)
+parse_vnc_fps(const char *value, int *out)
 {
-    if (strcasecmp(value, "rect") == 0) {
-        *out = DAMAGE_RECT;
-        return 0;
-    }
-
-    if (strcasecmp(value, "full") == 0) {
-        *out = DAMAGE_FULL;
-        return 0;
-    }
-
-    fprintf(
-        stderr,
-        "Invalid damage mode: %s (use rect or full)\n",
-        value
-    );
-
-    return -1;
-}
-
-void
-runtime_config_defaults(RuntimeConfig *cfg)
-{
-    *cfg = (RuntimeConfig) {
-        .source_mode = FRAME_SOURCE_MUTTER,
-        .capture_backend = CAPTURE_BACKEND_PIPEWIRE,
-        .capture_timeout_ms = 5000,
-        .mutter_cursor_mode = MUTTER_CURSOR_HIDDEN,
-        .mutter_hardware_cursor_mode = MUTTER_HW_CURSOR_AUTO,
-        .vnc_max_fps = 0,
-        .external_send_buffer = 65536,
-        .backend_receive_buffer = 65536,
-        .diff_detect = 1,
-        .diff_tile_size = 32,
-        .layout_remember = 1,
-        .layout_resave = 0,
-        .frame_stats = 1,
-        .frame_trace = 0,
-        .capture_trace = 0,
-        .capture_stall_ms = 500,
-        .frame_stats_interval_ms = 1000,
-
-        .public_port = 5901,
-        .backend_port = 5903,
-        .width = 1024,
-        .height = 768,
-        .max_fps = 60,
-        .ra2_stream_record_max = 16384,
-        .ra2_coalesce = 1,
-        .ra2_coalesce_us = 500,
-
-        .enable_zrle = 1,
-        .enable_raw = 1,
-        .enable_cursor = 1,
-        .enable_newfbsize = 1,
-        .enable_clipboard = 0,
-        .enable_file_transfer = 0,
-        .view_only = 1,
-        .verbose = 1,
-
-        .auth_socket = "/run/vnc-monitor-auth.sock",
-        .ra2_key_file = "./ra2-server-key.pem",
-        .backend_bind = "127.0.0.1",
-
-        .square_min = 64,
-        .square_max = 384,
-        .square_speed = 180.0,
-        .square_cycle_seconds = 4.0,
-        .damage_mode = DAMAGE_RECT,
-
-        .benchmark_mode = BENCHMARK_OFF,
-        .benchmark_interval_seconds = 1.0,
-        .benchmark_step_seconds = 5.0,
-        .benchmark_square_min = 64,
-        .benchmark_square_max = 768,
-        .benchmark_square_step = 64,
-        .benchmark_csv = NULL
-    };
-}
-
-void
-runtime_config_usage(const char *argv0)
-{
-    printf(
-        "Usage: %s [options]\n"
-        "\n"
-        "Source:\n"
-        "  --source mutter|test         Frame source                [mutter]\n"
-        "  --capture-backend MODE       pipewire|gstreamer        [pipewire]\n"
-        "  --capture-timeout-ms N       Wait for first real frame   [5000]\n"
-        "  --mutter-cursor MODE         hidden|embedded|metadata   [hidden]\n"
-        "  --mutter-hardware-cursor M   auto|enabled|disabled         [auto]\n"
-        "  --vnc-fps source|N           Max VNC publish rate      [source]\n"
-        "                              source/0 = every new source frame\n"
-        "  --external-send-buffer N     RA2 TCP SO_SNDBUF bytes     [65536]\n"
-        "  --backend-recv-buffer N      Backend TCP SO_RCVBUF bytes [65536]\n"
-        "  --diff-detect on|off         Diff real frames by tiles    [on]\n"
-        "  --diff-tile-size N           Diff tile size               [32]\n"
-        "  --layout-remember on|off     Restore saved GNOME layout   [on]\n"
-        "  --layout-resave on|off       Overwrite cached layout      [off]\n"
-        "  --frame-stats on|off         Pipeline stats once/sec      [on]\n"
-        "  --frame-trace on|off         One line per VNC publish     [off]\n"
-        "  --capture-trace on|off       One line per capture frame   [off]\n"
-        "  --capture-stall-ms N         Capture stall threshold      [500]\n"
-        "  --frame-stats-interval-ms N  Stats interval               [1000]\n"
-        "\n"
-        "Network:\n"
-        "  --port N                    Public RA2r VNC port       [5901]\n"
-        "  --backend-port N            Internal backend port      [5903]\n"
-        "  --backend-bind ADDR         Internal bind address      [127.0.0.1]\n"
-        "\n"
-        "Framebuffer / workload:\n"
-        "  --width N                   Width                      [1024]\n"
-        "  --height N                  Height                     [768]\n"
-        "  --fps N                     Maximum source FPS         [60]\n"
-        "  --square-min N              Normal pattern min square  [64]\n"
-        "  --square-max N              Normal pattern max square  [384]\n"
-        "  --square-speed N            Movement pixels/sec        [180]\n"
-        "  --square-cycle SEC          Size cycle duration        [4]\n"
-        "  --damage rect|full          Dirty rectangle strategy   [rect]\n"
-        "\n"
-        "RA2r:\n"
-        "  --ra2-record-size N         Max encrypted payload      [16384]\n"
-        "  --ra2-coalesce on|off       Merge backend reads         [on]\n"
-        "  --ra2-coalesce-us N         Max merge delay, usec       [500]\n"
-        "                              Protocol limit is 65535\n"
-        "  --ra2-key FILE              Persistent RSA key         [./ra2-server-key.pem]\n"
-        "  --auth-socket PATH          PAM helper socket          [/run/vnc-monitor-auth.sock]\n"
-        "\n"
-        "RFB compatibility switches:\n"
-        "  --zrle on|off               Prefer/allow ZRLE flag      [on]\n"
-        "  --raw on|off                Prefer/allow Raw flag       [on]\n"
-        "  --cursor on|off             Cursor extension flag       [on]\n"
-        "  --newfbsize on|off          NewFBSize extension flag    [on]\n"
-        "\n"
-        "Input / security:\n"
-        "  --view-only on|off          Ignore keyboard/pointer    [on]\n"
-        "  --clipboard on|off          Client clipboard input     [off]\n"
-        "  --file-transfer on|off      File transfer              [off]\n"
-        "\n"
-        "Benchmark:\n"
-        "  --benchmark MODE            off|square-sweep|suite      [off]\n"
-        "  --benchmark-interval SEC    Stats/CSV interval          [1]\n"
-        "  --benchmark-step SEC        Duration of each stage      [5]\n"
-        "  --benchmark-square-min N    Sweep minimum               [64]\n"
-        "  --benchmark-square-max N    Sweep maximum               [768]\n"
-        "  --benchmark-square-step N   Sweep step                  [64]\n"
-        "  --benchmark-csv FILE        Append detailed CSV         [disabled]\n"
-        "\n"
-        "Diagnostics:\n"
-        "  --verbose on|off            Extra diagnostics          [on]\n"
-        "  --show-config               Print config and exit\n"
-        "  -h, --help                  Show this help\n"
-        "\n"
-        "Examples:\n"
-        "  %s --ra2-record-size 32768\n"
-        "  %s --benchmark square-sweep --benchmark-csv square.csv\n"
-        "  %s --benchmark suite --benchmark-step 10 --benchmark-csv suite.csv\n"
-        "  %s --benchmark suite --damage full --ra2-record-size 32768\n",
-        argv0,
-        argv0,
-        argv0,
-        argv0,
-        argv0
-    );
-}
-
-void
-runtime_config_print(const RuntimeConfig *cfg)
-{
-    printf(
-        "Runtime configuration:\n"
-        "  source:             %s\n"
-        "  capture backend:    %s\n"
-        "  capture timeout:    %d ms\n"
-        "  Mutter cursor:      %s\n"
-        "  Mutter HW cursor:   %s (requested)\n"
-        "  VNC publisher:      source-driven\n"
-        "  VNC max rate:       %s\n"
-        "  external sndbuf:    %d bytes\n"
-        "  backend rcvbuf:     %d bytes\n"
-        "  diff detect:        %s\n"
-        "  diff tile size:     %d px\n"
-        "  layout remember:    %s\n"
-        "  layout resave:      %s\n"
-        "  frame stats:        %s\n"
-        "  frame trace:        %s\n"
-        "  capture trace:      %s\n"
-        "  capture stall:      %d ms\n"
-        "  stats interval:     %d ms\n"
-        "  public port:        %d\n"
-        "  backend:            %s:%d\n"
-        "  framebuffer:        %dx%d @ max %d FPS\n"
-        "  RA2 record max:     %d bytes\n"
-        "  RA2 coalesce:       %s\n"
-        "  RA2 coalesce wait:  %d us\n"
-        "  RA2 key:            %s\n"
-        "  auth socket:        %s\n"
-        "  normal square:      %d..%d px, %.1f px/s, %.2f s cycle\n"
-        "  damage:             %s\n"
-        "  ZRLE flag:          %s\n"
-        "  Raw flag:           %s\n"
-        "  cursor flag:        %s\n"
-        "  NewFBSize flag:     %s\n"
-        "  view-only:          %s\n"
-        "  clipboard input:    %s\n"
-        "  file transfer:      %s\n"
-        "  benchmark:          %s\n"
-        "  benchmark interval: %.3f s\n"
-        "  benchmark step:     %.3f s\n"
-        "  benchmark square:   %d..%d step %d\n"
-        "  benchmark CSV:      %s\n"
-        "  verbose:            %s\n",
-        runtime_config_source_name(cfg->source_mode),
-        runtime_config_capture_backend_name(cfg->capture_backend),
-        cfg->capture_timeout_ms,
-        runtime_config_mutter_cursor_name(cfg->mutter_cursor_mode),
-        runtime_config_mutter_hardware_cursor_name(cfg->mutter_hardware_cursor_mode),
-        cfg->vnc_max_fps > 0 ? "rate-limited" : "unlimited/source",
-        cfg->external_send_buffer,
-        cfg->backend_receive_buffer,
-        cfg->diff_detect ? "on" : "off",
-        cfg->diff_tile_size,
-        cfg->layout_remember ? "on" : "off",
-        cfg->layout_resave ? "on" : "off",
-        cfg->frame_stats ? "on" : "off",
-        cfg->frame_trace ? "on" : "off",
-        cfg->capture_trace ? "on" : "off",
-        cfg->capture_stall_ms,
-        cfg->frame_stats_interval_ms,
-        cfg->public_port,
-        cfg->backend_bind,
-        cfg->backend_port,
-        cfg->width,
-        cfg->height,
-        cfg->max_fps,
-        cfg->ra2_stream_record_max,
-        cfg->ra2_coalesce ? "on" : "off",
-        cfg->ra2_coalesce_us,
-        cfg->ra2_key_file,
-        cfg->auth_socket,
-        cfg->square_min,
-        cfg->square_max,
-        cfg->square_speed,
-        cfg->square_cycle_seconds,
-        runtime_config_damage_name(cfg->damage_mode),
-        cfg->enable_zrle ? "on" : "off",
-        cfg->enable_raw ? "on" : "off",
-        cfg->enable_cursor ? "on" : "off",
-        cfg->enable_newfbsize ? "on" : "off",
-        cfg->view_only ? "on" : "off",
-        cfg->enable_clipboard ? "on" : "off",
-        cfg->enable_file_transfer ? "on" : "off",
-        runtime_config_benchmark_name(cfg->benchmark_mode),
-        cfg->benchmark_interval_seconds,
-        cfg->benchmark_step_seconds,
-        cfg->benchmark_square_min,
-        cfg->benchmark_square_max,
-        cfg->benchmark_square_step,
-        cfg->benchmark_csv ? cfg->benchmark_csv : "(disabled)",
-        cfg->verbose ? "on" : "off"
-    );
-
-    if (cfg->vnc_max_fps > 0)
-        printf("  VNC max FPS value:  %d FPS\n", cfg->vnc_max_fps);
-}
-
-const char *
-runtime_config_mutter_cursor_name(
-    MutterCursorMode mode)
-{
-    switch (mode) {
-        case MUTTER_CURSOR_HIDDEN:
-            return "hidden";
-
-        case MUTTER_CURSOR_EMBEDDED:
-            return "embedded";
-
-        case MUTTER_CURSOR_METADATA:
-            return "metadata";
-    }
-
-    return "unknown";
-}
-
-const char *
-runtime_config_mutter_hardware_cursor_name(
-    MutterHardwareCursorMode mode)
-{
-    switch (mode) {
-        case MUTTER_HW_CURSOR_AUTO:
-            return "auto";
-        case MUTTER_HW_CURSOR_ENABLED:
-            return "enabled";
-        case MUTTER_HW_CURSOR_DISABLED:
-            return "disabled";
-    }
-
-    return "unknown";
-}
-
-static int
-parse_mutter_hardware_cursor(
-    const char *value,
-    MutterHardwareCursorMode *out)
-{
-    if (!value || !out)
-        return -1;
-
-    if (strcasecmp(value, "auto") == 0) {
-        *out = MUTTER_HW_CURSOR_AUTO;
-        return 0;
-    }
-
-    if (strcasecmp(value, "enabled") == 0 ||
-        strcasecmp(value, "on") == 0) {
-        *out = MUTTER_HW_CURSOR_ENABLED;
-        return 0;
-    }
-
-    if (strcasecmp(value, "disabled") == 0 ||
-        strcasecmp(value, "off") == 0) {
-        *out = MUTTER_HW_CURSOR_DISABLED;
-        return 0;
-    }
-
-    fprintf(
-        stderr,
-        "Invalid --mutter-hardware-cursor value: %s "
-        "(expected auto|enabled|disabled)\n",
-        value
-    );
-
-    return -1;
-}
-
-static int
-parse_vnc_fps(
-    const char *value,
-    int *out)
-{
-    if (!value || !out)
-        return -1;
-
-    if (strcasecmp(value, "source") == 0 ||
-        strcasecmp(value, "unlimited") == 0) {
+    if (value &&
+        (strcasecmp(value, "source") == 0 || strcasecmp(value, "unlimited") == 0)) {
         *out = 0;
         return 0;
     }
@@ -582,66 +205,530 @@ parse_vnc_fps(
     return parse_int("vnc-fps", value, 0, 240, out);
 }
 
-static int
-parse_mutter_cursor(
-    const char *value,
-    MutterCursorMode *out)
+static void
+apply_log_level(RuntimeConfig *cfg)
 {
-    if (!value || !out)
-        return -1;
+    cfg->frame_stats = cfg->verbose >= VNC_LOG_DEBUG;
+    cfg->frame_trace = cfg->verbose >= VNC_LOG_TRACE;
+    cfg->latency_trace = cfg->verbose >= VNC_LOG_TRACE;
+    cfg->capture_trace = cfg->verbose >= VNC_LOG_TRACE;
+    cfg->capture_stall_ms = 500;
+    cfg->frame_stats_interval_ms = 1000;
+}
 
-    if (strcmp(value, "hidden") == 0) {
-        *out = MUTTER_CURSOR_HIDDEN;
+static int
+apply_setting(RuntimeConfig *cfg, const char *name, const char *value)
+{
+    if (strcmp(name, "capture-backend") == 0)
+        return parse_capture_backend(value, &cfg->capture_backend);
+    if (strcmp(name, "capture-timeout-ms") == 0)
+        return parse_int(name, value, 100, 60000, &cfg->capture_timeout_ms);
+    if (strcmp(name, "mutter-cursor") == 0)
+        return parse_mutter_cursor(value, &cfg->mutter_cursor_mode);
+    if (strcmp(name, "vnc-fps") == 0)
+        return parse_vnc_fps(value, &cfg->vnc_max_fps);
+    if (strcmp(name, "latest-only") == 0)
+        return parse_bool(name, value, &cfg->latest_only);
+    if (strcmp(name, "external-send-buffer") == 0)
+        return parse_int(name, value, 4096, 4194304, &cfg->external_send_buffer);
+    if (strcmp(name, "backend-recv-buffer") == 0)
+        return parse_int(name, value, 4096, 4194304, &cfg->backend_receive_buffer);
+    if (strcmp(name, "client-keepalive-idle") == 0)
+        return parse_int(name, value, 1, 3600, &cfg->client_keepalive_idle_s);
+    if (strcmp(name, "client-keepalive-interval") == 0)
+        return parse_int(name, value, 1, 3600, &cfg->client_keepalive_interval_s);
+    if (strcmp(name, "client-keepalive-probes") == 0)
+        return parse_int(name, value, 1, 20, &cfg->client_keepalive_probes);
+    if (strcmp(name, "client-user-timeout-ms") == 0)
+        return parse_int(name, value, 1000, 600000, &cfg->client_user_timeout_ms);
+    if (strcmp(name, "client-handshake-timeout-ms") == 0)
+        return parse_int(name, value, 1000, 600000, &cfg->client_handshake_timeout_ms);
+    if (strcmp(name, "diff-detect") == 0)
+        return parse_bool(name, value, &cfg->diff_detect);
+    if (strcmp(name, "diff-tile-size") == 0)
+        return parse_int(name, value, 8, 256, &cfg->diff_tile_size);
+    if (strcmp(name, "layout-remember") == 0)
+        return parse_bool(name, value, &cfg->layout_remember);
+    if (strcmp(name, "layout-resave") == 0)
+        return parse_bool(name, value, &cfg->layout_resave);
+    if (strcmp(name, "port") == 0)
+        return parse_int(name, value, 1, 65535, &cfg->public_port);
+    if (strcmp(name, "backend-port") == 0)
+        return parse_int(name, value, 1, 65535, &cfg->backend_port);
+    if (strcmp(name, "backend-bind") == 0)
+        return copy_text(name, cfg->backend_bind, sizeof(cfg->backend_bind), value);
+    if (strcmp(name, "screen-mode") == 0)
+        return parse_screen_size_mode(value, &cfg->screen_size_mode);
+    if (strcmp(name, "width") == 0)
+        return parse_int(name, value, 64, 16384, &cfg->width);
+    if (strcmp(name, "height") == 0)
+        return parse_int(name, value, 64, 16384, &cfg->height);
+    if (strcmp(name, "fps") == 0)
+        return parse_int(name, value, 1, 240, &cfg->max_fps);
+    if (strcmp(name, "ra2-record-size") == 0)
+        return parse_int(name, value, 1, 65535, &cfg->ra2_stream_record_max);
+    if (strcmp(name, "ra2-coalesce") == 0)
+        return parse_bool(name, value, &cfg->ra2_coalesce);
+    if (strcmp(name, "ra2-coalesce-us") == 0)
+        return parse_int(name, value, 0, 1000000, &cfg->ra2_coalesce_us);
+    if (strcmp(name, "ra2-key") == 0)
+        return expand_path(name, cfg->ra2_key_file, sizeof(cfg->ra2_key_file), value);
+    if (strcmp(name, "auth-socket") == 0)
+        return expand_path(name, cfg->auth_socket, sizeof(cfg->auth_socket), value);
+    if (strcmp(name, "zrle") == 0)
+        return parse_bool(name, value, &cfg->enable_zrle);
+    if (strcmp(name, "raw") == 0)
+        return parse_bool(name, value, &cfg->enable_raw);
+    if (strcmp(name, "cursor") == 0)
+        return parse_bool(name, value, &cfg->enable_cursor);
+    if (strcmp(name, "newfbsize") == 0)
+        return parse_bool(name, value, &cfg->enable_newfbsize);
+    if (strcmp(name, "verbose") == 0) {
+        if (vnc_log_parse_level(value, &cfg->verbose) < 0) {
+            fprintf(stderr,
+                    "Invalid verbose level: %s (use 0|error, 1|info, 2|debug, 3|trace)\n",
+                    value ? value : "(null)");
+            return -1;
+        }
         return 0;
     }
 
-    if (strcmp(value, "embedded") == 0) {
-        *out = MUTTER_CURSOR_EMBEDDED;
-        return 0;
-    }
-
-    if (strcmp(value, "metadata") == 0) {
-        *out = MUTTER_CURSOR_METADATA;
-        return 0;
-    }
-
-    fprintf(
-        stderr,
-        "Invalid --mutter-cursor value: %s "
-        "(expected hidden|embedded|metadata)\n",
-        value
-    );
-
+    fprintf(stderr, "Unknown configuration setting: %s\n", name);
     return -1;
 }
 
+typedef struct {
+    const char *group;
+    const char *key;
+    const char *setting;
+} ConfigBinding;
+
+static const ConfigBinding config_bindings[] = {
+    {"capture", "backend", "capture-backend"},
+    {"capture", "timeout-ms", "capture-timeout-ms"},
+    {"capture", "cursor", "mutter-cursor"},
+    {"capture", "fps", "fps"},
+
+    {"display", "mode", "screen-mode"},
+    {"display", "width", "width"},
+    {"display", "height", "height"},
+    {"display", "layout-remember", "layout-remember"},
+    {"display", "layout-resave", "layout-resave"},
+
+    {"transport", "vnc-fps", "vnc-fps"},
+    {"transport", "latest-only", "latest-only"},
+    {"transport", "diff-detect", "diff-detect"},
+    {"transport", "diff-tile-size", "diff-tile-size"},
+
+    {"network", "port", "port"},
+    {"network", "backend-port", "backend-port"},
+    {"network", "backend-bind", "backend-bind"},
+    {"network", "external-send-buffer", "external-send-buffer"},
+    {"network", "backend-recv-buffer", "backend-recv-buffer"},
+    {"network", "client-keepalive-idle", "client-keepalive-idle"},
+    {"network", "client-keepalive-interval", "client-keepalive-interval"},
+    {"network", "client-keepalive-probes", "client-keepalive-probes"},
+    {"network", "client-user-timeout-ms", "client-user-timeout-ms"},
+    {"network", "client-handshake-timeout-ms", "client-handshake-timeout-ms"},
+
+    {"ra2", "record-size", "ra2-record-size"},
+    {"ra2", "coalesce", "ra2-coalesce"},
+    {"ra2", "coalesce-us", "ra2-coalesce-us"},
+    {"ra2", "key", "ra2-key"},
+    {"ra2", "auth-socket", "auth-socket"},
+
+    {"rfb", "zrle", "zrle"},
+    {"rfb", "raw", "raw"},
+    {"rfb", "cursor", "cursor"},
+    {"rfb", "newfbsize", "newfbsize"},
+
+    {"logging", "level", "verbose"}
+};
+
+static const ConfigBinding *
+find_config_binding(const char *group, const char *key)
+{
+    for (size_t i = 0; i < sizeof(config_bindings) / sizeof(config_bindings[0]); i++) {
+        if (strcmp(config_bindings[i].group, group) == 0 &&
+            strcmp(config_bindings[i].key, key) == 0)
+            return &config_bindings[i];
+    }
+
+    return NULL;
+}
+
+static int
+load_config_file(RuntimeConfig *cfg, int explicit_config)
+{
+    GKeyFile *keyfile = g_key_file_new();
+    GError *error = NULL;
+
+    if (!g_key_file_load_from_file(keyfile,
+                                   cfg->config_file,
+                                   G_KEY_FILE_NONE,
+                                   &error)) {
+        if (!explicit_config &&
+            error && error->domain == G_FILE_ERROR && error->code == G_FILE_ERROR_NOENT) {
+            g_clear_error(&error);
+            g_key_file_free(keyfile);
+            return 0;
+        }
+
+        fprintf(stderr,
+                "Cannot load config %s: %s\n",
+                cfg->config_file,
+                error ? error->message : "unknown error");
+        g_clear_error(&error);
+        g_key_file_free(keyfile);
+        return -1;
+    }
+
+    gsize group_count = 0;
+    gchar **groups = g_key_file_get_groups(keyfile, &group_count);
+
+    for (gsize gi = 0; gi < group_count; gi++) {
+        gsize key_count = 0;
+        GError *keys_error = NULL;
+        gchar **keys = g_key_file_get_keys(keyfile, groups[gi], &key_count, &keys_error);
+
+        if (!keys) {
+            fprintf(stderr,
+                    "Cannot read config group [%s]: %s\n",
+                    groups[gi],
+                    keys_error ? keys_error->message : "unknown error");
+            g_clear_error(&keys_error);
+            g_strfreev(groups);
+            g_key_file_free(keyfile);
+            return -1;
+        }
+
+        for (gsize ki = 0; ki < key_count; ki++) {
+            const ConfigBinding *binding = find_config_binding(groups[gi], keys[ki]);
+            if (!binding) {
+                fprintf(stderr,
+                        "Unknown config key %s/%s in %s\n",
+                        groups[gi],
+                        keys[ki],
+                        cfg->config_file);
+                g_strfreev(keys);
+                g_strfreev(groups);
+                g_key_file_free(keyfile);
+                return -1;
+            }
+
+            GError *value_error = NULL;
+            gchar *value = g_key_file_get_string(keyfile,
+                                                 groups[gi],
+                                                 keys[ki],
+                                                 &value_error);
+            if (!value) {
+                fprintf(stderr,
+                        "Cannot read config value %s/%s: %s\n",
+                        groups[gi],
+                        keys[ki],
+                        value_error ? value_error->message : "unknown error");
+                g_clear_error(&value_error);
+                g_strfreev(keys);
+                g_strfreev(groups);
+                g_key_file_free(keyfile);
+                return -1;
+            }
+
+            g_strstrip(value);
+            if (apply_setting(cfg, binding->setting, value) < 0) {
+                fprintf(stderr,
+                        "While reading %s [%s] %s\n",
+                        cfg->config_file,
+                        groups[gi],
+                        keys[ki]);
+                g_free(value);
+                g_strfreev(keys);
+                g_strfreev(groups);
+                g_key_file_free(keyfile);
+                return -1;
+            }
+            g_free(value);
+        }
+
+        g_strfreev(keys);
+    }
+
+    g_strfreev(groups);
+    g_key_file_free(keyfile);
+    return 0;
+}
+
+static int
+prescan_config_path(RuntimeConfig *cfg, int argc, char **argv, int *explicit_config)
+{
+    *explicit_config = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --config\n");
+                return -1;
+            }
+            if (expand_path("config", cfg->config_file, sizeof(cfg->config_file), argv[++i]) < 0)
+                return -1;
+            *explicit_config = 1;
+        }
+        else if (strncmp(argv[i], "--config=", 9) == 0) {
+            if (expand_path("config", cfg->config_file, sizeof(cfg->config_file), argv[i] + 9) < 0)
+                return -1;
+            *explicit_config = 1;
+        }
+    }
+
+    return 0;
+}
+
+void
+runtime_config_defaults(RuntimeConfig *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+
+    const char *home = getenv("HOME");
+    const char *config_home = getenv("XDG_CONFIG_HOME");
+
+    if (config_home && *config_home) {
+        snprintf(cfg->config_file,
+                 sizeof(cfg->config_file),
+                 "%s/vnc-monitor/config.ini",
+                 config_home);
+        snprintf(cfg->ra2_key_file,
+                 sizeof(cfg->ra2_key_file),
+                 "%s/vnc-monitor/ra2-server-key.pem",
+                 config_home);
+    }
+    else if (home && *home) {
+        snprintf(cfg->config_file,
+                 sizeof(cfg->config_file),
+                 "%s/.config/vnc-monitor/config.ini",
+                 home);
+        snprintf(cfg->ra2_key_file,
+                 sizeof(cfg->ra2_key_file),
+                 "%s/.config/vnc-monitor/ra2-server-key.pem",
+                 home);
+    }
+    else {
+        snprintf(cfg->config_file, sizeof(cfg->config_file), "./vnc-monitor.ini");
+        snprintf(cfg->ra2_key_file, sizeof(cfg->ra2_key_file), "./ra2-server-key.pem");
+    }
+
+    snprintf(cfg->auth_socket,
+             sizeof(cfg->auth_socket),
+             "/run/vnc-monitor-auth.sock");
+    snprintf(cfg->backend_bind,
+             sizeof(cfg->backend_bind),
+             "127.0.0.1");
+
+    cfg->capture_backend = CAPTURE_BACKEND_PIPEWIRE;
+    cfg->capture_timeout_ms = 5000;
+    cfg->mutter_cursor_mode = MUTTER_CURSOR_METADATA;
+    cfg->vnc_max_fps = 0;
+    cfg->latest_only = 1;
+
+    cfg->external_send_buffer = 65536;
+    cfg->backend_receive_buffer = 65536;
+    cfg->client_keepalive_idle_s = 15;
+    cfg->client_keepalive_interval_s = 5;
+    cfg->client_keepalive_probes = 3;
+    cfg->client_user_timeout_ms = 20000;
+    cfg->client_handshake_timeout_ms = 60000;
+    cfg->diff_detect = 1;
+    cfg->diff_tile_size = 32;
+    cfg->layout_remember = 1;
+    cfg->layout_resave = 0;
+
+    cfg->public_port = 5901;
+    cfg->backend_port = 5903;
+    cfg->screen_size_mode = SCREEN_SIZE_AUTO;
+    cfg->width = 1024;
+    cfg->height = 768;
+    cfg->max_fps = 60;
+    cfg->ra2_stream_record_max = 16384;
+    cfg->ra2_coalesce = 1;
+    cfg->ra2_coalesce_us = 500;
+
+    cfg->enable_zrle = 1;
+    cfg->enable_raw = 1;
+    cfg->enable_cursor = 1;
+    cfg->enable_newfbsize = 1;
+
+    cfg->enable_clipboard = 0;
+    cfg->enable_file_transfer = 0;
+    cfg->view_only = 1;
+    cfg->verbose = VNC_LOG_INFO;
+
+    apply_log_level(cfg);
+}
+
+void
+runtime_config_usage(const char *argv0)
+{
+    printf(
+        "VNC Monitor %s\n"
+        "Usage: %s [options]\n"
+        "\n"
+        "Configuration:\n"
+        "  --config FILE                INI config [~/.config/vnc-monitor/config.ini]\n"
+        "  Config is loaded after built-in defaults; CLI options override it.\n"
+        "\n"
+        "Wayland capture:\n"
+        "  --capture-backend MODE       pipewire|gstreamer\n"
+        "  --capture-timeout-ms N       Wait for first frame\n"
+        "  --mutter-cursor MODE         hidden|embedded|metadata\n"
+        "  --vnc-fps source|N           Max publish rate\n"
+        "  --latest-only on|off         Keep newest source state\n"
+        "  --diff-detect on|off         Tile diff detection\n"
+        "  --diff-tile-size N           Diff tile size\n"
+        "  --layout-remember on|off     Restore saved GNOME layout\n"
+        "  --layout-resave on|off       Replace saved layout\n"
+        "\n"
+        "Network:\n"
+        "  --port N                     Public RA2r VNC port\n"
+        "  --backend-port N             Internal RFB port\n"
+        "  --backend-bind ADDR          Internal bind address\n"
+        "  --external-send-buffer N     External TCP SO_SNDBUF\n"
+        "  --backend-recv-buffer N      Backend TCP SO_RCVBUF\n"
+        "  --client-keepalive-idle N    Seconds before TCP keepalive probes [15]\n"
+        "  --client-keepalive-interval N Seconds between keepalive probes [5]\n"
+        "  --client-keepalive-probes N  Failed probes before dead peer [3]\n"
+        "  --client-user-timeout-ms N   Max unacknowledged TCP time [20000]\n"
+        "  --client-handshake-timeout-ms N RA2/PAM phase timeout [60000]\n"
+        "\n"
+        "Virtual monitor:\n"
+        "  --screen-mode MODE           auto|fixed [auto]\n"
+        "  --width N                    Initial/fallback width [1024]\n"
+        "  --height N                   Initial/fallback height [768]\n"
+        "  --fps N                      Maximum capture FPS [60]\n"
+        "\n"
+        "RA2r:\n"
+        "  --ra2-record-size N          Max encrypted payload\n"
+        "  --ra2-coalesce on|off        Merge backend reads\n"
+        "  --ra2-coalesce-us N          Max merge delay, usec\n"
+        "  --ra2-key FILE               Persistent RSA identity\n"
+        "  --auth-socket PATH           PAM helper socket\n"
+        "\n"
+        "RFB compatibility:\n"
+        "  --zrle on|off                Advertise/allow ZRLE\n"
+        "  --raw on|off                 Advertise/allow Raw\n"
+        "  --cursor on|off              Cursor extension\n"
+        "  --newfbsize on|off           NewFBSize extension\n"
+        "\n"
+        "Logging:\n"
+        "  --verbose LEVEL              0|error, 1|info, 2|debug, 3|trace\n"
+        "\n"
+        "Connection policy is fixed in beta: strong single-connect; additional\n"
+        "clients are rejected immediately while one session owns the display.\n"
+        "Security is fixed in beta: view-only, clipboard input disabled,\n"
+        "file transfer disabled. These are not runtime switches.\n"
+        "\n"
+        "Other:\n"
+        "  --show-config                Print effective config and exit\n"
+        "  --version                    Print version and exit\n"
+        "  -h, --help                   Show this help\n",
+        VNC_MONITOR_VERSION,
+        argv0);
+}
+
+void
+runtime_config_print(const RuntimeConfig *cfg)
+{
+    printf(
+        "VNC Monitor %s configuration:\n"
+        "  config file:       %s\n"
+        "  capture backend:   %s\n"
+        "  capture timeout:   %d ms\n"
+        "  Mutter cursor:     %s\n"
+        "  capture max FPS:   %d\n"
+        "  VNC max rate:      %s\n"
+        "  latest-only:       %s\n"
+        "  diff detect:       %s (%d px tiles)\n"
+        "  layout remember:   %s\n"
+        "  layout resave:     %s\n"
+        "  public port:       %d\n"
+        "  backend:           %s:%d\n"
+        "  connection policy: strong single-connect\n"
+        "  TCP keepalive:     idle=%ds interval=%ds probes=%d\n"
+        "  TCP user timeout:  %d ms\n"
+        "  handshake timeout: %d ms\n"
+        "  screen mode:       %s\n"
+        "  framebuffer:       %dx%d (%s)\n"
+        "  RA2 record max:    %d bytes\n"
+        "  RA2 coalesce:      %s (%d us)\n"
+        "  RA2 key:           %s\n"
+        "  auth socket:       %s\n"
+        "  RFB ZRLE/raw:      %s/%s\n"
+        "  cursor/NewFBSize:  %s/%s\n"
+        "  security:          view-only, clipboard=off, file-transfer=off\n"
+        "  log level:         %s (%d)\n",
+        VNC_MONITOR_VERSION,
+        cfg->config_file,
+        runtime_config_capture_backend_name(cfg->capture_backend),
+        cfg->capture_timeout_ms,
+        runtime_config_mutter_cursor_name(cfg->mutter_cursor_mode),
+        cfg->max_fps,
+        cfg->vnc_max_fps > 0 ? "rate-limited" : "source-driven",
+        cfg->latest_only ? "on" : "off",
+        cfg->diff_detect ? "on" : "off",
+        cfg->diff_tile_size,
+        cfg->layout_remember ? "on" : "off",
+        cfg->layout_resave ? "on" : "off",
+        cfg->public_port,
+        cfg->backend_bind,
+        cfg->backend_port,
+        cfg->client_keepalive_idle_s,
+        cfg->client_keepalive_interval_s,
+        cfg->client_keepalive_probes,
+        cfg->client_user_timeout_ms,
+        cfg->client_handshake_timeout_ms,
+        runtime_config_screen_size_mode_name(cfg->screen_size_mode),
+        cfg->width,
+        cfg->height,
+        cfg->screen_size_mode == SCREEN_SIZE_FIXED ? "fixed" : "initial/fallback",
+        cfg->ra2_stream_record_max,
+        cfg->ra2_coalesce ? "on" : "off",
+        cfg->ra2_coalesce_us,
+        cfg->ra2_key_file,
+        cfg->auth_socket,
+        cfg->enable_zrle ? "on" : "off",
+        cfg->enable_raw ? "on" : "off",
+        cfg->enable_cursor ? "on" : "off",
+        cfg->enable_newfbsize ? "on" : "off",
+        vnc_log_level_name(cfg->verbose),
+        cfg->verbose);
+
+    if (cfg->vnc_max_fps > 0)
+        printf("  VNC max FPS:       %d\n", cfg->vnc_max_fps);
+}
+
 int
-runtime_config_parse(
-    RuntimeConfig *cfg,
-    int argc,
-    char **argv)
+runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
 {
     enum {
-        OPT_SOURCE = 1000,
+        OPT_CONFIG = 1000,
         OPT_CAPTURE_BACKEND,
         OPT_CAPTURE_TIMEOUT_MS,
         OPT_MUTTER_CURSOR,
-        OPT_MUTTER_HARDWARE_CURSOR,
         OPT_VNC_FPS,
+        OPT_LATEST_ONLY,
         OPT_EXTERNAL_SEND_BUFFER,
         OPT_BACKEND_RECV_BUFFER,
+        OPT_CLIENT_KEEPALIVE_IDLE,
+        OPT_CLIENT_KEEPALIVE_INTERVAL,
+        OPT_CLIENT_KEEPALIVE_PROBES,
+        OPT_CLIENT_USER_TIMEOUT_MS,
+        OPT_CLIENT_HANDSHAKE_TIMEOUT_MS,
         OPT_DIFF_DETECT,
         OPT_DIFF_TILE_SIZE,
         OPT_LAYOUT_REMEMBER,
         OPT_LAYOUT_RESAVE,
-        OPT_FRAME_STATS,
-        OPT_FRAME_TRACE,
-        OPT_CAPTURE_TRACE,
-        OPT_CAPTURE_STALL_MS,
-        OPT_FRAME_STATS_INTERVAL_MS,
         OPT_PORT,
         OPT_BACKEND_PORT,
         OPT_BACKEND_BIND,
+        OPT_SCREEN_MODE,
         OPT_WIDTH,
         OPT_HEIGHT,
         OPT_FPS,
@@ -654,46 +741,33 @@ runtime_config_parse(
         OPT_RAW,
         OPT_CURSOR,
         OPT_NEWFBSIZE,
-        OPT_VIEW_ONLY,
-        OPT_CLIPBOARD,
-        OPT_FILE_TRANSFER,
         OPT_VERBOSE,
         OPT_SHOW_CONFIG,
-        OPT_SQUARE_MIN,
-        OPT_SQUARE_MAX,
-        OPT_SQUARE_SPEED,
-        OPT_SQUARE_CYCLE,
-        OPT_DAMAGE,
-        OPT_BENCHMARK,
-        OPT_BENCHMARK_INTERVAL,
-        OPT_BENCHMARK_STEP,
-        OPT_BENCHMARK_SQUARE_MIN,
-        OPT_BENCHMARK_SQUARE_MAX,
-        OPT_BENCHMARK_SQUARE_STEP,
-        OPT_BENCHMARK_CSV
+        OPT_VERSION
     };
 
     static const struct option options[] = {
-        {"source", required_argument, NULL, OPT_SOURCE},
+        {"config", required_argument, NULL, OPT_CONFIG},
         {"capture-backend", required_argument, NULL, OPT_CAPTURE_BACKEND},
         {"capture-timeout-ms", required_argument, NULL, OPT_CAPTURE_TIMEOUT_MS},
         {"mutter-cursor", required_argument, NULL, OPT_MUTTER_CURSOR},
-        {"mutter-hardware-cursor", required_argument, NULL, OPT_MUTTER_HARDWARE_CURSOR},
         {"vnc-fps", required_argument, NULL, OPT_VNC_FPS},
+        {"latest-only", required_argument, NULL, OPT_LATEST_ONLY},
         {"external-send-buffer", required_argument, NULL, OPT_EXTERNAL_SEND_BUFFER},
         {"backend-recv-buffer", required_argument, NULL, OPT_BACKEND_RECV_BUFFER},
+        {"client-keepalive-idle", required_argument, NULL, OPT_CLIENT_KEEPALIVE_IDLE},
+        {"client-keepalive-interval", required_argument, NULL, OPT_CLIENT_KEEPALIVE_INTERVAL},
+        {"client-keepalive-probes", required_argument, NULL, OPT_CLIENT_KEEPALIVE_PROBES},
+        {"client-user-timeout-ms", required_argument, NULL, OPT_CLIENT_USER_TIMEOUT_MS},
+        {"client-handshake-timeout-ms", required_argument, NULL, OPT_CLIENT_HANDSHAKE_TIMEOUT_MS},
         {"diff-detect", required_argument, NULL, OPT_DIFF_DETECT},
         {"diff-tile-size", required_argument, NULL, OPT_DIFF_TILE_SIZE},
         {"layout-remember", required_argument, NULL, OPT_LAYOUT_REMEMBER},
         {"layout-resave", required_argument, NULL, OPT_LAYOUT_RESAVE},
-        {"frame-stats", required_argument, NULL, OPT_FRAME_STATS},
-        {"frame-trace", required_argument, NULL, OPT_FRAME_TRACE},
-        {"capture-trace", required_argument, NULL, OPT_CAPTURE_TRACE},
-        {"capture-stall-ms", required_argument, NULL, OPT_CAPTURE_STALL_MS},
-        {"frame-stats-interval-ms", required_argument, NULL, OPT_FRAME_STATS_INTERVAL_MS},
         {"port", required_argument, NULL, OPT_PORT},
         {"backend-port", required_argument, NULL, OPT_BACKEND_PORT},
         {"backend-bind", required_argument, NULL, OPT_BACKEND_BIND},
+        {"screen-mode", required_argument, NULL, OPT_SCREEN_MODE},
         {"width", required_argument, NULL, OPT_WIDTH},
         {"height", required_argument, NULL, OPT_HEIGHT},
         {"fps", required_argument, NULL, OPT_FPS},
@@ -706,474 +780,110 @@ runtime_config_parse(
         {"raw", required_argument, NULL, OPT_RAW},
         {"cursor", required_argument, NULL, OPT_CURSOR},
         {"newfbsize", required_argument, NULL, OPT_NEWFBSIZE},
-        {"view-only", required_argument, NULL, OPT_VIEW_ONLY},
-        {"clipboard", required_argument, NULL, OPT_CLIPBOARD},
-        {"file-transfer", required_argument, NULL, OPT_FILE_TRANSFER},
         {"verbose", required_argument, NULL, OPT_VERBOSE},
         {"show-config", no_argument, NULL, OPT_SHOW_CONFIG},
-        {"square-min", required_argument, NULL, OPT_SQUARE_MIN},
-        {"square-max", required_argument, NULL, OPT_SQUARE_MAX},
-        {"square-speed", required_argument, NULL, OPT_SQUARE_SPEED},
-        {"square-cycle", required_argument, NULL, OPT_SQUARE_CYCLE},
-        {"damage", required_argument, NULL, OPT_DAMAGE},
-        {"benchmark", required_argument, NULL, OPT_BENCHMARK},
-        {"benchmark-interval", required_argument, NULL, OPT_BENCHMARK_INTERVAL},
-        {"benchmark-step", required_argument, NULL, OPT_BENCHMARK_STEP},
-        {"benchmark-square-min", required_argument, NULL, OPT_BENCHMARK_SQUARE_MIN},
-        {"benchmark-square-max", required_argument, NULL, OPT_BENCHMARK_SQUARE_MAX},
-        {"benchmark-square-step", required_argument, NULL, OPT_BENCHMARK_SQUARE_STEP},
-        {"benchmark-csv", required_argument, NULL, OPT_BENCHMARK_CSV},
+        {"version", no_argument, NULL, OPT_VERSION},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
-    for (;;) {
-        int c =
-            getopt_long(
-                argc,
-                argv,
-                "h",
-                options,
-                NULL
-            );
-
-        if (c == -1)
-            break;
-
-        switch (c) {
-            case OPT_SOURCE:
-                if (
-                    parse_source_mode(
-                        optarg,
-                        &cfg->source_mode
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_CAPTURE_BACKEND:
-                if (parse_capture_backend(optarg, &cfg->capture_backend) < 0)
-                    return -1;
-                break;
-
-            case OPT_CAPTURE_TIMEOUT_MS:
-                if (
-                    parse_int(
-                        "capture-timeout-ms",
-                        optarg,
-                        100,
-                        60000,
-                        &cfg->capture_timeout_ms
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_MUTTER_CURSOR:
-                if (
-                    parse_mutter_cursor(
-                        optarg,
-                        &cfg->mutter_cursor_mode
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_MUTTER_HARDWARE_CURSOR:
-                if (
-                    parse_mutter_hardware_cursor(
-                        optarg,
-                        &cfg->mutter_hardware_cursor_mode
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_VNC_FPS:
-                if (parse_vnc_fps(optarg, &cfg->vnc_max_fps) < 0)
-                    return -1;
-                break;
-
-            case OPT_EXTERNAL_SEND_BUFFER:
-                if (
-                    parse_int(
-                        "external-send-buffer",
-                        optarg,
-                        4096,
-                        4194304,
-                        &cfg->external_send_buffer
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_BACKEND_RECV_BUFFER:
-                if (
-                    parse_int(
-                        "backend-recv-buffer",
-                        optarg,
-                        4096,
-                        4194304,
-                        &cfg->backend_receive_buffer
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_DIFF_DETECT:
-                if (
-                    parse_bool(
-                        "diff-detect",
-                        optarg,
-                        &cfg->diff_detect
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_DIFF_TILE_SIZE:
-                if (
-                    parse_int(
-                        "diff-tile-size",
-                        optarg,
-                        8,
-                        256,
-                        &cfg->diff_tile_size
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_LAYOUT_REMEMBER:
-                if (
-                    parse_bool(
-                        "layout-remember",
-                        optarg,
-                        &cfg->layout_remember
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_LAYOUT_RESAVE:
-                if (
-                    parse_bool(
-                        "layout-resave",
-                        optarg,
-                        &cfg->layout_resave
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_FRAME_STATS:
-                if (
-                    parse_bool(
-                        "frame-stats",
-                        optarg,
-                        &cfg->frame_stats
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_FRAME_TRACE:
-                if (
-                    parse_bool(
-                        "frame-trace",
-                        optarg,
-                        &cfg->frame_trace
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_CAPTURE_TRACE:
-                if (
-                    parse_bool(
-                        "capture-trace",
-                        optarg,
-                        &cfg->capture_trace
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_CAPTURE_STALL_MS:
-                if (
-                    parse_int(
-                        "capture-stall-ms",
-                        optarg,
-                        50,
-                        60000,
-                        &cfg->capture_stall_ms
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_FRAME_STATS_INTERVAL_MS:
-                if (
-                    parse_int(
-                        "frame-stats-interval-ms",
-                        optarg,
-                        100,
-                        60000,
-                        &cfg->frame_stats_interval_ms
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_PORT:
-                if (parse_int("port", optarg, 1, 65535, &cfg->public_port) < 0)
-                    return -1;
-                break;
-
-            case OPT_BACKEND_PORT:
-                if (parse_int("backend-port", optarg, 1, 65535, &cfg->backend_port) < 0)
-                    return -1;
-                break;
-
-            case OPT_BACKEND_BIND:
-                cfg->backend_bind = optarg;
-                break;
-
-            case OPT_WIDTH:
-                if (parse_int("width", optarg, 64, 16384, &cfg->width) < 0)
-                    return -1;
-                break;
-
-            case OPT_HEIGHT:
-                if (parse_int("height", optarg, 64, 16384, &cfg->height) < 0)
-                    return -1;
-                break;
-
-            case OPT_FPS:
-                if (parse_int("fps", optarg, 1, 240, &cfg->max_fps) < 0)
-                    return -1;
-                break;
-
-            case OPT_RA2_RECORD_SIZE:
-                if (
-                    parse_int(
-                        "ra2-record-size",
-                        optarg,
-                        1,
-                        65535,
-                        &cfg->ra2_stream_record_max
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_RA2_COALESCE:
-                if (
-                    parse_bool(
-                        "ra2-coalesce",
-                        optarg,
-                        &cfg->ra2_coalesce
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_RA2_COALESCE_US:
-                if (
-                    parse_int(
-                        "ra2-coalesce-us",
-                        optarg,
-                        0,
-                        1000000,
-                        &cfg->ra2_coalesce_us
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_RA2_KEY:
-                cfg->ra2_key_file = optarg;
-                break;
-
-            case OPT_AUTH_SOCKET:
-                cfg->auth_socket = optarg;
-                break;
-
-            case OPT_ZRLE:
-                if (parse_bool("zrle", optarg, &cfg->enable_zrle) < 0)
-                    return -1;
-                break;
-
-            case OPT_RAW:
-                if (parse_bool("raw", optarg, &cfg->enable_raw) < 0)
-                    return -1;
-                break;
-
-            case OPT_CURSOR:
-                if (parse_bool("cursor", optarg, &cfg->enable_cursor) < 0)
-                    return -1;
-                break;
-
-            case OPT_NEWFBSIZE:
-                if (parse_bool("newfbsize", optarg, &cfg->enable_newfbsize) < 0)
-                    return -1;
-                break;
-
-            case OPT_VIEW_ONLY:
-                if (parse_bool("view-only", optarg, &cfg->view_only) < 0)
-                    return -1;
-                break;
-
-            case OPT_CLIPBOARD:
-                if (parse_bool("clipboard", optarg, &cfg->enable_clipboard) < 0)
-                    return -1;
-                break;
-
-            case OPT_FILE_TRANSFER:
-                if (parse_bool("file-transfer", optarg, &cfg->enable_file_transfer) < 0)
-                    return -1;
-                break;
-
-            case OPT_VERBOSE:
-                if (parse_bool("verbose", optarg, &cfg->verbose) < 0)
-                    return -1;
-                break;
-
-            case OPT_SQUARE_MIN:
-                if (parse_int("square-min", optarg, 1, 16384, &cfg->square_min) < 0)
-                    return -1;
-                break;
-
-            case OPT_SQUARE_MAX:
-                if (parse_int("square-max", optarg, 1, 16384, &cfg->square_max) < 0)
-                    return -1;
-                break;
-
-            case OPT_SQUARE_SPEED:
-                if (parse_double("square-speed", optarg, 0.0, 10000.0, &cfg->square_speed) < 0)
-                    return -1;
-                break;
-
-            case OPT_SQUARE_CYCLE:
-                if (parse_double("square-cycle", optarg, 0.05, 3600.0, &cfg->square_cycle_seconds) < 0)
-                    return -1;
-                break;
-
-            case OPT_DAMAGE:
-                if (parse_damage_mode(optarg, &cfg->damage_mode) < 0)
-                    return -1;
-                break;
-
-            case OPT_BENCHMARK:
-                if (parse_benchmark_mode(optarg, &cfg->benchmark_mode) < 0)
-                    return -1;
-                break;
-
-            case OPT_BENCHMARK_INTERVAL:
-                if (
-                    parse_double(
-                        "benchmark-interval",
-                        optarg,
-                        0.1,
-                        3600.0,
-                        &cfg->benchmark_interval_seconds
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_BENCHMARK_STEP:
-                if (
-                    parse_double(
-                        "benchmark-step",
-                        optarg,
-                        0.25,
-                        3600.0,
-                        &cfg->benchmark_step_seconds
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_BENCHMARK_SQUARE_MIN:
-                if (
-                    parse_int(
-                        "benchmark-square-min",
-                        optarg,
-                        1,
-                        16384,
-                        &cfg->benchmark_square_min
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_BENCHMARK_SQUARE_MAX:
-                if (
-                    parse_int(
-                        "benchmark-square-max",
-                        optarg,
-                        1,
-                        16384,
-                        &cfg->benchmark_square_max
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_BENCHMARK_SQUARE_STEP:
-                if (
-                    parse_int(
-                        "benchmark-square-step",
-                        optarg,
-                        1,
-                        16384,
-                        &cfg->benchmark_square_step
-                    ) < 0
-                )
-                    return -1;
-                break;
-
-            case OPT_BENCHMARK_CSV:
-                cfg->benchmark_csv = optarg;
-                break;
-
-            case OPT_SHOW_CONFIG:
-                runtime_config_print(cfg);
-                exit(0);
-
-            case 'h':
-                runtime_config_usage(argv[0]);
-                exit(0);
-
-            default:
-                return -1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0) {
+            printf("%s\n", VNC_MONITOR_VERSION);
+            exit(0);
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            runtime_config_usage(argv[0]);
+            exit(0);
         }
     }
 
+    int explicit_config = 0;
+    if (prescan_config_path(cfg, argc, argv, &explicit_config) < 0)
+        return -1;
+
+    if (load_config_file(cfg, explicit_config) < 0)
+        return -1;
+
+    int show_config = 0;
+    optind = 1;
+
+    for (;;) {
+        int c = getopt_long(argc, argv, "h", options, NULL);
+        if (c == -1)
+            break;
+
+        const char *setting = NULL;
+
+        switch (c) {
+            case OPT_CONFIG:
+                /* Already handled before loading the config file. */
+                break;
+            case OPT_CAPTURE_BACKEND: setting = "capture-backend"; break;
+            case OPT_CAPTURE_TIMEOUT_MS: setting = "capture-timeout-ms"; break;
+            case OPT_MUTTER_CURSOR: setting = "mutter-cursor"; break;
+            case OPT_VNC_FPS: setting = "vnc-fps"; break;
+            case OPT_LATEST_ONLY: setting = "latest-only"; break;
+            case OPT_EXTERNAL_SEND_BUFFER: setting = "external-send-buffer"; break;
+            case OPT_BACKEND_RECV_BUFFER: setting = "backend-recv-buffer"; break;
+            case OPT_CLIENT_KEEPALIVE_IDLE: setting = "client-keepalive-idle"; break;
+            case OPT_CLIENT_KEEPALIVE_INTERVAL: setting = "client-keepalive-interval"; break;
+            case OPT_CLIENT_KEEPALIVE_PROBES: setting = "client-keepalive-probes"; break;
+            case OPT_CLIENT_USER_TIMEOUT_MS: setting = "client-user-timeout-ms"; break;
+            case OPT_CLIENT_HANDSHAKE_TIMEOUT_MS: setting = "client-handshake-timeout-ms"; break;
+            case OPT_DIFF_DETECT: setting = "diff-detect"; break;
+            case OPT_DIFF_TILE_SIZE: setting = "diff-tile-size"; break;
+            case OPT_LAYOUT_REMEMBER: setting = "layout-remember"; break;
+            case OPT_LAYOUT_RESAVE: setting = "layout-resave"; break;
+            case OPT_PORT: setting = "port"; break;
+            case OPT_BACKEND_PORT: setting = "backend-port"; break;
+            case OPT_BACKEND_BIND: setting = "backend-bind"; break;
+            case OPT_SCREEN_MODE: setting = "screen-mode"; break;
+            case OPT_WIDTH: setting = "width"; break;
+            case OPT_HEIGHT: setting = "height"; break;
+            case OPT_FPS: setting = "fps"; break;
+            case OPT_RA2_RECORD_SIZE: setting = "ra2-record-size"; break;
+            case OPT_RA2_COALESCE: setting = "ra2-coalesce"; break;
+            case OPT_RA2_COALESCE_US: setting = "ra2-coalesce-us"; break;
+            case OPT_RA2_KEY: setting = "ra2-key"; break;
+            case OPT_AUTH_SOCKET: setting = "auth-socket"; break;
+            case OPT_ZRLE: setting = "zrle"; break;
+            case OPT_RAW: setting = "raw"; break;
+            case OPT_CURSOR: setting = "cursor"; break;
+            case OPT_NEWFBSIZE: setting = "newfbsize"; break;
+            case OPT_VERBOSE: setting = "verbose"; break;
+            case OPT_SHOW_CONFIG:
+                show_config = 1;
+                break;
+            case OPT_VERSION:
+                printf("%s\n", VNC_MONITOR_VERSION);
+                exit(0);
+            case 'h':
+                runtime_config_usage(argv[0]);
+                exit(0);
+            default:
+                return -1;
+        }
+
+        if (setting && apply_setting(cfg, setting, optarg) < 0)
+            return -1;
+    }
+
     if (optind != argc) {
-        fprintf(
-            stderr,
-            "Unexpected positional argument: %s\n",
-            argv[optind]
-        );
+        fprintf(stderr, "Unexpected positional argument: %s\n", argv[optind]);
         return -1;
     }
 
-    if (!cfg->enable_zrle && !cfg->enable_raw) {
-        fprintf(
-            stderr,
-            "At least one of --zrle or --raw must be enabled\n"
-        );
+    if (cfg->public_port == cfg->backend_port) {
+        fprintf(stderr, "Public and backend ports must differ\n");
         return -1;
     }
 
-    if (
-        cfg->square_min > cfg->square_max ||
-        cfg->benchmark_square_min > cfg->benchmark_square_max
-    ) {
-        fprintf(stderr, "Square minimum cannot exceed maximum\n");
-        return -1;
+    apply_log_level(cfg);
+
+    if (show_config) {
+        runtime_config_print(cfg);
+        exit(0);
     }
 
     return 0;

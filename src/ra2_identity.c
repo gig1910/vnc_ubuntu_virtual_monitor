@@ -2,6 +2,7 @@
 
 #include "ra2_identity.h"
 #include "config.h"
+#include "log.h"
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -11,31 +12,22 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 static EVP_PKEY *
 generate_rsa_key(void)
 {
-    EVP_PKEY_CTX *ctx =
-        EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
-
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
     if (!ctx)
         return NULL;
 
     EVP_PKEY *key = NULL;
-
     if (EVP_PKEY_keygen_init(ctx) <= 0)
         goto fail;
-
-    if (
-        EVP_PKEY_CTX_set_rsa_keygen_bits(
-            ctx,
-            RA2_RSA_BITS
-        ) <= 0
-    )
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, RA2_RSA_BITS) <= 0)
         goto fail;
-
     if (EVP_PKEY_keygen(ctx, &key) <= 0)
         goto fail;
 
@@ -52,94 +44,104 @@ static EVP_PKEY *
 load_private_key(const char *path)
 {
     FILE *fp = fopen(path, "rb");
-
     if (!fp)
         return NULL;
 
-    EVP_PKEY *key =
-        PEM_read_PrivateKey(
-            fp,
-            NULL,
-            NULL,
-            NULL
-        );
-
+    EVP_PKEY *key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
     fclose(fp);
 
-    if (!key) {
-        fprintf(
-            stderr,
-            "Failed to parse RA2 server key: %s\n",
-            path
-        );
-    }
+    if (!key)
+        LOG_ERROR("Failed to parse RA2 server identity: %s", path);
 
     return key;
 }
 
 static int
-save_private_key_0600(
-    const char *path,
-    EVP_PKEY *key)
+ensure_parent_directory(const char *path)
 {
-    int fd =
-        open(
-            path,
-            O_WRONLY |
-            O_CREAT |
-            O_EXCL |
-            O_CLOEXEC,
-            0600
-        );
+    char *copy = strdup(path);
+    if (!copy)
+        return -1;
 
+    char *slash = strrchr(copy, '/');
+    if (!slash || slash == copy) {
+        free(copy);
+        return 0;
+    }
+
+    *slash = '\0';
+
+    if (mkdir(copy, 0700) < 0 && errno != EEXIST) {
+        LOG_ERROR("Could not create RA2 identity directory %s: %s",
+                  copy,
+                  strerror(errno));
+        free(copy);
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(copy, &st) < 0 || !S_ISDIR(st.st_mode)) {
+        LOG_ERROR("RA2 identity parent is not a directory: %s", copy);
+        free(copy);
+        return -1;
+    }
+
+    free(copy);
+    return 0;
+}
+
+static int
+save_private_key_0600(const char *path, EVP_PKEY *key)
+{
+    if (ensure_parent_directory(path) < 0)
+        return -1;
+
+    int fd = open(path,
+                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                  0600);
     if (fd < 0) {
         if (errno == EEXIST)
             return 1;
 
-        perror("create RA2 server key");
+        LOG_ERROR("Could not create RA2 server identity %s: %s",
+                  path,
+                  strerror(errno));
         return -1;
     }
 
     FILE *fp = fdopen(fd, "wb");
-
     if (!fp) {
-        perror("fdopen RA2 server key");
+        LOG_ERROR("fdopen failed for RA2 identity %s: %s",
+                  path,
+                  strerror(errno));
         close(fd);
         unlink(path);
         return -1;
     }
 
-    int ok =
-        PEM_write_PrivateKey(
-            fp,
-            key,
-            NULL,
-            NULL,
-            0,
-            NULL,
-            NULL
-        );
+    int ok = PEM_write_PrivateKey(fp,
+                                  key,
+                                  NULL,
+                                  NULL,
+                                  0,
+                                  NULL,
+                                  NULL);
 
     int flush_ok = fflush(fp) == 0;
-
     if (flush_ok)
         flush_ok = fsync(fd) == 0;
-
     int close_ok = fclose(fp) == 0;
 
     if (!ok || !flush_ok || !close_ok) {
-        fprintf(
-            stderr,
-            "Failed writing RA2 server key: %s\n",
-            path
-        );
-
+        LOG_ERROR("Failed writing RA2 server identity: %s", path);
         unlink(path);
         return -1;
     }
 
     if (chmod(path, 0600) < 0) {
-        perror("chmod RA2 server key");
+        LOG_ERROR("chmod(0600) failed for RA2 identity %s: %s",
+                  path,
+                  strerror(errno));
         unlink(path);
         return -1;
     }
@@ -153,67 +155,33 @@ ra2_identity_load_or_create(const char *path)
     if (!path || !*path)
         return NULL;
 
-    EVP_PKEY *key =
-        load_private_key(path);
-
+    EVP_PKEY *key = load_private_key(path);
     if (key) {
-        printf(
-            "Loaded persistent RA2 server identity: %s\n",
-            path
-        );
-
+        LOG_DEBUG("Loaded persistent RA2 server identity: %s", path);
         return key;
     }
 
     if (errno != ENOENT && access(path, F_OK) == 0)
         return NULL;
 
-    printf(
-        "Generating persistent %d-bit RA2 server identity...\n",
-        RA2_RSA_BITS
-    );
-
+    LOG_INFO("Generating persistent %d-bit RA2 server identity", RA2_RSA_BITS);
     key = generate_rsa_key();
-
     if (!key) {
-        fprintf(
-            stderr,
-            "Failed generating RA2 RSA key\n"
-        );
-
+        LOG_ERROR("Failed generating RA2 RSA key");
         return NULL;
     }
 
-    int save_rc =
-        save_private_key_0600(
-            path,
-            key
-        );
-
+    int save_rc = save_private_key_0600(path, key);
     if (save_rc == 0) {
-        printf(
-            "Saved persistent RA2 server identity: %s (mode 0600)\n",
-            path
-        );
-
+        LOG_INFO("Saved persistent RA2 server identity: %s (mode 0600)", path);
         return key;
     }
 
     if (save_rc == 1) {
-        /*
-         * Another instance created it between our load and create.
-         * Prefer the on-disk identity so all instances converge on one key.
-         */
         EVP_PKEY_free(key);
         key = load_private_key(path);
-
-        if (key) {
-            printf(
-                "Loaded RA2 server identity created concurrently: %s\n",
-                path
-            );
-        }
-
+        if (key)
+            LOG_DEBUG("Loaded RA2 identity created concurrently: %s", path);
         return key;
     }
 
