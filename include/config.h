@@ -1,7 +1,7 @@
 #ifndef VNC_MONITOR_CONFIG_H
 #define VNC_MONITOR_CONFIG_H
 
-#define VNC_MONITOR_VERSION   "0.1.0-beta.1"
+#define VNC_MONITOR_VERSION   "0.1.0-beta.2"
 
 #define RA2_RSA_BITS          2048
 #define RA2_RANDOM_SIZE       16
