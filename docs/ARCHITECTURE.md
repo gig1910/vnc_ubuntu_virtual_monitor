@@ -49,6 +49,30 @@ On a connection:
 
 On disconnect the internal RFB backend is stopped first, then capture and the virtual monitor are removed. The next viewer starts from the persistent config again; a resize requested by one client does not alter the configured fallback for later clients.
 
+## Strong single-connect ownership
+
+The server deliberately has exactly one active display owner. This is a production invariant in the beta, not an accidental consequence of a blocking `accept()` loop.
+
+The public listener remains responsive while the active session runs. The active session is executed by one detached worker that exclusively owns the shared FrameBridge/capture/backend lifecycle. If another TCP connection reaches the public listener while that worker is active, the new socket is immediately reset and closed; it never reaches RA2 negotiation and cannot disturb the active display owner.
+
+This arrangement is intentionally **not** multi-client support. There is still only one capture pipeline, one virtual monitor and one per-session adaptive RFB state.
+
+### Dead-peer release
+
+The external client socket enables Linux TCP liveness controls before RA2 negotiation:
+
+- `SO_KEEPALIVE`;
+- `TCP_KEEPIDLE`;
+- `TCP_KEEPINTVL`;
+- `TCP_KEEPCNT`;
+- `TCP_USER_TIMEOUT` when available.
+
+The defaults are 15 seconds idle before keepalive probing, 5 seconds between probes, 3 failed probes and a 20-second user timeout for unacknowledged data.
+
+These are transport-liveness checks, **not application-idle checks**. A healthy client may display a completely static framebuffer indefinitely. If Wi-Fi/LAN connectivity disappears without a clean TCP close, the kernel eventually fails the socket; the RA2 relay exits, the worker tears down LibVNCServer/PipeWire/Mutter and the single-client slot becomes available again.
+
+During daemon shutdown the main thread shuts down the active client socket and waits for the only client worker to finish before destroying shared FrameBridge/statistics state.
+
 ## Virtual-monitor lifecycle
 
 The Mutter sequence is:
@@ -123,7 +147,9 @@ refresh dimension-specific GNOME layout cache
 
 Only after the new monitor/capture and transport state are available is the LibVNCServer framebuffer committed. If monitor creation fails, the previous monitor/FrameBridge size is restored. If adaptive storage allocation fails after monitor recreation, the server also attempts to roll the monitor back and returns `OutOfResources` to the resize request.
 
-`rfbNewFramebuffer()` is the LibVNCServer-supported path for replacing a framebuffer and updating connected clients. The normal LibVNCServer `SetDesktopSize` machinery sends the mandatory `ExtendedDesktopSize` result to the requester.
+`rfbNewFramebuffer()` is the LibVNCServer-supported path for replacing a framebuffer and updating connected clients. After replacement, the backend explicitly restores the BGRx server pixel format and recalculates client translation tables so resize cannot silently revert LibVNCServer to its host-endian default channel layout.
+
+The normal LibVNCServer `SetDesktopSize` machinery sends the mandatory `ExtendedDesktopSize` result to the requester.
 
 A successful resize preserves the already-negotiated JPEG21 client capability. Size-dependent pending JPEG/repair state is cleared, and the CopyRect reference is invalidated so motion reuse is not attempted against pixels from the old dimensions.
 
@@ -217,8 +243,8 @@ A previously observed race in which an already-scheduled repair tile can become 
 Logging is a single hierarchy:
 
 - `error`: failures;
-- `info`: service/connection/monitor lifecycle;
-- `debug`: protocol/capture/transport state and periodic statistics;
+- `info`: service/connection/monitor lifecycle and rejected extra clients;
+- `debug`: protocol/capture/transport state, periodic statistics and applied TCP liveness policy;
 - `trace`: per-update frame/JPEG/CopyRect/repair/latency details.
 
 The persistent `[logging] level=` setting controls the service; `--verbose` is a CLI override for foreground diagnostics.
