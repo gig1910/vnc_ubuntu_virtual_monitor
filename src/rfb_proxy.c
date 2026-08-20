@@ -3,6 +3,7 @@
 #include "io.h"
 #include "shutdown_signal.h"
 #include "ra2_stream_coalescer.h"
+#include "mutter_virtual_monitor.h"
 #include "log.h"
 
 #include <arpa/inet.h>
@@ -152,6 +153,9 @@ relay_loop(int external_fd,
     unsigned long long c2s_bytes = 0;
     unsigned long long s2c_bytes = 0;
 
+    const int mutter_lifecycle_fd =
+        mutter_virtual_monitor_lifecycle_fd();
+
     LOG_DEBUG("RA2 stream relay: record-cap=%d coalesce=%s wait=%dus",
               cfg->ra2_stream_record_max,
               cfg->ra2_coalesce ? "on" : "off",
@@ -166,10 +170,14 @@ relay_loop(int external_fd,
         int stop_fd = shutdown_signal_fd();
         if (stop_fd >= 0)
             FD_SET(stop_fd, &readfds);
+        if (mutter_lifecycle_fd >= 0)
+            FD_SET(mutter_lifecycle_fd, &readfds);
 
         int maxfd = external_fd > backend_fd ? external_fd : backend_fd;
         if (stop_fd > maxfd)
             maxfd = stop_fd;
+        if (mutter_lifecycle_fd > maxfd)
+            maxfd = mutter_lifecycle_fd;
 
         /* Periodic wake-up keeps backpressure telemetry fresh. */
         struct timeval timeout = {.tv_sec = 0, .tv_usec = 20000};
@@ -196,6 +204,13 @@ relay_loop(int external_fd,
 
         if (stop_fd >= 0 && FD_ISSET(stop_fd, &readfds)) {
             shutdown_signal_drain();
+            return 0;
+        }
+
+        if (mutter_lifecycle_fd >= 0 &&
+            FD_ISSET(mutter_lifecycle_fd, &readfds)) {
+            mutter_virtual_monitor_lifecycle_drain();
+            LOG_INFO("Mutter stopped screen sharing; closing VNC session");
             return 0;
         }
 

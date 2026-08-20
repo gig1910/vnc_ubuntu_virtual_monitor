@@ -222,5 +222,7 @@ cleanup-obsolete-support:
 	./tools/cleanup-obsolete-support.sh
 
 clean:
-	rm -f $(OBJECTS) $(BROKER_OBJECTS) $(DEPS) $(TARGET) $(BROKER_TARGET) $(PAM_HELPER)
+	# Remove every generated object/dependency, including artifacts from source
+	# files that were deleted or renamed since the previous build.
+	rm -f src/*.o src/*.d $(TARGET) $(BROKER_TARGET) $(PAM_HELPER)
 	rm -rf "$(BUILD_DIR)"

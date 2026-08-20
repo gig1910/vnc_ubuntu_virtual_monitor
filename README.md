@@ -2,11 +2,11 @@
 
 `vnc-monitor` turns a VNC-capable tablet into a view-only extended monitor for the **currently active local GNOME Wayland login session**.
 
-Current beta: **`0.1.0-beta.3`**.
+Current beta: **`0.1.0-beta.4`**.
 
 ## Production architecture
 
-Beta.3 separates machine-wide connection policy from per-user display/capture work:
+The production architecture separates machine-wide connection policy from per-user display/capture work:
 
 ```text
 VNC viewer
@@ -27,7 +27,7 @@ Mutter virtual monitor -> PipeWire -> adaptive RFB
 
 The broker owns only the public listener and session-selection policy. RA2 credentials, PAM authentication, Mutter, PipeWire and framebuffer processing remain in the unprivileged user agent.
 
-The virtual monitor exists only while an authenticated VNC client is connected and is removed on disconnect or policy revocation.
+The virtual monitor exists only while an authenticated VNC client is connected and is removed on disconnect, GNOME screen-sharing Stop, or policy revocation.
 
 ## Session security policy
 
@@ -56,12 +56,27 @@ The PAM helper independently verifies `SO_PEERCRED` and authenticates only the U
 
 GDM is deliberately **not served**.
 
+## GNOME lifecycle integration
+
+GNOME remains authoritative for its own RemoteDesktop/ScreenCast session. If the user presses the system screen-sharing **Stop** control, the associated VNC connection is revoked rather than being left connected to a vanished virtual monitor.
+
+Monitor layout persistence is connection-scoped:
+
+- a normal VNC disconnect saves the latest live Mutter layout while the virtual `Meta-*` monitor still exists;
+- the next connection restores that saved layout;
+- a cache that does not contain a virtual `Meta-*` monitor is not applied to a new virtual-monitor session;
+- if GNOME has already removed the virtual monitor, teardown does not overwrite the last valid cache with a physical-monitor-only layout.
+
+The project does not modify `~/.config/monitors.xml`.
+
 ## Runtime validation
 
-Beta.3 has been exercised on the target Ubuntu 26.04 GNOME Wayland host with the legacy iPad VNC client. Confirmed scenarios include:
+Beta.4 has been exercised on the target Ubuntu 26.04 GNOME Wayland host with the legacy iPad VNC client. Confirmed scenarios include:
 
 - normal RA2r/PAM connection to the active `gig` session;
 - virtual monitor creation on connect and teardown on disconnect;
+- GNOME screen-sharing Stop tears down the virtual monitor and terminates the corresponding VNC session;
+- changed virtual-monitor layout is saved on normal disconnect and restored on reconnect;
 - immediate rejection of a second simultaneous viewer;
 - automatic teardown when the client disappears from Wi-Fi / powers off;
 - Switch User or lock transition to GDM immediately revokes the existing VNC connection;
@@ -132,7 +147,7 @@ The builder uses `make -j"$(nproc)"` by default, runs dependency preflight, deri
 Generated package name follows:
 
 ```text
-dist/vnc-monitor_0.1.0~beta.3-<revision>_amd64.deb
+dist/vnc-monitor_0.1.0~beta.4-<revision>_amd64.deb
 ```
 
 The binary package contains:
@@ -216,7 +231,7 @@ broker validates active seat0 Session ID/UID
 
 ## Existing transport/security properties
 
-Beta.3 retains the proven transport path:
+Beta.4 retains the proven transport path:
 
 - native PipeWire capture, GStreamer fallback;
 - PipeWire `SPA_META_Cursor` cursor metadata;
