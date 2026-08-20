@@ -1,12 +1,12 @@
 # VNC Monitor for GNOME Wayland
 
-`vnc-monitor` turns a VNC-capable tablet into a view-only extended monitor for the currently active local GNOME Wayland login session.
+`vnc-monitor` turns a VNC-capable tablet into a view-only extended monitor for the **currently active local GNOME Wayland login session**.
 
-## Beta status
+Current beta: **`0.1.0-beta.3`**.
 
-Current development beta on this branch: **`0.1.0-beta.3`**.
+## Production architecture
 
-Beta.3 changes session ownership without changing the proven capture/RFB transport path. The public TCP listener is now a small system broker; all RA2/PAM, Mutter, PipeWire and framebuffer work stays in an unprivileged per-user session agent.
+Beta.3 separates machine-wide connection policy from per-user display/capture work:
 
 ```text
 VNC viewer
@@ -16,7 +16,7 @@ VNC viewer
 vnc-monitor-broker              root system service
     |
     | logind seat0.ActiveSession gate
-    | SCM_RIGHTS: pass the accepted TCP fd
+    | SCM_RIGHTS: pass accepted TCP fd
     v
 vnc-monitor --agent             active user's systemd --user service
     |
@@ -25,15 +25,15 @@ vnc-monitor --agent             active user's systemd --user service
 Mutter virtual monitor -> PipeWire -> adaptive RFB
 ```
 
+The broker owns only the public listener and session-selection policy. RA2 credentials, PAM authentication, Mutter, PipeWire and framebuffer processing remain in the unprivileged user agent.
+
 The virtual monitor exists only while an authenticated VNC client is connected and is removed on disconnect or policy revocation.
 
 ## Session security policy
 
-The broker routes a new connection only when `seat0` has an active **local Wayland user session**. It rejects GDM/greeter, remote sessions and non-Wayland targets.
+The broker routes a new connection only when `seat0` has an active **local Wayland `Class=user` session**. GDM/greeter, remote sessions and non-Wayland targets are rejected.
 
-Each accepted VNC connection is bound to the exact logind **Session ID + UID** that was active at handoff time. It is never moved to another login session.
-
-Therefore:
+Each accepted connection is bound to the exact logind **Session ID + UID** active at handoff time. It is never moved to another login session.
 
 ```text
 active session = gig
@@ -50,17 +50,31 @@ Switch User / logoff / seat0 leaves bound Session ID
         -> old VNC connection is permanently dead
 ```
 
-Returning to the same Unix user does **not** restore the old connection. The viewer must reconnect and authenticate again. To see Bob's active desktop, reconnect while Bob's graphical session is active and authenticate as Bob.
+Returning to the same Unix user does **not** restore the old connection. To see Bob's active desktop, reconnect while Bob's graphical session is active and authenticate as Bob.
 
-The PAM helper independently checks `SO_PEERCRED` and will only authenticate the Unix username that owns the calling agent process. A Bob agent cannot be used to authenticate `gig`, and an inactive `gig` agent is never selected merely because it still exists after Fast User Switching.
+The PAM helper independently verifies `SO_PEERCRED` and authenticates only the Unix account owning the calling agent. An inactive user's agent is never selected merely because its user manager still exists after Fast User Switching.
 
-GDM is deliberately **not served** in beta.3.
+GDM is deliberately **not served**.
+
+## Runtime validation
+
+Beta.3 has been exercised on the target Ubuntu 26.04 GNOME Wayland host with the legacy iPad VNC client. Confirmed scenarios include:
+
+- normal RA2r/PAM connection to the active `gig` session;
+- virtual monitor creation on connect and teardown on disconnect;
+- immediate rejection of a second simultaneous viewer;
+- automatic teardown when the client disappears from Wi-Fi / powers off;
+- Switch User or lock transition to GDM immediately revokes the existing VNC connection;
+- new VNC connections are rejected while GDM/greeter is active;
+- after logging into another local account, the broker routes only to that account's active agent;
+- credentials for a different/inactive Unix account are rejected;
+- switching back to the original account requires a new VNC connection and fresh authentication.
 
 ## Strong single-connect
 
 There is one machine-wide external VNC session at a time. The broker keeps the public listener responsive while a session exists solely to reject additional clients immediately instead of leaving them in the TCP backlog.
 
-Lost-peer protection remains unchanged:
+Lost-peer protection:
 
 ```ini
 [network]
@@ -94,11 +108,9 @@ An explicit `--config FILE` replaces the normal per-user override path but still
 /etc/vnc-monitor/config.ini
 ```
 
-A per-user `~/.config/vnc-monitor/config.ini` does not move the machine-wide public listener. This prevents different login users from competing for or redefining the external server port.
+A per-user config cannot move the machine-wide public listener. Other capture/display/transport/RA2 settings remain per-user through the normal layered agent configuration.
 
-Other capture/display/transport/RA2 settings remain effective per user through the normal layered agent configuration.
-
-The default remains:
+Default display sizing:
 
 ```ini
 [display]
@@ -115,17 +127,15 @@ Older viewers that cannot send RFB `ExtendedDesktopSize` use the configured fall
 ./build-deb.sh --clean
 ```
 
-The first beta.3 build should be clean because new broker/protocol objects and the main agent lifecycle were added. Later packaging-only rebuilds do not require `--clean`.
+The builder uses `make -j"$(nproc)"` by default, runs dependency preflight, derives runtime ELF dependencies with `dpkg-shlibdeps`, and validates the package with `tools/verify-deb.sh`.
 
-The builder uses `make -j"$(nproc)"` by default, runs dependency preflight, uses `dpkg-shlibdeps` for runtime ELF dependencies only, and then runs `tools/verify-deb.sh` against the generated package.
-
-Expected filename:
+Generated package name follows:
 
 ```text
-dist/vnc-monitor_0.1.0~beta.3-1_amd64.deb
+dist/vnc-monitor_0.1.0~beta.3-<revision>_amd64.deb
 ```
 
-The package contains:
+The binary package contains:
 
 ```text
 /usr/bin/vnc-monitor
@@ -139,17 +149,15 @@ The package contains:
 /etc/pam.d/vnc-monitor
 ```
 
-The user agent is package-wanted by `graphical-session.target`, so future graphical login sessions start their own agent without the package writing into arbitrary home directories.
+The user agent is package-wanted by `graphical-session.target`, so future graphical login sessions start their own agent without package scripts writing into arbitrary home directories.
 
-For the graphical session that is already running during the first install/upgrade:
+For a graphical session already running during install/upgrade:
 
 ```bash
 systemctl --user daemon-reload
 systemctl --user restart vnc-monitor.service
 sudo systemctl restart vnc-monitor-broker.service
 ```
-
-The broker unit has unlimited start retries specifically so a beta.2 -> beta.3 package upgrade does not permanently fail if the old standalone user daemon still owns the public port until this restart.
 
 ## Source install / upgrade
 
@@ -160,9 +168,7 @@ git pull --ff-only
 ./install.sh --clean
 ```
 
-For the beta.2 -> beta.3 source transition the installer deliberately restarts the old user daemon as `--agent` **before** starting the system broker, freeing the public port deterministically.
-
-Source installation creates and preserves both:
+Source installation creates/preserves both:
 
 ```text
 /etc/vnc-monitor/config.ini
@@ -210,7 +216,7 @@ broker validates active seat0 Session ID/UID
 
 ## Existing transport/security properties
 
-Beta.3 retains the beta.2 production path:
+Beta.3 retains the proven transport path:
 
 - native PipeWire capture, GStreamer fallback;
 - PipeWire `SPA_META_Cursor` cursor metadata;
@@ -227,7 +233,7 @@ The server remains display-only: keyboard, pointer/touch, clipboard input and fi
 
 ## Standalone developer mode
 
-Running the binary without `--agent` still starts the old direct public listener for focused development/diagnostics:
+Running the binary without `--agent` still starts the direct public listener for focused development/diagnostics:
 
 ```bash
 ./vnc-monitor --verbose debug
