@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include "auth_client.h"
 #include "broker_protocol.h"
 #include "config.h"
 #include "ra2.h"
@@ -18,6 +19,7 @@
 #include <errno.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +36,7 @@ typedef struct {
     int running;
     int client_fd;
     int control_fd;
+    uint16_t transport;
     char peer_addr[VNC_BROKER_PEER_ADDR_MAX];
     char session_id[VNC_BROKER_SESSION_ID_MAX];
 
@@ -414,6 +417,7 @@ done:
     pthread_mutex_lock(&slot->mutex);
     slot->client_fd = -1;
     slot->control_fd = -1;
+    slot->transport = VNC_BROKER_TRANSPORT_LEGACY_VNC;
     slot->session_id[0] = '\0';
     slot->running = 0;
     pthread_cond_broadcast(&slot->cond);
@@ -430,6 +434,7 @@ release_unstarted_client_slot(ClientSlot *slot, int client_fd)
     slot->running = 0;
     slot->client_fd = -1;
     slot->control_fd = -1;
+    slot->transport = VNC_BROKER_TRANSPORT_LEGACY_VNC;
     slot->session_id[0] = '\0';
     pthread_cond_broadcast(&slot->cond);
     pthread_mutex_unlock(&slot->mutex);
@@ -455,6 +460,7 @@ start_client_worker(ClientSlot *slot,
     slot->running = 1;
     slot->client_fd = client_fd;
     slot->control_fd = control_fd;
+    slot->transport = VNC_BROKER_TRANSPORT_VNC;
     slot->cfg = cfg;
     slot->frames = frames;
     slot->pipeline_stats = pipeline_stats;
@@ -507,13 +513,200 @@ start_client_worker(ClientSlot *slot,
     return 0;
 }
 
+static int
+claim_web_control_slot(ClientSlot *slot,
+                       int control_fd,
+                       const char *peer_addr,
+                       const char *session_id,
+                       const RuntimeConfig *cfg)
+{
+    pthread_mutex_lock(&slot->mutex);
+
+    if (slot->running) {
+        pthread_mutex_unlock(&slot->mutex);
+        return 1;
+    }
+
+    slot->running = 1;
+    slot->client_fd = -1;
+    slot->control_fd = control_fd;
+    slot->transport = VNC_BROKER_TRANSPORT_WEBRTC;
+    slot->cfg = cfg;
+    snprintf(slot->peer_addr,
+             sizeof(slot->peer_addr),
+             "%s",
+             peer_addr ? peer_addr : "unknown");
+    snprintf(slot->session_id,
+             sizeof(slot->session_id),
+             "%s",
+             session_id ? session_id : "");
+
+    pthread_mutex_unlock(&slot->mutex);
+
+    if (shutdown_signal_register_fd(control_fd) < 0) {
+        pthread_mutex_lock(&slot->mutex);
+        slot->running = 0;
+        slot->control_fd = -1;
+        slot->transport = VNC_BROKER_TRANSPORT_LEGACY_VNC;
+        slot->session_id[0] = '\0';
+        pthread_cond_broadcast(&slot->cond);
+        pthread_mutex_unlock(&slot->mutex);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void
+release_web_control_slot(ClientSlot *slot, int control_fd)
+{
+    shutdown_signal_unregister_fd(control_fd);
+
+    pthread_mutex_lock(&slot->mutex);
+    if (slot->control_fd == control_fd) {
+        slot->client_fd = -1;
+        slot->control_fd = -1;
+        slot->transport = VNC_BROKER_TRANSPORT_LEGACY_VNC;
+        slot->session_id[0] = '\0';
+        slot->running = 0;
+        pthread_cond_broadcast(&slot->cond);
+    }
+    pthread_mutex_unlock(&slot->mutex);
+}
+
+static void
+wait_for_web_control_end(int control_fd)
+{
+    for (;;) {
+        uint8_t payload[VNC_BROKER_CONTROL_PAYLOAD_MAX];
+        VncBrokerControlType type;
+        size_t payload_len = 0;
+
+        if (vnc_broker_recv_control(control_fd,
+                                    &type,
+                                    payload,
+                                    sizeof(payload),
+                                    &payload_len) < 0) {
+            return;
+        }
+
+        if (type == VNC_BROKER_CONTROL_REVOKE && payload_len == 0)
+            return;
+
+        /* SDP/ICE will be handled here when the WebRTC media backend lands. */
+        LOG_DEBUG("Ignoring unsupported WebRTC control message type=%u payload=%zu",
+                  (unsigned)type,
+                  payload_len);
+    }
+}
+
+static void
+serve_web_control_session(int control_fd,
+                          const VncBrokerHandoff *handoff,
+                          const RuntimeConfig *cfg,
+                          ClientSlot *slot)
+{
+    int claim_rc = claim_web_control_slot(slot,
+                                          control_fd,
+                                          handoff->peer_addr,
+                                          handoff->session_id,
+                                          cfg);
+    if (claim_rc != 0) {
+        LOG_INFO("Agent rejected WebRTC handoff for %s: local session already busy",
+                 handoff->peer_addr);
+        (void)vnc_broker_send_web_auth_result(control_fd,
+                                              VNC_BROKER_WEB_AUTH_ERROR);
+        (void)shutdown(control_fd, SHUT_RDWR);
+        close(control_fd);
+        return;
+    }
+
+    VncBrokerWebAuthRequest request;
+    memset(&request, 0, sizeof(request));
+
+    VncBrokerWebAuthResult result = VNC_BROKER_WEB_AUTH_ERROR;
+
+    if (vnc_broker_recv_web_auth_request(control_fd, &request) < 0) {
+        LOG_ERROR("Invalid WebRTC authentication request from broker: %s",
+                  strerror(errno));
+        goto respond;
+    }
+
+    struct passwd *pw = getpwuid(getuid());
+    if (!pw || !pw->pw_name) {
+        LOG_ERROR("Cannot resolve local Unix account for WebRTC authentication");
+        goto respond;
+    }
+
+    /*
+     * Duplicate the auth-helper's SO_PEERCRED account binding at the agent
+     * boundary so a mismatched browser username is rejected before PAM.
+     */
+    if (strcmp(request.username, pw->pw_name) != 0) {
+        LOG_INFO("Rejected WebRTC authentication for user '%s': agent belongs to '%s'",
+                 request.username,
+                 pw->pw_name);
+        result = VNC_BROKER_WEB_AUTH_DENIED;
+        goto respond;
+    }
+
+    if (io_deadline_set_ms(cfg->client_handshake_timeout_ms) < 0) {
+        LOG_ERROR("Could not start WebRTC PAM deadline: %s", strerror(errno));
+        goto respond;
+    }
+
+    int auth_rc = auth_client_check(cfg->auth_socket,
+                                    request.username,
+                                    request.password);
+    io_deadline_clear();
+
+    if (auth_rc == 1)
+        result = VNC_BROKER_WEB_AUTH_OK;
+    else if (auth_rc == 0)
+        result = VNC_BROKER_WEB_AUTH_DENIED;
+    else
+        result = VNC_BROKER_WEB_AUTH_ERROR;
+
+respond:
+    if (vnc_broker_send_web_auth_result(control_fd, result) < 0) {
+        LOG_DEBUG("Could not return WebRTC authentication result to broker: %s",
+                  strerror(errno));
+        result = VNC_BROKER_WEB_AUTH_ERROR;
+    }
+
+    vnc_broker_web_auth_request_clear(&request);
+
+    if (result == VNC_BROKER_WEB_AUTH_OK) {
+        LOG_INFO("WebRTC browser authenticated for active user; peer=%s logind-session=%s",
+                 handoff->peer_addr,
+                 handoff->session_id);
+
+        /*
+         * Keep the exact broker control channel as the lifetime authority.
+         * Closing/revoking it tears down this local slot immediately. The
+         * future webrtcbin session will live inside this same interval.
+         */
+        wait_for_web_control_end(control_fd);
+    }
+
+    (void)shutdown(control_fd, SHUT_RDWR);
+    close(control_fd);
+    release_web_control_slot(slot, control_fd);
+
+    LOG_INFO("WebRTC control session ended: %s", handoff->peer_addr);
+}
+
 static void
 wait_for_client_slot(ClientSlot *slot)
 {
     pthread_mutex_lock(&slot->mutex);
 
-    if (slot->running && slot->client_fd >= 0)
-        (void)shutdown(slot->client_fd, SHUT_RDWR);
+    if (slot->running) {
+        if (slot->client_fd >= 0)
+            (void)shutdown(slot->client_fd, SHUT_RDWR);
+        if (slot->control_fd >= 0)
+            (void)shutdown(slot->control_fd, SHUT_RDWR);
+    }
 
     while (slot->running)
         pthread_cond_wait(&slot->cond, &slot->mutex);
@@ -724,9 +917,26 @@ handle_broker_handoff(int control_fd,
         LOG_ERROR("Rejected broker handoff for uid=%lu; agent uid=%lu",
                   (unsigned long)handoff.uid,
                   (unsigned long)getuid());
-        (void)vnc_broker_send_status(control_fd, VNC_BROKER_STATUS_REJECT);
-        close(client_fd);
+        if (handoff.transport == VNC_BROKER_TRANSPORT_WEBRTC)
+            (void)vnc_broker_send_web_auth_result(control_fd,
+                                                  VNC_BROKER_WEB_AUTH_ERROR);
+        else
+            (void)vnc_broker_send_status(control_fd, VNC_BROKER_STATUS_REJECT);
+        if (client_fd >= 0)
+            close(client_fd);
         return -1;
+    }
+
+    if (handoff.transport == VNC_BROKER_TRANSPORT_WEBRTC) {
+        if (client_fd >= 0) {
+            LOG_ERROR("Rejected WebRTC broker handoff carrying an unexpected client fd");
+            close(client_fd);
+            return -1;
+        }
+
+        /* This synchronous handler owns/closes control_fd before returning. */
+        serve_web_control_session(control_fd, &handoff, cfg, client_slot);
+        return 2;
     }
 
     int start_rc = start_client_worker(client_slot,
@@ -775,7 +985,7 @@ run_agent_listener(const RuntimeConfig *cfg,
     if (shutdown_signal_register_fd(listen_fd) < 0)
         LOG_DEBUG("Could not register agent listener for shutdown");
 
-    LOG_INFO("VNC Monitor %s agent ready at %s; public TCP listener is owned by system broker",
+    LOG_INFO("VNC Monitor %s agent ready at %s; public VNC/HTTPS listeners are owned by system broker",
              VNC_MONITOR_VERSION,
              socket_path);
 
@@ -826,6 +1036,7 @@ run_agent_listener(const RuntimeConfig *cfg,
 
         if (handoff_rc <= 0)
             close(control_fd);
+        /* handoff_rc==1: VNC worker owns fd; ==2: Web handler already closed it. */
     }
 
     shutdown_signal_unregister_fd(listen_fd);
@@ -920,6 +1131,7 @@ main(int argc, char **argv)
     memset(&client_slot, 0, sizeof(client_slot));
     client_slot.client_fd = -1;
     client_slot.control_fd = -1;
+    client_slot.transport = VNC_BROKER_TRANSPORT_LEGACY_VNC;
 
     int mutex_rc = pthread_mutex_init(&client_slot.mutex, NULL);
     if (mutex_rc != 0) {
