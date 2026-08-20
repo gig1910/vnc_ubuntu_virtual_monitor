@@ -61,22 +61,34 @@ create_public_listener(const RuntimeConfig *cfg)
     return fd;
 }
 
-static void
+static int
 set_client_socket_option(int fd,
                          int level,
                          int option,
                          int value,
-                         const char *name)
+                         const char *name,
+                         int required)
 {
-    if (setsockopt(fd, level, option, &value, sizeof(value)) < 0) {
+    if (setsockopt(fd, level, option, &value, sizeof(value)) == 0)
+        return 0;
+
+    if (required) {
+        LOG_ERROR("Could not set required client %s=%d: %s",
+                  name,
+                  value,
+                  strerror(errno));
+    }
+    else {
         LOG_DEBUG("Could not set client %s=%d: %s",
                   name,
                   value,
                   strerror(errno));
     }
+
+    return -1;
 }
 
-static void
+static int
 set_client_io_timeout(int client_fd, int timeout_ms)
 {
     struct timeval timeout = {
@@ -89,9 +101,10 @@ set_client_io_timeout(int client_fd, int timeout_ms)
                    SO_RCVTIMEO,
                    &timeout,
                    sizeof(timeout)) < 0) {
-        LOG_DEBUG("Could not set RA2 handshake SO_RCVTIMEO=%dms: %s",
+        LOG_ERROR("Could not set required RA2 handshake SO_RCVTIMEO=%dms: %s",
                   timeout_ms,
                   strerror(errno));
+        return -1;
     }
 
     if (setsockopt(client_fd,
@@ -99,10 +112,13 @@ set_client_io_timeout(int client_fd, int timeout_ms)
                    SO_SNDTIMEO,
                    &timeout,
                    sizeof(timeout)) < 0) {
-        LOG_DEBUG("Could not set RA2 handshake SO_SNDTIMEO=%dms: %s",
+        LOG_ERROR("Could not set required RA2 handshake SO_SNDTIMEO=%dms: %s",
                   timeout_ms,
                   strerror(errno));
+        return -1;
     }
+
+    return 0;
 }
 
 static void
@@ -127,69 +143,81 @@ clear_client_io_timeout(int client_fd)
     }
 }
 
-static void
+static int
 configure_external_socket(int client_fd, const RuntimeConfig *cfg)
 {
-    set_client_socket_option(client_fd,
-                             SOL_SOCKET,
-                             SO_SNDBUF,
-                             cfg->external_send_buffer,
-                             "SO_SNDBUF");
+    (void)set_client_socket_option(client_fd,
+                                   SOL_SOCKET,
+                                   SO_SNDBUF,
+                                   cfg->external_send_buffer,
+                                   "SO_SNDBUF",
+                                   0);
 
     /*
      * Detect a vanished Wi-Fi/LAN peer even when the framebuffer is static.
      * This is deliberately TCP liveness, not an application-idle timeout:
      * healthy viewers may stay connected indefinitely without RFB activity.
      */
-    set_client_socket_option(client_fd,
-                             SOL_SOCKET,
-                             SO_KEEPALIVE,
-                             1,
-                             "SO_KEEPALIVE");
-    set_client_socket_option(client_fd,
-                             IPPROTO_TCP,
-                             TCP_KEEPIDLE,
-                             cfg->client_keepalive_idle_s,
-                             "TCP_KEEPIDLE");
-    set_client_socket_option(client_fd,
-                             IPPROTO_TCP,
-                             TCP_KEEPINTVL,
-                             cfg->client_keepalive_interval_s,
-                             "TCP_KEEPINTVL");
-    set_client_socket_option(client_fd,
-                             IPPROTO_TCP,
-                             TCP_KEEPCNT,
-                             cfg->client_keepalive_probes,
-                             "TCP_KEEPCNT");
-#ifdef TCP_USER_TIMEOUT
-    set_client_socket_option(client_fd,
-                             IPPROTO_TCP,
-                             TCP_USER_TIMEOUT,
-                             cfg->client_user_timeout_ms,
-                             "TCP_USER_TIMEOUT");
-#endif
-
-    if (!vnc_log_enabled(VNC_LOG_DEBUG))
-        return;
-
-    int actual = 0;
-    socklen_t actual_len = sizeof(actual);
-    if (getsockopt(client_fd,
-                   SOL_SOCKET,
-                   SO_SNDBUF,
-                   &actual,
-                   &actual_len) == 0) {
-        LOG_DEBUG("External TCP send buffer: requested=%d actual=%d bytes",
-                  cfg->external_send_buffer,
-                  actual);
+    if (set_client_socket_option(client_fd,
+                                 SOL_SOCKET,
+                                 SO_KEEPALIVE,
+                                 1,
+                                 "SO_KEEPALIVE",
+                                 1) < 0 ||
+        set_client_socket_option(client_fd,
+                                 IPPROTO_TCP,
+                                 TCP_KEEPIDLE,
+                                 cfg->client_keepalive_idle_s,
+                                 "TCP_KEEPIDLE",
+                                 1) < 0 ||
+        set_client_socket_option(client_fd,
+                                 IPPROTO_TCP,
+                                 TCP_KEEPINTVL,
+                                 cfg->client_keepalive_interval_s,
+                                 "TCP_KEEPINTVL",
+                                 1) < 0 ||
+        set_client_socket_option(client_fd,
+                                 IPPROTO_TCP,
+                                 TCP_KEEPCNT,
+                                 cfg->client_keepalive_probes,
+                                 "TCP_KEEPCNT",
+                                 1) < 0) {
+        return -1;
     }
 
-    LOG_DEBUG("Client liveness: keepalive idle=%ds interval=%ds probes=%d user-timeout=%dms handshake-timeout=%dms",
-              cfg->client_keepalive_idle_s,
-              cfg->client_keepalive_interval_s,
-              cfg->client_keepalive_probes,
-              cfg->client_user_timeout_ms,
-              cfg->client_handshake_timeout_ms);
+#ifdef TCP_USER_TIMEOUT
+    if (set_client_socket_option(client_fd,
+                                 IPPROTO_TCP,
+                                 TCP_USER_TIMEOUT,
+                                 cfg->client_user_timeout_ms,
+                                 "TCP_USER_TIMEOUT",
+                                 1) < 0) {
+        return -1;
+    }
+#endif
+
+    if (vnc_log_enabled(VNC_LOG_DEBUG)) {
+        int actual = 0;
+        socklen_t actual_len = sizeof(actual);
+        if (getsockopt(client_fd,
+                       SOL_SOCKET,
+                       SO_SNDBUF,
+                       &actual,
+                       &actual_len) == 0) {
+            LOG_DEBUG("External TCP send buffer: requested=%d actual=%d bytes",
+                      cfg->external_send_buffer,
+                      actual);
+        }
+
+        LOG_DEBUG("Client liveness: keepalive idle=%ds interval=%ds probes=%d user-timeout=%dms handshake-timeout=%dms",
+                  cfg->client_keepalive_idle_s,
+                  cfg->client_keepalive_interval_s,
+                  cfg->client_keepalive_probes,
+                  cfg->client_user_timeout_ms,
+                  cfg->client_handshake_timeout_ms);
+    }
+
+    return 0;
 }
 
 static void
@@ -222,7 +250,8 @@ serve_client(int client_fd,
      * slot forever. The timeout applies only to the unauthenticated RA2/PAM
      * handshake and is removed before the long-lived RFB session begins.
      */
-    set_client_io_timeout(client_fd, cfg.client_handshake_timeout_ms);
+    if (set_client_io_timeout(client_fd, cfg.client_handshake_timeout_ms) < 0)
+        return;
 
     if (ra2_server_handshake(client_fd, &session, &cfg) < 0) {
         clear_client_io_timeout(client_fd);
@@ -325,6 +354,18 @@ client_worker(void *arg)
     return NULL;
 }
 
+static void
+release_unstarted_client_slot(ClientSlot *slot, int client_fd)
+{
+    shutdown_signal_unregister_fd(client_fd);
+
+    pthread_mutex_lock(&slot->mutex);
+    slot->running = 0;
+    slot->client_fd = -1;
+    pthread_cond_broadcast(&slot->cond);
+    pthread_mutex_unlock(&slot->mutex);
+}
+
 static int
 start_client_worker(ClientSlot *slot,
                     int client_fd,
@@ -355,17 +396,16 @@ start_client_worker(ClientSlot *slot,
     if (shutdown_signal_register_fd(client_fd) < 0)
         LOG_DEBUG("Could not register client socket for shutdown");
 
-    configure_external_socket(client_fd, cfg);
+    if (configure_external_socket(client_fd, cfg) < 0) {
+        release_unstarted_client_slot(slot, client_fd);
+        errno = EIO;
+        return -1;
+    }
 
     pthread_attr_t attr;
     int rc = pthread_attr_init(&attr);
     if (rc != 0) {
-        shutdown_signal_unregister_fd(client_fd);
-        pthread_mutex_lock(&slot->mutex);
-        slot->running = 0;
-        slot->client_fd = -1;
-        pthread_cond_broadcast(&slot->cond);
-        pthread_mutex_unlock(&slot->mutex);
+        release_unstarted_client_slot(slot, client_fd);
         errno = rc;
         return -1;
     }
@@ -373,12 +413,7 @@ start_client_worker(ClientSlot *slot,
     rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     if (rc != 0) {
         pthread_attr_destroy(&attr);
-        shutdown_signal_unregister_fd(client_fd);
-        pthread_mutex_lock(&slot->mutex);
-        slot->running = 0;
-        slot->client_fd = -1;
-        pthread_cond_broadcast(&slot->cond);
-        pthread_mutex_unlock(&slot->mutex);
+        release_unstarted_client_slot(slot, client_fd);
         errno = rc;
         return -1;
     }
@@ -388,12 +423,7 @@ start_client_worker(ClientSlot *slot,
     pthread_attr_destroy(&attr);
 
     if (rc != 0) {
-        shutdown_signal_unregister_fd(client_fd);
-        pthread_mutex_lock(&slot->mutex);
-        slot->running = 0;
-        slot->client_fd = -1;
-        pthread_cond_broadcast(&slot->cond);
-        pthread_mutex_unlock(&slot->mutex);
+        release_unstarted_client_slot(slot, client_fd);
         errno = rc;
         return -1;
     }
@@ -566,7 +596,7 @@ main(int argc, char **argv)
         }
 
         if (start_rc < 0) {
-            LOG_ERROR("Could not start client session for %s: %s",
+            LOG_ERROR("Could not start protected client session for %s: %s",
                       peer_addr,
                       strerror(errno));
             close(client_fd);
