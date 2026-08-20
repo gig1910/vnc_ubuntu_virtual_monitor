@@ -2,8 +2,42 @@
 #include "shutdown_signal.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
+
+static int
+socket_wait_timeout_ms(int fd, short events)
+{
+    int option = events & POLLOUT ? SO_SNDTIMEO : SO_RCVTIMEO;
+    struct timeval timeout = {0};
+    socklen_t timeout_len = sizeof(timeout);
+
+    if (getsockopt(fd,
+                   SOL_SOCKET,
+                   option,
+                   &timeout,
+                   &timeout_len) < 0) {
+        /* Non-socket descriptors keep the historical infinite wait. */
+        return -1;
+    }
+
+    if (timeout.tv_sec == 0 && timeout.tv_usec == 0)
+        return -1;
+
+    long long timeout_ms =
+        (long long)timeout.tv_sec * 1000LL +
+        ((long long)timeout.tv_usec + 999LL) / 1000LL;
+
+    if (timeout_ms < 1)
+        timeout_ms = 1;
+    if (timeout_ms > INT_MAX)
+        timeout_ms = INT_MAX;
+
+    return (int)timeout_ms;
+}
 
 static int
 wait_fd_or_shutdown(
@@ -32,12 +66,26 @@ wait_fd_or_shutdown(
             nfds = 2;
         }
 
-        int rc = poll(fds, nfds, -1);
+        /*
+         * Our I/O wrapper normally waits indefinitely and is interrupted by
+         * the process shutdown pipe. When a socket has SO_RCVTIMEO/SO_SNDTIMEO
+         * configured (currently the unauthenticated RA2/PAM phase), honor the
+         * same timeout in poll() as well. Otherwise a silent peer could block
+         * forever before read()/write() gets a chance to observe the socket
+         * timeout.
+         */
+        int timeout_ms = socket_wait_timeout_ms(fd, events);
+        int rc = poll(fds, nfds, timeout_ms);
 
         if (rc < 0) {
             if (errno == EINTR)
                 continue;
 
+            return -1;
+        }
+
+        if (rc == 0) {
+            errno = EAGAIN;
             return -1;
         }
 
