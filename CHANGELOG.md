@@ -4,7 +4,7 @@ All notable project milestones are summarized here. Development commits before t
 
 ## 0.1.0-beta.2 — 2026-08-20
 
-Configuration and dynamic-display release.
+Configuration, dynamic-display and single-session hardening release.
 
 ### Added
 
@@ -18,13 +18,19 @@ Configuration and dynamic-display release.
 - transactional Mutter/PipeWire + FrameBridge + adaptive-transport + RFB framebuffer resize;
 - CopyRect reference reallocation/invalidation after resize while preserving negotiated JPEG21 capability;
 - dimension-specific layout-cache refresh after a successful resize;
-- effective-config output at the end of `install.sh`.
+- effective-config output at the end of `install.sh`;
+- explicit **strong single-connect** session ownership: one active viewer owns the virtual monitor and additional connections are immediately reset/rejected;
+- external-client TCP liveness protection using `SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT` and `TCP_USER_TIMEOUT` when available;
+- configurable dead-peer timing under `[network]` with defaults `15s / 5s / 3 probes / 20000ms`.
 
 ### Changed
 
 - `display.width` / `display.height` are initial/fallback dimensions in `auto` mode and exact dimensions in `fixed` mode;
 - the internal LibVNCServer backend is now session-scoped: loopback TCP/5903 exists only after RA2r/PAM authentication and is removed on disconnect;
 - client-requested size changes are session-local and do not mutate the persistent fallback used by the next viewer;
+- the public listener remains responsive during the active session solely to reject extra clients immediately; this does not enable multi-client streaming;
+- a lost/half-open active TCP peer now tears itself down through kernel liveness detection instead of potentially holding the only session slot indefinitely;
+- daemon shutdown waits for the only active client worker to finish before shared framebuffer/statistics state is destroyed;
 - systemd user service starts the daemon with the persistent config instead of hard-coding log level arguments;
 - installer creates the default config once and preserves local edits on later upgrades;
 - installer continues to use `nproc` parallelism and dependency preflight before build/install.
