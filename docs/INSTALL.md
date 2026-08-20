@@ -4,41 +4,40 @@ This document describes the supported `0.1.0-beta.2` deployment model on a GNOME
 
 ## Runtime model
 
-VNC Monitor is split deliberately into two privilege domains:
+VNC Monitor is split into two privilege domains:
 
-- `vnc-monitor.service` is a **systemd user service**. It runs as the logged-in GNOME user so it can reach the session D-Bus, Mutter RemoteDesktop/ScreenCast interfaces and PipeWire.
-- `vnc-monitor-auth.socket` and `vnc-monitor-auth@.service` are **system units**. They expose the small privileged PAM authentication helper through `/run/vnc-monitor-auth.sock`.
+- `vnc-monitor.service` is a **systemd user service** running as the logged-in GNOME user so it can reach session D-Bus, Mutter RemoteDesktop/ScreenCast and PipeWire;
+- `vnc-monitor-auth.socket` + `vnc-monitor-auth@.service` are **system units** exposing the small privileged PAM helper through `/run/vnc-monitor-auth.sock`.
 
-Do not convert the main daemon to a root system service. Doing so breaks the session ownership model and is not a supported installation.
+Do not convert the main daemon to a root system service.
 
-The internal LibVNCServer backend is session-scoped in beta.2: `127.0.0.1:5903` is opened only after a viewer has completed RA2r/PAM authentication and is closed on disconnect.
+The public server is intentionally **STRONG SINGLE CONNECT**. Exactly one accepted viewer owns the display session. The public listener remains responsive while that session runs only so additional connections can be immediately reset/rejected.
 
-The public server policy is **strong single-connect**: exactly one viewer may own the virtual monitor. While that session runs, the public listener remains responsive only so extra connection attempts can be rejected immediately instead of waiting in the listen backlog.
+The internal LibVNCServer backend is session-scoped: `127.0.0.1:5903` exists only after successful RA2r/PAM authentication and is removed on disconnect.
 
 ## Unified installer
 
-The preferred installation/upgrade entrypoint is:
+Run from the repository as the logged-in GNOME desktop user:
 
 ```bash
 ./install.sh
 ```
 
-Run it as the logged-in GNOME desktop user, **not** through `sudo`.
+Do **not** run it through `sudo`. The script invokes `sudo` itself only for the PAM helper and system units.
 
 The installer:
 
-1. performs dependency preflight before compilation or service changes;
-2. builds `vnc-monitor`, the PAM helper and generated PAM socket unit;
-3. creates `~/.config/vnc-monitor/config.ini` from the repository template only when it does not already exist;
-4. installs/updates the PAM helper and its system units using scoped `sudo` operations;
-5. installs `~/.local/bin/vnc-monitor` and the systemd user unit;
-6. restarts the auth socket and user daemon only after successful installation;
-7. prints the effective parsed config and final status of both service layers.
+1. checks all required commands and development libraries before changing anything;
+2. builds the daemon, PAM helper and generated PAM socket unit;
+3. creates `~/.config/vnc-monitor/config.ini` only when it does not already exist;
+4. installs/updates both privilege domains;
+5. restarts the auth socket and user daemon only after successful build/install;
+6. prints the effective parsed configuration and final service status.
 
-Default parallelism is the number of logical CPUs reported by `nproc`:
+Default parallelism is:
 
-```bash
-./install.sh
+```text
+make -j"$(nproc)"
 ```
 
 Clean rebuild:
@@ -47,7 +46,7 @@ Clean rebuild:
 ./install.sh --clean
 ```
 
-Override parallelism only when needed:
+Optional manual limit:
 
 ```bash
 ./install.sh --jobs 8
@@ -55,25 +54,13 @@ Override parallelism only when needed:
 JOBS=8 ./install.sh
 ```
 
-The installer intentionally does **not** run `git pull`; updating source code and installing it remain separate operations.
+The installer intentionally does not run `git pull`.
 
 ## Dependency preflight
 
-`install.sh` verifies dependencies before it runs `make`.
+Required commands include `make`, `cc`, `pkg-config`, `nproc`, `mktemp`, `install`, `sed`, `systemctl` and `sudo`.
 
-Required commands:
-
-- `make`;
-- `cc`;
-- `pkg-config`;
-- `nproc`;
-- `mktemp`;
-- `install`;
-- `sed`;
-- `systemctl`;
-- `sudo`.
-
-The following development libraries are checked through `pkg-config --exists` and their versions are printed:
+The following development modules are verified through `pkg-config --exists` and their versions are printed:
 
 - `libvncserver`;
 - `openssl`;
@@ -97,7 +84,7 @@ sudo apt install \
   libpipewire-0.3-dev libjpeg-dev libpam0g-dev
 ```
 
-The probes, rather than package names, are authoritative.
+The probes, not the package names, are authoritative.
 
 ## Install / upgrade
 
@@ -107,11 +94,16 @@ git pull --ff-only
 ./install.sh
 ```
 
-The build defaults to `make -j"$(nproc)"`. `-MMD -MP` dependency files make ordinary incremental upgrades sufficient.
+The installer is idempotent for an existing deployment. It does not uninstall first: the old daemon keeps running during compilation, files are replaced only after a successful build, and then the installed services are restarted.
 
-The installer is idempotent for an existing deployment. It does not uninstall first: the old daemon keeps running while the new version is compiled; files are replaced only after successful build, then both service layers are restarted.
+An active VNC connection is naturally disconnected by the final daemon restart during an upgrade.
 
-An active VNC session will naturally be disconnected by the final daemon restart during upgrade.
+Because beta.2 changes headers and session lifecycle substantially, use one clean build when first moving to it:
+
+```bash
+git pull --ff-only
+./install.sh --clean
+```
 
 ## Persistent configuration
 
@@ -127,7 +119,7 @@ Installed file:
 ~/.config/vnc-monitor/config.ini
 ```
 
-The installed file is mode `0600`. It is **created once and preserved on upgrades**.
+The installed file is mode `0600` and is **created once, then preserved on upgrades**.
 
 Configuration precedence:
 
@@ -135,7 +127,7 @@ Configuration precedence:
 built-in defaults < config.ini < command-line options
 ```
 
-The systemd service starts:
+The user service starts:
 
 ```text
 %h/.local/bin/vnc-monitor --config %h/.config/vnc-monitor/config.ini
@@ -149,7 +141,7 @@ Show the effective configuration without starting a server:
   --show-config
 ```
 
-The parser is intentionally strict: unknown sections/keys and invalid values are startup errors rather than silently ignored settings.
+The parser is strict: unknown sections/keys and invalid values are startup errors.
 
 After editing the config:
 
@@ -157,7 +149,7 @@ After editing the config:
 systemctl --user restart vnc-monitor.service
 ```
 
-### Main config sections
+## Supported production config
 
 ```ini
 [capture]
@@ -189,6 +181,7 @@ client-keepalive-idle=15
 client-keepalive-interval=5
 client-keepalive-probes=3
 client-user-timeout-ms=20000
+client-handshake-timeout-ms=60000
 
 [ra2]
 record-size=16384
@@ -201,36 +194,56 @@ auth-socket=/run/vnc-monitor-auth.sock
 level=info
 ```
 
-Paths accept absolute paths, `~/...`, or `$HOME/...`.
+Paths accept absolute paths, `~/...`, and `$HOME/...`.
 
-An existing local config created before the liveness keys were introduced does not need to be rewritten: missing keys inherit the built-in defaults shown above.
+Older installed configs do not have to be rewritten when new optional keys are introduced: missing keys inherit built-in defaults.
 
-## Strong single-connect and lost-client handling
+## Strong single-connect policy
 
-The server does not support concurrent viewers in beta.2. The active connection owns the entire virtual-display session from RA2 negotiation through monitor teardown.
+The slot is reserved immediately at `accept()`, before RA2/PAM completes. Therefore a second connection cannot race the first during authentication.
 
-Unlike the older blocking listener implementation, the public `accept()` loop remains active while the one client session runs. A second connection is accepted only long enough to detect the conflict, then its socket is reset/closed immediately and an `info` log entry reports the rejection. The active viewer is not interrupted.
+The active session runs in one client worker. The main listener continues accepting only to enforce the policy. If another client arrives while the slot is owned, its socket is closed with an immediate reset and an `info` log entry is emitted:
 
-The active external socket is configured with TCP liveness detection before RA2 negotiation:
+```text
+Rejected additional client: ADDRESS (strong single-connect policy)
+```
+
+This is not multi-client support: there is still exactly one virtual monitor, one capture pipeline and one adaptive RFB session.
+
+## Lost-client protection
+
+There are two distinct protections because established and unauthenticated connections fail differently.
+
+### Established session: TCP liveness
+
+The accepted external socket requires:
 
 ```ini
-[network]
 client-keepalive-idle=15
 client-keepalive-interval=5
 client-keepalive-probes=3
 client-user-timeout-ms=20000
 ```
 
-Meaning:
+These map to Linux `SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, and `TCP_USER_TIMEOUT` when available.
 
-- `client-keepalive-idle` — seconds of transport idleness before the kernel starts keepalive probing;
-- `client-keepalive-interval` — seconds between unanswered keepalive probes;
-- `client-keepalive-probes` — number of failed probes allowed;
-- `client-user-timeout-ms` — maximum period for unacknowledged transmitted TCP data (`TCP_USER_TIMEOUT`).
+They are **transport liveness**, not application-idle timers. A healthy viewer displaying a completely static image may remain connected indefinitely because its TCP stack still responds.
 
-These values detect a **dead peer**, not an idle application. A healthy iPad/viewer showing a static image remains connected indefinitely because it continues to answer TCP keepalive probes.
+If Wi-Fi/LAN connectivity disappears without FIN/RST, kernel TCP failure eventually propagates through the RA2 relay. The session worker then stops LibVNCServer, capture and Mutter, and releases the sole client slot.
 
-If Wi-Fi disappears, the client sleeps hard, or the route is otherwise lost without FIN/RST, the kernel eventually reports the socket failure. That causes the RA2 relay to exit, the per-session backend/capture/Mutter monitor to be removed, and the single-client slot to become available again. Exact detection time is kernel/network-state dependent; with the defaults it is intended to be in the order of tens of seconds rather than indefinite.
+Exact wall-clock detection time depends on TCP/network state; the defaults are intended to recover in the order of tens of seconds rather than leave a half-open session indefinitely.
+
+### Unauthenticated/stalled client: handshake deadline
+
+```ini
+client-handshake-timeout-ms=60000
+```
+
+This is one **monotonic deadline** for the bounded handshake `io_*` phase. It is not reset by each individual byte, so a silent or trickle-slow client cannot reserve the sole slot forever.
+
+The deadline participates directly in the project's `poll()`-based I/O wrapper and therefore covers external RA2 reads/writes plus auth-helper request/response waits that use `io_*` in the same worker.
+
+After successful authentication the deadline is cleared completely. The long-lived VNC session is then governed only by TCP liveness, not by an application inactivity timeout.
 
 ## Display size: auto vs fixed
 
@@ -243,27 +256,25 @@ width=1024
 height=768
 ```
 
-`width`/`height` are the initial and fallback size.
+`width` / `height` are the initial/fallback dimensions.
 
-A client that advertises the RFB `ExtendedDesktopSize` pseudo-encoding can send `SetDesktopSize`. For a valid one-screen request, beta.2 transactionally changes:
+A viewer advertising RFB `ExtendedDesktopSize` can send `SetDesktopSize`. For a valid one-screen request beta.2 coordinates:
 
-1. the Mutter virtual monitor/capture;
-2. the FrameBridge storage;
+1. Mutter virtual monitor/capture;
+2. FrameBridge storage;
 3. adaptive JPEG/repair/CopyRect size-dependent state;
-4. the LibVNCServer framebuffer via `rfbNewFramebuffer()`;
-5. the layout-cache context for the new dimensions.
+4. LibVNCServer framebuffer through `rfbNewFramebuffer()`;
+5. dimension-specific layout cache.
 
-The RFB connection remains the same. CopyRect exactness is invalidated and relearned after the resize; JPEG capability negotiation is preserved.
+The RFB connection stays open. JPEG21 capability is preserved; CopyRect exactness/reference state is invalidated and rebuilt for the new dimensions.
 
-If the requested monitor/capture cannot be created, the server attempts to restore the previous size and returns an RFB resize error.
-
-Only one virtual screen spanning the framebuffer is accepted. Multi-screen `SetDesktopSize` layouts are rejected because this project exposes one Mutter virtual monitor per VNC session.
+Only one screen at `(0,0)` spanning the framebuffer is accepted.
 
 ### Older clients
 
-`NewFBSize`/`DesktopSize` support alone lets a viewer **receive** a size change from the server. It does not communicate a preferred size to the server.
+`NewFBSize` / `DesktopSize` (`-223`) only allows a viewer to **receive** a server-side size change. It does not communicate preferred dimensions.
 
-Therefore a viewer that does not advertise `ExtendedDesktopSize` cannot drive auto sizing. Such a client simply receives the configured fallback `width`/`height`.
+A viewer must advertise `ExtendedDesktopSize` (`-308`) and send `SetDesktopSize` to drive auto sizing. Otherwise the configured fallback is used.
 
 ### `mode=fixed`
 
@@ -274,55 +285,44 @@ width=1024
 height=768
 ```
 
-The monitor is always created at the configured dimensions and `SetDesktopSize` requests are rejected with `ResizeProhibited`.
+The configured dimensions are mandatory and client `SetDesktopSize` requests are rejected with `ResizeProhibited`.
 
-## Preserve the existing RA2 identity
+## RA2 identity
 
-Older development versions stored the key as:
-
-```text
-./ra2-server-key.pem
-```
-
-The beta stores it under:
+Current identity path:
 
 ```text
 ~/.config/vnc-monitor/ra2-server-key.pem
 ```
 
-If the installed identity does not yet exist, `make install`/`install.sh` migrates the legacy local key when available. Otherwise the running server creates a persistent identity on first use.
+Older development versions used `./ra2-server-key.pem`. If the installed identity does not yet exist, the installation path migrates the legacy key when available; otherwise the server creates a persistent identity on first use.
 
-The identity file is mode `0600`; the config directory is mode `0700`.
+The identity is mode `0600`; its config directory is mode `0700`.
 
-## Service behaviour
+## Service lifecycle
 
 Idle:
 
 ```text
 public TCP listener active
+no client worker
 no virtual monitor
 no PipeWire capture
 no internal LibVNCServer listener
 ```
 
-Authenticated connection:
+Active:
 
 ```text
+one accepted client owns the slot
 RA2r/PAM
   -> Mutter virtual monitor
   -> PipeWire capture
-  -> per-session LibVNCServer on 127.0.0.1:5903
+  -> per-session LibVNCServer 127.0.0.1:5903
   -> adaptive RFB transport
 ```
 
-While active:
-
-```text
-second client -> immediate reset/reject
-lost active TCP peer -> keepalive/user-timeout -> teardown
-```
-
-Disconnect or detected dead peer tears down the backend, capture and virtual monitor and returns to the public listener.
+On clean disconnect, dead-peer detection, handshake failure/deadline, or daemon shutdown, the session is torn down and the slot becomes available again.
 
 ## Service commands
 
@@ -339,7 +339,7 @@ PAM layer:
 systemctl status vnc-monitor-auth.socket
 ```
 
-or:
+Combined project helper:
 
 ```bash
 make status-support
@@ -347,43 +347,45 @@ make status-support
 
 ## Logging
 
-Prefer the config:
+Configure normally through:
 
 ```ini
 [logging]
 level=debug
 ```
 
-then restart the user service. Available values are `error`, `info`, `debug`, and `trace` (or `0..3`). Use `trace` only for short diagnostics.
+Values: `error`, `info`, `debug`, `trace` or `0..3`.
 
-At `info`, rejected extra clients are visible. At `debug`, the effective TCP keepalive/user-timeout values are also logged when a client socket is accepted.
+At `info`, lifecycle and rejected extra clients are visible. At `debug`, negotiated capture/transport state and effective TCP liveness/deadline values are shown. Use `trace` only for short diagnostics.
 
-CLI `--verbose` still overrides the config for foreground tests.
+CLI `--verbose` overrides the file for foreground tests.
 
 ## Firewall
 
-The external viewer connects to `network.port` (TCP/5901 by default). The internal backend binds to `network.backend-bind:backend-port` (default `127.0.0.1:5903`) only during an authenticated session and must not be exposed externally.
+The external viewer connects to `[network] port` (TCP/5901 by default). The internal backend uses `[network] backend-bind:backend-port` (`127.0.0.1:5903` by default) only during an authenticated session and must not be exposed externally.
 
 ## Layout cache
 
-The monitor layout cache uses Mutter `org.gnome.Mutter.DisplayConfig` state and retains its historical `~/.config/vnc-monitor-server/` namespace during beta stabilization.
+Mutter layout state remains under the historical beta namespace:
 
-A separate cache file is keyed by framebuffer dimensions, so a newly requested client size can have its own remembered GNOME placement.
+```text
+~/.config/vnc-monitor-server/
+```
+
+Cache files are dimension-specific, so newly requested framebuffer sizes can learn independent GNOME placement.
 
 ## Manual development install
-
-The low-level targets remain available:
 
 ```bash
 make -j"$(nproc)"
 make install-service
 ```
 
-For normal deployment prefer `./install.sh`, which adds dependency preflight, deterministic restart and effective-config output.
+For normal deployment prefer `./install.sh` because it also performs dependency preflight, deterministic upgrade restart and effective-config validation.
 
 ## Uninstall
 
-Remove the user daemon/service while preserving config/identity/layout:
+Remove user daemon/service while preserving config/identity/layout:
 
 ```bash
 make uninstall-service
@@ -395,10 +397,10 @@ Remove PAM support separately:
 make uninstall-pam-service
 ```
 
-Delete all user configuration, identity and layout only when explicitly intended:
+Delete user config, identity and layout only when explicitly intended:
 
 ```bash
 make purge-config
 ```
 
-Changing/deleting the RA2 identity may require a viewer to accept a new server key.
+Deleting/changing the RA2 identity can require the viewer to accept a new server key.
