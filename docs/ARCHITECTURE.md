@@ -163,23 +163,28 @@ On publish it composes the premultiplied RGBA cursor over the BGRx base. Cursor-
 
 ## Persistent configuration
 
-The systemd user service reads:
+Runtime configuration is layered in this order:
 
 ```text
-~/.config/vnc-monitor/config.ini
+built-in defaults
+    < /etc/vnc-monitor/config.ini
+    < ~/.config/vnc-monitor/config.ini
+    < CLI
 ```
 
-Precedence:
+The system file is optional for source installs and is installed as a conffile by the `.deb`. The user file is also optional; source install creates it once and preserves it on upgrades, while package install leaves user homes untouched.
+
+`--config FILE` replaces the normal user override path but does **not** suppress the system baseline:
 
 ```text
-built-in defaults < config.ini < CLI
+built-ins < /etc/vnc-monitor/config.ini < --config FILE < CLI
 ```
 
 Runtime strings are copied into owned `RuntimeConfig` storage; they do not point into parser-temporary data.
 
 The INI parser is strict. Unknown keys/sections and invalid values prevent startup.
 
-The installer creates the config once from `config/vnc-monitor.conf` and preserves the installed copy during upgrades.
+This split keeps machine-wide defaults under `/etc` while preserving per-user RA2 identity, layout and optional overrides under the user's home directory.
 
 ## Dynamic display sizing
 
@@ -312,9 +317,13 @@ The previously observed stale-repair-tile race when motion resumes remains a tra
 
 `vnc-monitor.service` runs under the user systemd manager because it must share the logged-in GNOME Wayland session and access session D-Bus/PipeWire.
 
+Source installs place the unit in `~/.config/systemd/user/` and run `~/.local/bin/vnc-monitor`. Binary packages place the unit in `/usr/lib/systemd/user/` and run `/usr/bin/vnc-monitor`.
+
 ### PAM helper
 
 Authentication remains a narrow privileged system socket/service. The main VNC daemon itself is not root.
+
+The package-installed socket is generic rather than bound to the username of the package builder. The helper validates the local peer with `SO_PEERCRED` and only permits PAM authentication for the same Unix username as the connecting process.
 
 ## Future protocol backends
 
