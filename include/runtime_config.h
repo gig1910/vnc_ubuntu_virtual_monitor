@@ -1,6 +1,8 @@
 #ifndef VNC_MONITOR_RUNTIME_CONFIG_H
 #define VNC_MONITOR_RUNTIME_CONFIG_H
 
+#include <limits.h>
+
 typedef enum {
     CAPTURE_BACKEND_PIPEWIRE = 0,
     CAPTURE_BACKEND_GSTREAMER
@@ -11,6 +13,11 @@ typedef enum {
     MUTTER_CURSOR_EMBEDDED = 1,
     MUTTER_CURSOR_METADATA = 2
 } MutterCursorMode;
+
+typedef enum {
+    SCREEN_SIZE_AUTO = 0,
+    SCREEN_SIZE_FIXED = 1
+} ScreenSizeMode;
 
 typedef struct {
     CaptureBackend capture_backend;
@@ -38,9 +45,17 @@ typedef struct {
 
     int public_port;
     int backend_port;
+
+    /*
+     * AUTO: width/height are the initial/fallback size. A client that
+     * supports ExtendedDesktopSize may request another size during the
+     * session. FIXED: client resize requests are rejected.
+     */
+    ScreenSizeMode screen_size_mode;
     int width;
     int height;
     int max_fps;
+
     int ra2_stream_record_max;
     int ra2_coalesce;
     int ra2_coalesce_us;
@@ -57,9 +72,11 @@ typedef struct {
 
     int verbose;
 
-    const char *auth_socket;
-    const char *ra2_key_file;
-    const char *backend_bind;
+    /* Owned storage: config/CLI strings never point into temporary buffers. */
+    char config_file[PATH_MAX];
+    char auth_socket[PATH_MAX];
+    char ra2_key_file[PATH_MAX];
+    char backend_bind[64];
 } RuntimeConfig;
 
 void runtime_config_defaults(RuntimeConfig *cfg);
@@ -69,5 +86,6 @@ void runtime_config_usage(const char *argv0);
 
 const char *runtime_config_capture_backend_name(CaptureBackend backend);
 const char *runtime_config_mutter_cursor_name(MutterCursorMode mode);
+const char *runtime_config_screen_size_mode_name(ScreenSizeMode mode);
 
 #endif
