@@ -1,0 +1,51 @@
+name: WebRTC hybrid CI
+
+on:
+  push:
+    branches:
+      - feature/webrtc-hybrid
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            dpkg-dev \
+            libvncserver-dev \
+            libssl-dev \
+            nettle-dev \
+            libglib2.0-dev \
+            libsoup-3.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libpipewire-0.3-dev \
+            libjpeg-dev \
+            libpam0g-dev \
+            ca-certificates
+
+      - name: Clean compile
+        run: |
+          make clean
+          make -j"$(nproc)" all auth-helper
+
+      - name: Build and verify Debian package
+        run: |
+          ./build-deb.sh --clean --jobs "$(nproc)"
