@@ -2,17 +2,54 @@
 
 All notable project milestones are summarized here. Development commits before the beta checkpoint were intentionally experimental and are condensed by behavior rather than reproduced commit-by-commit.
 
-## Unreleased — Debian packaging
+## 0.1.0-beta.3 — 2026-08-20
 
-- added executable `build-deb.sh` for rootless binary `.deb` builds using `make -j"$(nproc)"`;
-- added packaging preflight for compiler/library and `dpkg` tooling without leaking build dependencies into the binary package;
-- runtime shared-library dependencies are generated from the compiled ELF files through `dpkg-shlibdeps`;
+System-broker / per-user-agent security architecture.
+
+### Added
+
+- `vnc-monitor-broker`, a small root system service that owns the machine-wide public VNC listener;
+- logind `seat0.ActiveSession` routing: only the current active local `Class=user`, `Type=wayland`, `Remote=false` session is attachable;
+- exact VNC connection binding to logind **Session ID + UID**, not merely a Unix username;
+- Unix `SOCK_SEQPACKET` broker/agent control channel under `$XDG_RUNTIME_DIR/vnc-monitor/agent.sock`;
+- zero-copy TCP ownership handoff from broker to agent through `SCM_RIGHTS`;
+- broker-held duplicate TCP descriptor used solely as a policy-revocation handle;
+- agent control guard: broker death/restart closes an already handed-off VNC session rather than allowing it to continue without active-session policy enforcement;
+- package-level global `graphical-session.target` Wants link so future graphical logins automatically start their user agent;
+- `RuntimeDirectory=vnc-monitor` for the hardened user service;
+- broker-aware `.deb` verification for binaries, units, Wants link, conffiles, private-key absence and runtime dependencies.
+
+### Security policy
+
+- GDM/greeter is deliberately not served;
+- Fast User Switching never transfers an existing VNC connection to another login session;
+- logoff or any change away from the bound logind Session ID permanently disconnects the VNC client and tears down its virtual monitor;
+- returning to the same Unix user still requires a new VNC connection and new RA2/PAM authentication;
+- while Bob is active, an inactive `gig` session is not selectable even if its user manager remains alive;
+- after broker routing, the existing PAM helper independently requires the RA2 username to equal the Unix account owning the active user agent (`SO_PEERCRED`);
+- source and package installs now use a generic local PAM socket because multi-user agents must reach it; the privileged helper's same-account `SO_PEERCRED` check remains the authorization boundary.
+
+### Changed
+
+- production `vnc-monitor.service` now runs `/usr/bin/vnc-monitor --agent` (or the source-install equivalent) and no longer binds the public TCP port;
+- the public `[network] port` is machine-wide broker policy read only from `/etc/vnc-monitor/config.ini` in broker mode;
+- per-user config still controls the active user's capture/display/transport/RA2 settings but cannot move the machine-wide public listener;
+- system broker keeps strong single-connect ownership and immediately resets additional clients;
+- beta.2 TCP keepalive, `TCP_USER_TIMEOUT` and monotonic handshake deadline remain in the handed-off user-agent socket path;
+- source upgrade order restarts beta.2 standalone as `--agent` before starting the broker, preventing a deterministic TCP/5901 collision;
+- package broker retries are not permanently start-limited during beta.2 -> beta.3 handoff, and package configuration does not fail merely because the already-running beta.2 user daemon still temporarily owns the public port;
+- standalone direct-listener mode remains available only for development/foreground diagnostics.
+
+### Debian packaging
+
+- executable `build-deb.sh` builds with `make -j"$(nproc)"` by default and performs compiler/library/`dpkg` preflight;
+- runtime shared-library dependencies are generated from all compiled ELF files through `dpkg-shlibdeps`;
+- no compiler, `pkg-config`, `dpkg-dev`, `debhelper` or `*-dev` package is propagated into binary `Depends`;
 - package layout uses `/usr/bin`, `/usr/libexec`, `/usr/lib/systemd/system` and `/usr/lib/systemd/user`;
-- `/etc/vnc-monitor/config.ini` is now an optional system baseline read before the per-user config;
-- effective config precedence is `built-ins < /etc/vnc-monitor/config.ini < user/--config < CLI`;
+- `/etc/vnc-monitor/config.ini` is a package conffile and system baseline;
+- effective agent config precedence remains `built-ins < /etc/vnc-monitor/config.ini < user/--config < CLI`;
 - package installation keeps RA2 identity/layout/user overrides in the user's home rather than creating home files from root maintainer scripts;
-- package PAM socket is build-user-independent; the helper's existing `SO_PEERCRED` same-account authorization remains the security boundary;
-- package version conversion uses Debian prerelease ordering, e.g. `0.1.0-beta.2` -> `0.1.0~beta.2-1`.
+- package version conversion uses Debian prerelease ordering, e.g. `0.1.0-beta.3` -> `0.1.0~beta.3-1`.
 
 ## 0.1.0-beta.2 — 2026-08-20
 
