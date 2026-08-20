@@ -13,6 +13,7 @@ Usage: ./install.sh [--clean] [--jobs N]
 
 Build and install the complete VNC Monitor beta stack:
   - vnc-monitor binary;
+  - persistent ~/.config/vnc-monitor/config.ini (created once, then preserved);
   - vnc-monitor.service (systemd user service);
   - PAM auth helper;
   - vnc-monitor-auth.socket + vnc-monitor-auth@.service (system units).
@@ -97,6 +98,23 @@ On Ubuntu, start with:
 EOF
     exit 1
 fi
+
+required_source_files=(
+    Makefile
+    config/vnc-monitor.conf
+    systemd/vnc-monitor.service
+    auth-helper/vnc-monitor-auth-helper.c
+    auth-helper/vnc-monitor-auth.socket.in
+    auth-helper/vnc-monitor-auth@.service
+    auth-helper/vnc-monitor.pam
+)
+
+for required_file in "${required_source_files[@]}"; do
+    if [[ ! -f "$required_file" ]]; then
+        echo "Required repository file is missing: $required_file" >&2
+        exit 1
+    fi
+done
 
 if [[ -z "$JOBS" ]]; then
     JOBS="$(nproc)"
@@ -249,11 +267,17 @@ printf '\n===== VNC MONITOR: ACTIVATE INSTALLED VERSION =====\n'
 sudo systemctl restart vnc-monitor-auth.socket
 systemctl --user restart vnc-monitor.service
 
+printf '\n===== VNC MONITOR: EFFECTIVE CONFIG =====\n'
+"$HOME/.local/bin/vnc-monitor" \
+    --config "$HOME/.config/vnc-monitor/config.ini" \
+    --show-config
+
 printf '\n===== VNC MONITOR: FINAL STATUS =====\n'
 make status-support
 
 printf '\nInstallation complete.\n'
+printf 'Config:        %s\n' "$HOME/.config/vnc-monitor/config.ini"
 printf 'User daemon:   vnc-monitor.service\n'
 printf 'System auth:   vnc-monitor-auth.socket -> vnc-monitor-auth@.service\n'
-printf 'Viewer port:   TCP/5901\n'
+printf 'Viewer port:   TCP/5901 (unless overridden in config)\n'
 printf 'Live log:      journalctl --user -u vnc-monitor.service -f\n'
