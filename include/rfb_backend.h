@@ -6,6 +6,8 @@
 #include "runtime_config.h"
 #include "frame_bridge.h"
 #include "pipeline_stats.h"
+#include "real_monitor.h"
+#include "monitor_layout_cache.h"
 
 typedef struct {
     pthread_t thread;
@@ -15,16 +17,20 @@ typedef struct {
     int failed;
     int stop;
 
-    const RuntimeConfig *cfg;
+    RuntimeConfig *cfg;
     FrameBridge *frames;
     PipelineStats *stats;
+    RealMonitor *real_monitor;
+    MonitorLayoutCache *layout_cache;
 } RfbBackend;
 
 int rfb_backend_start(
     RfbBackend *backend,
-    const RuntimeConfig *cfg,
+    RuntimeConfig *cfg,
     FrameBridge *frames,
-    PipelineStats *stats);
+    PipelineStats *stats,
+    RealMonitor *real_monitor,
+    MonitorLayoutCache *layout_cache);
 
 void rfb_backend_stop(RfbBackend *backend);
 
