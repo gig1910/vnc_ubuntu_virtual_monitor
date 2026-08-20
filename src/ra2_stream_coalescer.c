@@ -1,6 +1,5 @@
 #include "ra2_stream_coalescer.h"
 
-#include "benchmark.h"
 #include "shutdown_signal.h"
 
 #include <errno.h>
@@ -89,10 +88,6 @@ backend_read(
         );
 
     if (n > 0) {
-        benchmark_record_backend_read(
-            (size_t)n
-        );
-
         pipeline_stats_backend_read(
             stats,
             (size_t)n
@@ -219,14 +214,14 @@ ra2_stream_coalesce_and_send(
             cfg->ra2_coalesce_us > 0
         ) {
             double deadline =
-                benchmark_now() +
+                pipeline_stats_now() +
                 (double)cfg->ra2_coalesce_us /
                 1000000.0;
 
             while (used < cap) {
                 double remain =
                     deadline -
-                    benchmark_now();
+                    pipeline_stats_now();
 
                 if (remain <= 0.0)
                     break;
@@ -299,9 +294,6 @@ ra2_stream_coalesce_and_send(
         }
     }
 
-    double send_started =
-        benchmark_now();
-
     int send_rc =
         ra2_send_record(
             external_fd,
@@ -310,21 +302,10 @@ ra2_stream_coalesce_and_send(
             used
         );
 
-    double send_ms =
-        (
-            benchmark_now() -
-            send_started
-        ) * 1000.0;
-
     if (send_rc < 0) {
         free(buffer);
         return RA2_COALESCE_ERROR;
     }
-
-    benchmark_record_ra2_out(
-        used,
-        send_ms
-    );
 
     pipeline_stats_ra2_send(
         stats,
