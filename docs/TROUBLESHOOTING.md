@@ -65,6 +65,70 @@ This is intentional in beta.2. The internal LibVNCServer backend is session-scop
 
 The persistent idle listener is the public `[network] port` (5901 by default).
 
+## A second viewer cannot connect
+
+This is intentional. The beta has a **strong single-connect** policy: one accepted viewer owns the virtual-display session from RA2 negotiation through teardown.
+
+The public listener remains responsive during that session only so additional connection attempts can be rejected immediately. The second socket is reset/closed and the active viewer is left untouched.
+
+At `info` level the journal should contain:
+
+```text
+Rejected additional client: ADDRESS (strong single-connect policy)
+```
+
+A second client is also rejected while the first client is still authenticating; the slot is reserved at `accept()`, not only after PAM success.
+
+## A client connected but never completed authentication
+
+An unauthenticated connection must not own the only slot forever. The effective config contains:
+
+```ini
+[network]
+client-handshake-timeout-ms=60000
+```
+
+This is one monotonic deadline for the bounded handshake `io_*` phase. It is not reset by trickling individual bytes. Once the deadline expires, blocked protocol/auth-helper I/O fails and the connection is torn down. After successful RA2/PAM authentication the deadline is cleared completely.
+
+Check the effective value:
+
+```bash
+~/.local/bin/vnc-monitor --show-config | grep -i handshake
+```
+
+A timed-out or otherwise failed negotiation is logged as an RA2 handshake failure and the single-client slot is released.
+
+## Wi-Fi disappeared but the virtual monitor is still present
+
+The active external socket uses TCP dead-peer detection rather than an application-idle timer. Defaults are:
+
+```ini
+[network]
+client-keepalive-idle=15
+client-keepalive-interval=5
+client-keepalive-probes=3
+client-user-timeout-ms=20000
+```
+
+A healthy viewer showing a completely static desktop is allowed to remain connected indefinitely; it still answers TCP keepalive probes.
+
+If the route/Wi-Fi disappears without a normal FIN/RST, the kernel needs time to establish that the peer is dead. Exact timing depends on TCP/network state, so do not treat the configured numbers as an exact wall-clock disconnect guarantee. With the defaults, the intent is to recover the abandoned slot in tens of seconds rather than indefinitely.
+
+At `debug`, verify that the socket policy was applied:
+
+```text
+Client liveness: keepalive idle=15s interval=5s probes=3 user-timeout=20000ms handshake-deadline=60000ms
+```
+
+After the socket failure propagates through the RA2 relay, normal teardown should follow:
+
+```text
+Virtual monitor removed
+Client disconnected: ADDRESS
+```
+
+A client process that is still alive enough for its operating system to ACK TCP packets is not a dead TCP peer. This policy deliberately avoids inventing an RFB activity timeout that would disconnect a legitimate static viewer.
+
 ## Service is running but the client cannot authenticate
 
 Check the PAM socket:
@@ -76,7 +140,7 @@ ls -l /run/vnc-monitor-auth.sock
 
 The socket is system-level even though the main daemon is a user service.
 
-At `debug` level the RA2r negotiation should reach the authentication stage. A failure before that can instead indicate a changed RA2 identity or protocol mismatch.
+At `debug` level the RA2r negotiation should reach the authentication stage. A failure before that can instead indicate a changed RA2 identity, protocol mismatch, or the configured handshake deadline.
 
 ## Client reports a changed server identity
 
