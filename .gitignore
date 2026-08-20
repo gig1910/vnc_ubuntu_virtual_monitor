@@ -5,6 +5,8 @@ src/*.o
 src/*.d
 auth-helper/vnc-monitor-auth-helper
 build/
+dist/
+*.deb
 
 # Runtime-generated server identity / secrets
 ra2-server-key.pem
