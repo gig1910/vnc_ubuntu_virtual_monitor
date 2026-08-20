@@ -288,10 +288,8 @@ web_server_start(WebServer **out,
                  const WebServerHooks *hooks,
                  gpointer user_data)
 {
-    if (!out || !config_file) {
-        g_set_error_literal(NULL, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "invalid arguments");
+    if (!out || !config_file)
         return -1;
-    }
 
     *out = NULL;
 
