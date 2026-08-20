@@ -30,6 +30,17 @@ typedef struct {
 
     int external_send_buffer;
     int backend_receive_buffer;
+
+    /*
+     * External client liveness policy. These are TCP keepalive/user-timeout
+     * controls, not application-idle timers: a healthy viewer may display a
+     * static desktop indefinitely without being disconnected.
+     */
+    int client_keepalive_idle_s;
+    int client_keepalive_interval_s;
+    int client_keepalive_probes;
+    int client_user_timeout_ms;
+
     int diff_detect;
     int diff_tile_size;
     int layout_remember;
