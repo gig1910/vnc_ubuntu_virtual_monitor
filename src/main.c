@@ -10,6 +10,7 @@
 #include "real_monitor.h"
 #include "monitor_layout_cache.h"
 #include "pipeline_stats.h"
+#include "io.h"
 #include "log.h"
 
 #include <arpa/inet.h>
@@ -21,7 +22,6 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -86,61 +86,6 @@ set_client_socket_option(int fd,
     }
 
     return -1;
-}
-
-static int
-set_client_io_timeout(int client_fd, int timeout_ms)
-{
-    struct timeval timeout = {
-        .tv_sec = timeout_ms / 1000,
-        .tv_usec = (timeout_ms % 1000) * 1000
-    };
-
-    if (setsockopt(client_fd,
-                   SOL_SOCKET,
-                   SO_RCVTIMEO,
-                   &timeout,
-                   sizeof(timeout)) < 0) {
-        LOG_ERROR("Could not set required RA2 handshake SO_RCVTIMEO=%dms: %s",
-                  timeout_ms,
-                  strerror(errno));
-        return -1;
-    }
-
-    if (setsockopt(client_fd,
-                   SOL_SOCKET,
-                   SO_SNDTIMEO,
-                   &timeout,
-                   sizeof(timeout)) < 0) {
-        LOG_ERROR("Could not set required RA2 handshake SO_SNDTIMEO=%dms: %s",
-                  timeout_ms,
-                  strerror(errno));
-        return -1;
-    }
-
-    return 0;
-}
-
-static void
-clear_client_io_timeout(int client_fd)
-{
-    struct timeval timeout = {0};
-
-    if (setsockopt(client_fd,
-                   SOL_SOCKET,
-                   SO_RCVTIMEO,
-                   &timeout,
-                   sizeof(timeout)) < 0) {
-        LOG_DEBUG("Could not clear client SO_RCVTIMEO: %s", strerror(errno));
-    }
-
-    if (setsockopt(client_fd,
-                   SOL_SOCKET,
-                   SO_SNDTIMEO,
-                   &timeout,
-                   sizeof(timeout)) < 0) {
-        LOG_DEBUG("Could not clear client SO_SNDTIMEO: %s", strerror(errno));
-    }
 }
 
 static int
@@ -209,7 +154,7 @@ configure_external_socket(int client_fd, const RuntimeConfig *cfg)
                       actual);
         }
 
-        LOG_DEBUG("Client liveness: keepalive idle=%ds interval=%ds probes=%d user-timeout=%dms handshake-timeout=%dms",
+        LOG_DEBUG("Client liveness: keepalive idle=%ds interval=%ds probes=%d user-timeout=%dms handshake-deadline=%dms",
                   cfg->client_keepalive_idle_s,
                   cfg->client_keepalive_interval_s,
                   cfg->client_keepalive_probes,
@@ -246,20 +191,24 @@ serve_client(int client_fd,
     Ra2Session session;
 
     /*
-     * A connected but non-negotiating peer must not monopolize the only client
-     * slot forever. The timeout applies only to the unauthenticated RA2/PAM
-     * handshake and is removed before the long-lived RFB session begins.
+     * A connected, stalled or deliberately slow peer must not monopolize the
+     * only client slot. One monotonic deadline covers all io_* waits during
+     * the external RA2 negotiation and the auth-helper request/response. It is
+     * cleared completely before the long-lived RFB session begins.
      */
-    if (set_client_io_timeout(client_fd, cfg.client_handshake_timeout_ms) < 0)
-        return;
-
-    if (ra2_server_handshake(client_fd, &session, &cfg) < 0) {
-        clear_client_io_timeout(client_fd);
-        LOG_ERROR("RA2r handshake failed or timed out");
+    if (io_deadline_set_ms(cfg.client_handshake_timeout_ms) < 0) {
+        LOG_ERROR("Could not start RA2 handshake deadline: %s", strerror(errno));
         return;
     }
 
-    clear_client_io_timeout(client_fd);
+    int handshake_rc = ra2_server_handshake(client_fd, &session, &cfg);
+    io_deadline_clear();
+
+    if (handshake_rc < 0) {
+        LOG_ERROR("RA2r handshake failed or exceeded %d ms I/O deadline",
+                  cfg.client_handshake_timeout_ms);
+        return;
+    }
 
     if (frame_bridge_resize(frames, cfg.width, cfg.height) < 0) {
         LOG_ERROR("Could not prepare FrameBridge at %dx%d", cfg.width, cfg.height);
