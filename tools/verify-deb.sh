@@ -12,7 +12,7 @@ if [[ ! -f "$DEB" ]]; then
     exit 1
 fi
 
-for command_name in dpkg-deb grep mktemp find; do
+for command_name in dpkg-deb grep mktemp find readlink; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "Required command not found: $command_name" >&2
         exit 1
@@ -57,8 +57,6 @@ if grep -Eiq '(^|,[[:space:]]*)(build-essential|pkg-config|dpkg-dev|debhelper[^,
     exit 1
 fi
 
-# PipeWire is a runtime service requirement in addition to the shared-library
-# dependencies discovered by dpkg-shlibdeps.
 if ! grep -Eq '(^|,[[:space:]]*)pipewire([[:space:]]|,|$)' <<<"$depends"; then
     echo "Runtime dependency 'pipewire' is missing" >&2
     exit 1
@@ -66,8 +64,11 @@ fi
 
 required_paths=(
     usr/bin/vnc-monitor
+    usr/libexec/vnc-monitor-broker
     usr/libexec/vnc-monitor-auth-helper
     usr/lib/systemd/user/vnc-monitor.service
+    usr/lib/systemd/user/graphical-session.target.wants/vnc-monitor.service
+    usr/lib/systemd/system/vnc-monitor-broker.service
     usr/lib/systemd/system/vnc-monitor-auth.socket
     usr/lib/systemd/system/vnc-monitor-auth@.service
     etc/vnc-monitor/config.ini
@@ -79,20 +80,21 @@ required_paths=(
 )
 
 for path in "${required_paths[@]}"; do
-    if [[ ! -e "$root/$path" ]]; then
+    if [[ ! -e "$root/$path" && ! -L "$root/$path" ]]; then
         echo "Required package path is missing: /$path" >&2
         exit 1
     fi
 done
 
-[[ -x "$root/usr/bin/vnc-monitor" ]] || {
-    echo "/usr/bin/vnc-monitor is not executable" >&2
-    exit 1
-}
-[[ -x "$root/usr/libexec/vnc-monitor-auth-helper" ]] || {
-    echo "/usr/libexec/vnc-monitor-auth-helper is not executable" >&2
-    exit 1
-}
+for binary in \
+    "$root/usr/bin/vnc-monitor" \
+    "$root/usr/libexec/vnc-monitor-broker" \
+    "$root/usr/libexec/vnc-monitor-auth-helper"; do
+    [[ -x "$binary" ]] || {
+        echo "Packaged binary is not executable: $binary" >&2
+        exit 1
+    }
+done
 
 # No server private identity may ever be shipped in the package.
 if find "$root" -type f -name '*.pem' -print -quit | grep -q .; then
@@ -114,10 +116,32 @@ grep -Fxq '/etc/pam.d/vnc-monitor' "$control/conffiles" || {
     exit 1
 }
 
-# Validate the package-specific unit paths and generic local-auth socket model.
-grep -Fxq 'ExecStart=/usr/bin/vnc-monitor' \
+# Production user service must be agent-only and have a writable private
+# runtime directory for the broker control socket.
+grep -Fxq 'ExecStart=/usr/bin/vnc-monitor --agent' \
     "$root/usr/lib/systemd/user/vnc-monitor.service" || {
-    echo "Packaged user service does not start /usr/bin/vnc-monitor" >&2
+    echo "Packaged user service is not in broker-managed agent mode" >&2
+    exit 1
+}
+grep -Fxq 'RuntimeDirectory=vnc-monitor' \
+    "$root/usr/lib/systemd/user/vnc-monitor.service" || {
+    echo "Packaged user service lacks RuntimeDirectory=vnc-monitor" >&2
+    exit 1
+}
+
+agent_wants="$root/usr/lib/systemd/user/graphical-session.target.wants/vnc-monitor.service"
+[[ -L "$agent_wants" ]] || {
+    echo "Global graphical-session.target Wants link is not a symlink" >&2
+    exit 1
+}
+[[ "$(readlink "$agent_wants")" == '../vnc-monitor.service' ]] || {
+    echo "Unexpected user-service Wants target: $(readlink "$agent_wants")" >&2
+    exit 1
+}
+
+grep -Fxq 'ExecStart=/usr/libexec/vnc-monitor-broker' \
+    "$root/usr/lib/systemd/system/vnc-monitor-broker.service" || {
+    echo "Packaged broker service does not start /usr/libexec/vnc-monitor-broker" >&2
     exit 1
 }
 grep -Fxq 'ExecStart=/usr/libexec/vnc-monitor-auth-helper' \
@@ -131,13 +155,28 @@ grep -Fxq 'SocketMode=0666' \
     exit 1
 }
 
+# Maintainer scripts must manage the two system services. The per-user agent
+# is globally wanted for future graphical sessions and is not started from a
+# root package script inside arbitrary user managers.
+grep -q 'vnc-monitor-broker.service' "$control/postinst" || {
+    echo "postinst does not activate the system broker" >&2
+    exit 1
+}
+grep -q 'vnc-monitor-auth.socket' "$control/postinst" || {
+    echo "postinst does not activate the PAM socket" >&2
+    exit 1
+}
+
 printf '\n===== VNC MONITOR: PACKAGE VERIFY =====\n'
 printf 'Package:      %s\n' "$package"
 printf 'Version:      %s\n' "$version"
 printf 'Architecture: %s\n' "$architecture"
 printf 'Depends:      %s\n' "$depends"
 printf 'Config:       /etc/vnc-monitor/config.ini (conffile)\n'
-printf 'User unit:    /usr/lib/systemd/user/vnc-monitor.service\n'
+printf 'Broker:       /usr/libexec/vnc-monitor-broker\n'
+printf 'Broker unit:  /usr/lib/systemd/system/vnc-monitor-broker.service\n'
+printf 'User agent:   /usr/bin/vnc-monitor --agent\n'
+printf 'Agent wants:  graphical-session.target (global package symlink)\n'
 printf 'Auth socket:  /usr/lib/systemd/system/vnc-monitor-auth.socket\n'
 printf 'Private key:  not present in package\n'
 printf 'Result:       OK\n'
