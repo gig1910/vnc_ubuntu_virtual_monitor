@@ -13,12 +13,39 @@ typedef struct {
     char *stream_path;
     uint32_t node_id;
     int started;
+
+    /*
+     * A dedicated GLib main context watches Mutter's ScreenCast.Session Closed
+     * signal and DisplayConfig.MonitorsChanged while the RFB relay itself is
+     * blocked in select().  Closed is translated into lifecycle_pipe[0].
+     */
+    GThread *lifecycle_thread;
+    GMainContext *lifecycle_context;
+    GMutex lifecycle_mutex;
+    GCond lifecycle_cond;
+    guint lifecycle_closed_subscription;
+    guint lifecycle_monitors_subscription;
+    guint lifecycle_display_change_seq;
+    guint lifecycle_display_change_seq_at_close;
+    int lifecycle_pipe[2];
+    int lifecycle_sync_initialized;
+    int lifecycle_ready;
+    int lifecycle_stop_requested;
+    int lifecycle_closed;
 } MutterVirtualMonitor;
 
 int mutter_virtual_monitor_start(
     MutterVirtualMonitor *monitor,
     int timeout_ms,
     MutterCursorMode cursor_mode);
+
+/*
+ * Read end of the current client worker's Mutter lifecycle notification pipe.
+ * The fd becomes readable when GNOME/Mutter closes the ScreenCast session,
+ * including the shell's Stop sharing action.  Returns -1 when no monitor is
+ * active in the calling thread.
+ */
+int mutter_virtual_monitor_current_lifecycle_fd(void);
 
 void mutter_virtual_monitor_stop(
     MutterVirtualMonitor *monitor);
