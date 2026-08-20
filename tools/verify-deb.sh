@@ -139,11 +139,29 @@ agent_wants="$root/usr/lib/systemd/user/graphical-session.target.wants/vnc-monit
     exit 1
 }
 
-grep -Fxq 'ExecStart=/usr/libexec/vnc-monitor-broker' \
-    "$root/usr/lib/systemd/system/vnc-monitor-broker.service" || {
+broker_unit="$root/usr/lib/systemd/system/vnc-monitor-broker.service"
+grep -Fxq 'ExecStart=/usr/libexec/vnc-monitor-broker' "$broker_unit" || {
     echo "Packaged broker service does not start /usr/libexec/vnc-monitor-broker" >&2
     exit 1
 }
+
+# ProtectHome=yes also hides /run/user, which makes the active user's
+# $XDG_RUNTIME_DIR/vnc-monitor/agent.sock invisible to the system broker.
+# Keep /home and /root inaccessible explicitly, while exposing /run/user
+# read-only so connect(2) to the agent's Unix socket remains possible.
+if grep -Fxq 'ProtectHome=yes' "$broker_unit"; then
+    echo "Packaged broker incorrectly hides /run/user with ProtectHome=yes" >&2
+    exit 1
+fi
+grep -Fxq 'InaccessiblePaths=/home /root' "$broker_unit" || {
+    echo "Packaged broker does not keep /home and /root inaccessible" >&2
+    exit 1
+}
+grep -Fxq 'ReadOnlyPaths=/run/user' "$broker_unit" || {
+    echo "Packaged broker cannot safely see /run/user agent sockets" >&2
+    exit 1
+}
+
 grep -Fxq 'ExecStart=/usr/libexec/vnc-monitor-auth-helper' \
     "$root/usr/lib/systemd/system/vnc-monitor-auth@.service" || {
     echo "Packaged PAM service does not start /usr/libexec/vnc-monitor-auth-helper" >&2
@@ -175,6 +193,7 @@ printf 'Depends:      %s\n' "$depends"
 printf 'Config:       /etc/vnc-monitor/config.ini (conffile)\n'
 printf 'Broker:       /usr/libexec/vnc-monitor-broker\n'
 printf 'Broker unit:  /usr/lib/systemd/system/vnc-monitor-broker.service\n'
+printf 'Broker IPC:   /run/user visible read-only; /home and /root inaccessible\n'
 printf 'User agent:   /usr/bin/vnc-monitor --agent\n'
 printf 'Agent wants:  graphical-session.target (global package symlink)\n'
 printf 'Auth socket:  /usr/lib/systemd/system/vnc-monitor-auth.socket\n'
