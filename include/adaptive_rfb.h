@@ -21,6 +21,12 @@ AdaptiveRfbState *adaptive_rfb_create(
 
 void adaptive_rfb_destroy(AdaptiveRfbState *state);
 
+/* Reset size-dependent JPEG/repair/CopyRect state after framebuffer resize. */
+int adaptive_rfb_resize(
+    AdaptiveRfbState *state,
+    int width,
+    int height);
+
 int adaptive_rfb_should_queue_jpeg(
     AdaptiveRfbState *state,
     double changed_percent);
