@@ -1,6 +1,8 @@
 # Build artifacts
+vnc-monitor
 vnc-monitor-test
 src/*.o
+src/*.d
 auth-helper/vnc-monitor-auth-helper
 build/
 
@@ -8,9 +10,10 @@ build/
 ra2-server-key.pem
 *.pem
 
-# Local diagnostics / benchmark output
+# Local diagnostics / logs
 *.csv
 *.log
+*.pcap
 
 # Editor / OS noise
 .vscode/
