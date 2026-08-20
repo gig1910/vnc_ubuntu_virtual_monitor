@@ -42,7 +42,7 @@ Mutter ScreenCast + RemoteDesktop
 one virtual monitor in that login session
 ```
 
-The broker does **not** proxy framebuffer traffic and does not handle RA2 passwords. It only owns the public listener, determines the eligible active login session and passes the accepted socket descriptor to that user's agent.
+The broker does **not** proxy framebuffer traffic and does not handle RA2 passwords. It owns the public listener, determines the eligible active login session and passes the accepted socket descriptor to that user's agent.
 
 ## Active-session gate
 
@@ -78,7 +78,7 @@ session 3 / uid 1000 active
         |
 VNC -> agent(uid 1000)
         |
-Switch User
+Switch User / lock / logoff
         |
 seat0.ActiveSession != session 3
         |
@@ -89,7 +89,7 @@ RFB/RA2 exits
 Mutter virtual monitor removed
 ```
 
-The connection is not redirected to GDM, Bob, or a later reactivated `gig` session. Reconnection and new RA2/PAM authentication are mandatory.
+The connection is not redirected to GDM, another user, or a later reactivated session. Reconnection and new RA2/PAM authentication are mandatory.
 
 This prevents a surviving inactive graphical session from being used as a VNC target after Fast User Switching.
 
@@ -109,7 +109,21 @@ The broker connects to the active user's socket and verifies:
 SO_PEERCRED.uid == active logind session UID
 ```
 
-The agent independently verifies the connecting control peer is root.
+before sending the external TCP descriptor with `SCM_RIGHTS`.
+
+The agent independently verifies that the control peer is the system broker.
+
+### Root identity across user namespaces
+
+A hardened systemd user service may run in a user namespace that maps only the desktop user's UID. Host root can then appear through `SO_PEERCRED` as an overflow UID instead of literal UID 0.
+
+Overflow UID is never trusted by itself because every unmapped host UID may have the same value. The agent uses the immutable peer PID from `SO_PEERCRED` and accepts namespace-mapped root only when `/proc/<pid>/cgroup` identifies the peer exactly as:
+
+```text
+/system.slice/vnc-monitor-broker.service
+```
+
+If root is directly visible as UID 0, the ordinary UID check succeeds. All other peers are rejected.
 
 The accepted external TCP socket is passed with `SCM_RIGHTS`. After a successful handoff both processes hold descriptors referring to the same TCP socket:
 
@@ -148,7 +162,7 @@ selected agent UID
 RA2/PAM Unix username
 ```
 
-A connection routed to Bob's active agent cannot authenticate as `gig`.
+A connection routed to another user's active agent cannot authenticate as an inactive account.
 
 ## Configuration ownership
 
@@ -214,6 +228,18 @@ Beta.3 does not redesign the proven beta.2 transport:
 - CopyRect/reference state reset on framebuffer resize.
 
 The earlier stale progressive-repair tile race remains a tracked beta limitation.
+
+## Runtime validation checkpoint
+
+The complete broker/agent lifecycle has been exercised on the target Ubuntu 26.04 GNOME Wayland host:
+
+- active `gig` session routed and authenticated normally;
+- transition to GDM/greeter revoked the bound connection;
+- connections attempted while greeter was active were not routed;
+- another local account (`guest`) received new connections only while its own Wayland session was active;
+- wrong/inactive account credentials were rejected;
+- switching back to `gig` required a new connection;
+- strong single-connect and dead Wi-Fi peer cleanup remained functional.
 
 ## Strict view-only boundary
 
