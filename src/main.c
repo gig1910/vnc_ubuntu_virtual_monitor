@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -72,6 +73,57 @@ set_client_socket_option(int fd,
                   name,
                   value,
                   strerror(errno));
+    }
+}
+
+static void
+set_client_io_timeout(int client_fd, int timeout_ms)
+{
+    struct timeval timeout = {
+        .tv_sec = timeout_ms / 1000,
+        .tv_usec = (timeout_ms % 1000) * 1000
+    };
+
+    if (setsockopt(client_fd,
+                   SOL_SOCKET,
+                   SO_RCVTIMEO,
+                   &timeout,
+                   sizeof(timeout)) < 0) {
+        LOG_DEBUG("Could not set RA2 handshake SO_RCVTIMEO=%dms: %s",
+                  timeout_ms,
+                  strerror(errno));
+    }
+
+    if (setsockopt(client_fd,
+                   SOL_SOCKET,
+                   SO_SNDTIMEO,
+                   &timeout,
+                   sizeof(timeout)) < 0) {
+        LOG_DEBUG("Could not set RA2 handshake SO_SNDTIMEO=%dms: %s",
+                  timeout_ms,
+                  strerror(errno));
+    }
+}
+
+static void
+clear_client_io_timeout(int client_fd)
+{
+    struct timeval timeout = {0};
+
+    if (setsockopt(client_fd,
+                   SOL_SOCKET,
+                   SO_RCVTIMEO,
+                   &timeout,
+                   sizeof(timeout)) < 0) {
+        LOG_DEBUG("Could not clear client SO_RCVTIMEO: %s", strerror(errno));
+    }
+
+    if (setsockopt(client_fd,
+                   SOL_SOCKET,
+                   SO_SNDTIMEO,
+                   &timeout,
+                   sizeof(timeout)) < 0) {
+        LOG_DEBUG("Could not clear client SO_SNDTIMEO: %s", strerror(errno));
     }
 }
 
@@ -132,11 +184,12 @@ configure_external_socket(int client_fd, const RuntimeConfig *cfg)
                   actual);
     }
 
-    LOG_DEBUG("Client liveness: keepalive idle=%ds interval=%ds probes=%d user-timeout=%dms",
+    LOG_DEBUG("Client liveness: keepalive idle=%ds interval=%ds probes=%d user-timeout=%dms handshake-timeout=%dms",
               cfg->client_keepalive_idle_s,
               cfg->client_keepalive_interval_s,
               cfg->client_keepalive_probes,
-              cfg->client_user_timeout_ms);
+              cfg->client_user_timeout_ms,
+              cfg->client_handshake_timeout_ms);
 }
 
 static void
@@ -164,10 +217,20 @@ serve_client(int client_fd,
     RuntimeConfig cfg = *base_cfg;
     Ra2Session session;
 
+    /*
+     * A connected but non-negotiating peer must not monopolize the only client
+     * slot forever. The timeout applies only to the unauthenticated RA2/PAM
+     * handshake and is removed before the long-lived RFB session begins.
+     */
+    set_client_io_timeout(client_fd, cfg.client_handshake_timeout_ms);
+
     if (ra2_server_handshake(client_fd, &session, &cfg) < 0) {
-        LOG_ERROR("RA2r handshake failed");
+        clear_client_io_timeout(client_fd);
+        LOG_ERROR("RA2r handshake failed or timed out");
         return;
     }
+
+    clear_client_io_timeout(client_fd);
 
     if (frame_bridge_resize(frames, cfg.width, cfg.height) < 0) {
         LOG_ERROR("Could not prepare FrameBridge at %dx%d", cfg.width, cfg.height);
@@ -295,20 +358,33 @@ start_client_worker(ClientSlot *slot,
     configure_external_socket(client_fd, cfg);
 
     pthread_attr_t attr;
-    if (pthread_attr_init(&attr) != 0) {
+    int rc = pthread_attr_init(&attr);
+    if (rc != 0) {
         shutdown_signal_unregister_fd(client_fd);
         pthread_mutex_lock(&slot->mutex);
         slot->running = 0;
         slot->client_fd = -1;
         pthread_cond_broadcast(&slot->cond);
         pthread_mutex_unlock(&slot->mutex);
+        errno = rc;
         return -1;
     }
 
-    (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (rc != 0) {
+        pthread_attr_destroy(&attr);
+        shutdown_signal_unregister_fd(client_fd);
+        pthread_mutex_lock(&slot->mutex);
+        slot->running = 0;
+        slot->client_fd = -1;
+        pthread_cond_broadcast(&slot->cond);
+        pthread_mutex_unlock(&slot->mutex);
+        errno = rc;
+        return -1;
+    }
 
     pthread_t thread;
-    int rc = pthread_create(&thread, &attr, client_worker, slot);
+    rc = pthread_create(&thread, &attr, client_worker, slot);
     pthread_attr_destroy(&attr);
 
     if (rc != 0) {
@@ -381,9 +457,21 @@ main(int argc, char **argv)
     memset(&client_slot, 0, sizeof(client_slot));
     client_slot.client_fd = -1;
 
-    if (pthread_mutex_init(&client_slot.mutex, NULL) != 0 ||
-        pthread_cond_init(&client_slot.cond, NULL) != 0) {
-        LOG_ERROR("Failed to initialize single-client session slot");
+    int mutex_rc = pthread_mutex_init(&client_slot.mutex, NULL);
+    if (mutex_rc != 0) {
+        LOG_ERROR("Failed to initialize single-client mutex: %s",
+                  strerror(mutex_rc));
+        frame_bridge_destroy(&frames);
+        shutdown_signal_cleanup();
+        pipeline_stats_destroy(&pipeline_stats);
+        return 1;
+    }
+
+    int cond_rc = pthread_cond_init(&client_slot.cond, NULL);
+    if (cond_rc != 0) {
+        LOG_ERROR("Failed to initialize single-client condition: %s",
+                  strerror(cond_rc));
+        pthread_mutex_destroy(&client_slot.mutex);
         frame_bridge_destroy(&frames);
         shutdown_signal_cleanup();
         pipeline_stats_destroy(&pipeline_stats);
