@@ -2,269 +2,326 @@
 
 ## Goal
 
-Present a real virtual monitor to the **current GNOME Wayland session** and display it on a view-only VNC client. The monitor exists only for the lifetime of an authenticated viewer connection.
+Expose one real virtual monitor inside the **current GNOME Wayland session** and display it through a legacy-compatible, view-only VNC connection.
+
+The monitor is connection-scoped: it does not exist while the daemon is idle.
 
 ## End-to-end data path
 
 ```text
 VNC viewer
     |
-    | RFB 3.8, RA2r, encrypted records
+    | RFB 3.8 / RA2r encrypted records
     v
-RA2r frontend :5901
+public RA2r frontend :5901
     |
     | decrypted local RFB, active session only
     v
 LibVNCServer 127.0.0.1:5903
     |
-    | framebuffer updates
+    | adaptive framebuffer updates
     v
-adaptive RFB transport
+JPEG21 / CopyRect / lossless repair
     ^
     | BGRx framebuffer
 FrameBridge
     ^
-    | copied PipeWire frames + cursor composition
+    | copied frame + cursor composition
 native PipeWire capture
     ^
     | RecordVirtual stream
 Mutter ScreenCast + RemoteDesktop
     |
     v
-virtual monitor in the current GNOME Wayland session
+one virtual monitor in the current GNOME Wayland session
 ```
 
-## Service and session lifecycle
+## Idle vs active process model
 
-The persistent user daemon keeps only the public RA2r listener while idle. It does **not** keep a Mutter monitor, PipeWire stream, or internal LibVNCServer listener alive.
+Idle daemon:
 
-On a connection:
+```text
+public listener :5901
+no client worker
+no LibVNCServer :5903
+no PipeWire capture
+no Mutter virtual monitor
+```
 
-1. RA2r/PAM authentication completes;
-2. a session-local `RuntimeConfig` is copied from the parsed persistent config;
-3. the FrameBridge is prepared at the configured initial/fallback size;
-4. the Mutter virtual monitor and PipeWire capture start;
-5. the per-session LibVNCServer backend starts on loopback;
-6. decrypted RFB is relayed between the authenticated viewer and that backend.
+Accepted session:
 
-On disconnect the internal RFB backend is stopped first, then capture and the virtual monitor are removed. The next viewer starts from the persistent config again; a resize requested by one client does not alter the configured fallback for later clients.
+```text
+single client worker
+  -> RA2r/PAM
+  -> Mutter virtual monitor
+  -> PipeWire capture
+  -> session-local LibVNCServer :5903
+  -> encrypted RFB relay
+```
+
+Disconnect or detected failure tears the entire session down and returns to the idle listener.
 
 ## Strong single-connect ownership
 
-The server deliberately has exactly one active display owner. This is a production invariant in the beta, not an accidental consequence of a blocking `accept()` loop.
+The beta intentionally has **one display owner**. This is a server invariant, not a side effect of a blocking listener and not a configurable `max-clients` value.
 
-The public listener remains responsive while the active session runs. The active session is executed by one detached worker that exclusively owns the shared FrameBridge/capture/backend lifecycle. If another TCP connection reaches the public listener while that worker is active, the new socket is immediately reset and closed; it never reaches RA2 negotiation and cannot disturb the active display owner.
+The public listener stays in the main thread. The first accepted socket atomically reserves the single `ClientSlot`, and one detached worker owns the display-session lifecycle.
 
-This arrangement is intentionally **not** multi-client support. There is still only one capture pipeline, one virtual monitor and one per-session adaptive RFB state.
+While that slot is reserved, any later connection is accepted only far enough to identify the conflict. The extra socket receives an immediate close/reset and never enters RA2 negotiation:
 
-### Dead-peer release
+```text
+client #1 -> ClientSlot -> worker -> display session
+client #2 -> listener -> immediate reject/reset
+client #3 -> listener -> immediate reject/reset
+```
 
-The external client socket enables Linux TCP liveness controls before RA2 negotiation:
+The slot is reserved **before authentication**, so two clients cannot race during RA2/PAM setup.
+
+This does not introduce multi-client state: there is still one FrameBridge, one virtual monitor/capture pipeline and one adaptive RFB state for the current session.
+
+## Connection-liveness layers
+
+A single-slot server must recover both from a vanished established peer and from an unauthenticated client that connects but never completes negotiation.
+
+### Established peer: kernel TCP liveness
+
+Before the client worker starts, the external TCP socket requires:
 
 - `SO_KEEPALIVE`;
 - `TCP_KEEPIDLE`;
 - `TCP_KEEPINTVL`;
 - `TCP_KEEPCNT`;
-- `TCP_USER_TIMEOUT` when available.
+- `TCP_USER_TIMEOUT` when provided by the target Linux headers/kernel.
 
-The defaults are 15 seconds idle before keepalive probing, 5 seconds between probes, 3 failed probes and a 20-second user timeout for unacknowledged data.
+Default policy:
 
-These are transport-liveness checks, **not application-idle checks**. A healthy client may display a completely static framebuffer indefinitely. If Wi-Fi/LAN connectivity disappears without a clean TCP close, the kernel eventually fails the socket; the RA2 relay exits, the worker tears down LibVNCServer/PipeWire/Mutter and the single-client slot becomes available again.
+```text
+keepalive idle      15 s
+keepalive interval   5 s
+keepalive probes     3
+TCP user timeout    20 s
+```
 
-During daemon shutdown the main thread shuts down the active client socket and waits for the only client worker to finish before destroying shared FrameBridge/statistics state.
+These values detect transport failure. They are deliberately **not an application-idle timeout**: a healthy viewer displaying a static framebuffer may stay connected indefinitely.
+
+When a half-open Wi-Fi/LAN connection is declared dead by TCP, the RA2 relay returns and normal session teardown releases the sole slot.
+
+### Unauthenticated/stalled peer: monotonic I/O deadline
+
+TCP keepalive cannot protect against a peer whose TCP stack is alive but whose protocol negotiation stalls. The bounded handshake therefore installs one thread-local monotonic `io_*` deadline, default 60000 ms.
+
+`io_read_exact()` / `io_write_exact()` already wait through a central `poll()` wrapper. The wrapper now computes the earliest of:
+
+```text
+process shutdown
+thread-local protocol deadline
+socket SO_RCVTIMEO/SO_SNDTIMEO, when present
+socket readiness/error
+```
+
+The handshake deadline is **not reset for each byte or record**, so a trickle-slow peer cannot extend the sole slot indefinitely.
+
+The same worker performs the auth-helper `io_*` request/response, so those waits participate in the same deadline. After successful RA2/PAM authentication the deadline is cleared completely before the normal long-lived RFB session starts.
+
+### Daemon shutdown
+
+The accepted external client fd is registered with the existing shutdown supervisor. On SIGINT/SIGTERM the listener and client socket are shut down, and the main thread waits until the one client worker has finished before destroying shared FrameBridge/statistics objects.
 
 ## Virtual-monitor lifecycle
 
-The Mutter sequence is:
+The confirmed Mutter sequence is:
 
 1. `org.gnome.Mutter.RemoteDesktop.CreateSession`;
 2. read the RemoteDesktop session `SessionId`;
 3. `org.gnome.Mutter.ScreenCast.CreateSession` linked with `remote-desktop-session-id`;
-4. `ScreenCast.Session.RecordVirtual` with the requested cursor mode and `is-platform=true`;
+4. `ScreenCast.Session.RecordVirtual` with cursor mode and `is-platform=true`;
 5. subscribe for `PipeWireStreamAdded`;
 6. start the **RemoteDesktop** session;
-7. capture the returned PipeWire node.
+7. use the returned PipeWire node.
 
-`ScreenCast.Session.Start` is intentionally not called for the linked RemoteDesktop session.
+`ScreenCast.Session.Start` is intentionally not called for the linked session.
 
 Stopping the RemoteDesktop session removes the virtual monitor.
 
+## Capture ownership
+
+A `struct pw_buffer *` is never retained after its PipeWire process callback.
+
+Valid BGRx video is copied into private storage before the PipeWire buffer is recycled. Video chunk validity and cursor metadata validity are handled independently because Mutter can produce an empty/corrupted video chunk that still carries useful `SPA_META_Cursor` data.
+
+## Cursor model
+
+Production uses PipeWire cursor metadata.
+
+The capture layer keeps:
+
+- a cursor-free base framebuffer;
+- cached cursor bitmap/position/hotspot;
+- scratch framebuffer for composition.
+
+On publish it composes the premultiplied RGBA cursor over the BGRx base. Cursor-only PipeWire buffers can therefore generate a new VNC frame without a new video payload.
+
 ## Persistent configuration
 
-The systemd user service reads `~/.config/vnc-monitor/config.ini`. Values are owned by `RuntimeConfig`; no runtime string points into temporary parser storage.
+The systemd user service reads:
 
-Precedence is:
+```text
+~/.config/vnc-monitor/config.ini
+```
+
+Precedence:
 
 ```text
 built-in defaults < config.ini < CLI
 ```
 
-The INI parser is strict. Unknown keys/sections and invalid values prevent startup instead of being silently ignored.
+Runtime strings are copied into owned `RuntimeConfig` storage; they do not point into parser-temporary data.
 
-The installer creates the file once from `config/vnc-monitor.conf` and never overwrites an existing local config during upgrades.
+The INI parser is strict. Unknown keys/sections and invalid values prevent startup.
+
+The installer creates the config once from `config/vnc-monitor.conf` and preserves the installed copy during upgrades.
 
 ## Dynamic display sizing
 
 ### RFB semantics
 
-There are two different RFB resize capabilities:
+Two resize capabilities must not be confused:
 
-- `NewFBSize` / `DesktopSize` (`-223`) lets a client **receive** a server framebuffer-size change;
-- `ExtendedDesktopSize` (`-308`) plus client message `SetDesktopSize` lets a client **request** a framebuffer size/layout.
+- `NewFBSize` / `DesktopSize` (`-223`) means the viewer can **receive** a server framebuffer-size change;
+- `ExtendedDesktopSize` (`-308`) + client `SetDesktopSize` means the viewer can **request** dimensions/layout.
 
-The first capability does not communicate the viewer's preferred dimensions to the server.
+A client advertising only `-223` does not tell the server what size it wants.
 
 ### `display.mode=auto`
 
-`display.width` and `display.height` are the initial/fallback dimensions.
+Configured `width` / `height` are initial/fallback dimensions.
 
-When a viewer that supports `ExtendedDesktopSize` sends a valid one-screen `SetDesktopSize` request, the LibVNCServer hook performs a coordinated resize in the backend thread. Only a single screen at `(0,0)` spanning the requested framebuffer is accepted because one VNC session maps to one Mutter virtual monitor.
-
-The transaction is:
+For a valid single-screen `SetDesktopSize` request, the backend coordinates:
 
 ```text
 preallocate new RFB framebuffer + diff storage
         |
         v
-stop old PipeWire/Mutter monitor
+stop old capture / Mutter monitor
         |
         v
 resize FrameBridge
         |
         v
-start new Mutter/PipeWire monitor at requested dimensions
+start new Mutter/PipeWire monitor
         |
         v
-resize adaptive JPEG/repair state
+resize JPEG/repair state
 invalidate + resize CopyRect reference
         |
         v
 rfbNewFramebuffer()
+restore BGRx server pixel format
+rebuild client translation tables
         |
         v
-refresh dimension-specific GNOME layout cache
+refresh dimension-specific layout cache
 ```
 
-Only after the new monitor/capture and transport state are available is the LibVNCServer framebuffer committed. If monitor creation fails, the previous monitor/FrameBridge size is restored. If adaptive storage allocation fails after monitor recreation, the server also attempts to roll the monitor back and returns `OutOfResources` to the resize request.
+Only one screen at `(0,0)` spanning the framebuffer is accepted because one VNC session maps to one Mutter virtual monitor.
 
-`rfbNewFramebuffer()` is the LibVNCServer-supported path for replacing a framebuffer and updating connected clients. After replacement, the backend explicitly restores the BGRx server pixel format and recalculates client translation tables so resize cannot silently revert LibVNCServer to its host-endian default channel layout.
+The resize is session-local. Persistent fallback dimensions are not modified, so the next connection starts from the config again.
 
-The normal LibVNCServer `SetDesktopSize` machinery sends the mandatory `ExtendedDesktopSize` result to the requester.
+A successful resize preserves the already-negotiated JPEG21 capability while clearing size-dependent pending/repair state and invalidating CopyRect reference pixels from the old dimensions.
 
-A successful resize preserves the already-negotiated JPEG21 client capability. Size-dependent pending JPEG/repair state is cleared, and the CopyRect reference is invalidated so motion reuse is not attempted against pixels from the old dimensions.
+If recreation fails, the code attempts to restore the previous monitor/FrameBridge size and returns an RFB resize error rather than committing a partial RFB framebuffer change.
 
 ### `display.mode=fixed`
 
-Client `SetDesktopSize` requests are rejected with `ResizeProhibited`; the configured dimensions are always used.
+`SetDesktopSize` is rejected with `ResizeProhibited`; configured dimensions are mandatory.
 
-### Older viewers
+### Legacy viewer limitation
 
-A viewer that only advertises `NewFBSize` cannot tell the server its preferred dimensions. In `auto` mode it therefore receives the configured initial/fallback dimensions. This is an RFB protocol capability limit rather than server-side guessing.
-
-## Capture ownership rule
-
-A `struct pw_buffer *` is never retained beyond the PipeWire process callback. Valid BGRx video is copied to private memory and the PipeWire buffer is immediately recycled.
-
-Mutter may produce buffers with an empty/corrupted video chunk while still carrying meaningful `SPA_META_Cursor` data. Cursor metadata is therefore processed independently of video payload validity.
-
-## Cursor model
-
-Production uses cursor metadata rather than an embedded cursor stream.
-
-The capture layer keeps:
-
-- a cursor-free base framebuffer;
-- cached cursor bitmap, position and hotspot;
-- a scratch framebuffer.
-
-For every publish it copies base → scratch and composites the premultiplied RGBA cursor into BGRx scratch. Cursor-only PipeWire updates can therefore create a new VNC frame even when no video pixels were supplied by Mutter.
+A viewer that only advertises `NewFBSize` cannot drive auto sizing. It receives the configured fallback size. This is a protocol capability limit, not something the server can infer reliably.
 
 ## RA2r frontend
 
-The legacy client uses RFB security type 13 (`RA2r`). The implementation supports the path experimentally confirmed with the target viewer:
+The target legacy viewer uses RFB security type 13 (`RA2r`). The confirmed implementation path is:
 
-- 2048-bit RSA public-key exchange;
-- server/client random exchange encrypted with RSA;
+- 2048-bit RSA key exchange;
+- RSA-encrypted ServerRandom/ClientRandom;
 - AES-128-EAX session keys;
 - mutual SHA-1 public-key hash verification;
-- RA2 authentication subtype 1;
+- authentication subtype 1;
 - encrypted username/password;
-- PAM authentication through the local privileged helper socket.
+- PAM verification through the privileged local helper socket.
 
-After authentication the frontend acts as a codec-agnostic encrypted RFB relay to the loopback LibVNCServer backend.
+After authentication the frontend is a codec-agnostic encrypted relay to the loopback LibVNCServer backend.
 
 ## Strict view-only boundary
 
-The beta does not treat view-only as a preference. The internal RFB server installs handlers that discard keyboard and pointer events, disables client clipboard input and disallows file transfer.
+View-only is a hard production invariant:
 
-The public RA2r frontend never grants additional input capabilities.
+- keyboard events discarded;
+- pointer/touch events discarded;
+- clipboard input disabled;
+- file transfer disabled.
+
+No public runtime setting relaxes this boundary.
 
 ## Adaptive framebuffer transport
 
 ### Initial state
 
-The first real framebuffer after a virtual monitor starts (and the first framebuffer after a resize) is submitted losslessly. This establishes a coherent client state without periodic diagnostic keyframes.
+The first real framebuffer after monitor creation, and the first framebuffer after a resize, is sent losslessly to establish a coherent client state.
 
 ### Latest-only source handling
 
-PipeWire may run faster than the remote viewer. When downstream queues indicate pressure, the publisher stops consuming intermediate source states and resumes from the newest available state after low-water recovery.
+Under downstream pressure the publisher stops consuming intermediate source states. Once low-water is restored, it resumes from the newest FrameBridge state rather than replaying stale frames.
 
-The goal is latency, not preserving every captured frame.
+### JPEG21
 
-### JPEG21 live updates
+A viewer advertising encoding 21 enables the custom JPEG21 path. Active changed regions are encoded at quality 30.
 
-A viewer advertising RFB encoding 21 enables the custom JPEG21 path. Active non-zero changes are sent at quality 30.
+Pending damage can coalesce while waiting for the next `FramebufferUpdateRequest`; custom JPEG responses preserve RFB demand-driven semantics.
 
-Pending damage may coalesce while the server waits for the next `FramebufferUpdateRequest`. A custom JPEG response consumes exactly one outstanding request, preserving normal RFB demand-driven semantics.
+### CopyRect
 
-### CopyRect acceleration
+When the viewer advertises standard CopyRect encoding 1, translated pixels may be reused from the last framebuffer state actually delivered to that client.
 
-A client advertising standard CopyRect encoding 1 can reuse pixels already known to it.
-
-For a pending update the server searches the last framebuffer state **actually delivered to that client** for a translated copy of current pixels. Candidate translations are only accepted after byte-exact verification on 32x32 tiles.
-
-A successful update contains:
+Candidates are accepted only after byte-exact 32x32 verification. A successful update is:
 
 ```text
-CopyRect(known pixels)
+CopyRect(exact known pixels)
 + zero to four JPEG21 residual rectangles
 ```
 
-If no safe translation exists, the regular JPEG21 path is unchanged.
+Otherwise normal JPEG21 is used.
 
 ### Progressive exact repair
 
-Every lossy JPEG region marks 32x32 tiles as inexact. Once source activity is quiet and transport is below low-water, the server schedules dispersed lossless ZRLE tiles until the client framebuffer is exact again.
+Lossy JPEG regions mark 32x32 tiles as inexact. After source activity becomes quiet and transport is below low-water, dispersed lossless ZRLE tiles repair the client framebuffer until exactness is restored.
 
-A previously observed race in which an already-scheduled repair tile can become stale when motion resumes is still tracked as a beta limitation.
+The previously observed stale-repair-tile race when motion resumes remains a tracked beta limitation.
 
 ## Logging
 
-Logging is a single hierarchy:
-
 - `error`: failures;
-- `info`: service/connection/monitor lifecycle and rejected extra clients;
-- `debug`: protocol/capture/transport state, periodic statistics and applied TCP liveness policy;
-- `trace`: per-update frame/JPEG/CopyRect/repair/latency details.
+- `info`: service/session lifecycle and rejected additional clients;
+- `debug`: negotiation, capture/transport summaries, TCP liveness/deadline policy;
+- `trace`: per-update JPEG/CopyRect/repair/latency detail.
 
-The persistent `[logging] level=` setting controls the service; `--verbose` is a CLI override for foreground diagnostics.
-
-## Process/service architecture
+## Service privilege model
 
 ### User daemon
 
-`vnc-monitor.service` runs under the user systemd manager and shares the graphical session. It must be able to access session D-Bus, Mutter RemoteDesktop/ScreenCast, PipeWire, and private user config/identity/layout files.
+`vnc-monitor.service` runs under the user systemd manager because it must share the logged-in GNOME Wayland session and access session D-Bus/PipeWire.
 
 ### PAM helper
 
-The PAM helper is intentionally separate and privileged. A system socket/service pair exposes only the narrow authentication operation needed by the unprivileged daemon.
+Authentication remains a narrow privileged system socket/service. The main VNC daemon itself is not root.
 
 ## Future protocol backends
 
-The capture/virtual-monitor side remains conceptually independent of the external protocol:
+The capture side remains conceptually independent of the external protocol:
 
 ```text
 Mutter -> PipeWire -> framebuffer -> protocol backend
 ```
 
-The later legacy-RDP experiment should branch from this stabilized VNC beta rather than altering the confirmed VNC transport in place.
+Legacy-RDP work should branch from the stabilized VNC beta rather than changing the confirmed VNC transport in place.
