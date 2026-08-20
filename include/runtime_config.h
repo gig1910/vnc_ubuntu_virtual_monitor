@@ -84,8 +84,16 @@ typedef struct {
 
     int verbose;
 
-    /* Owned storage: config/CLI strings never point into temporary buffers. */
+    /*
+     * Layered configuration:
+     * built-ins < /etc/vnc-monitor/config.ini < user/--config < CLI.
+     * config_file is the normal per-user override path, or the explicit
+     * --config path when one is supplied.
+     */
+    char system_config_file[PATH_MAX];
     char config_file[PATH_MAX];
+
+    /* Owned storage: config/CLI strings never point into temporary buffers. */
     char auth_socket[PATH_MAX];
     char ra2_key_file[PATH_MAX];
     char backend_bind[64];
