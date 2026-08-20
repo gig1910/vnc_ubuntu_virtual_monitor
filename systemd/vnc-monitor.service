@@ -12,6 +12,8 @@ Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s
 UMask=0077
+RuntimeDirectory=vnc-monitor
+RuntimeDirectoryMode=0700
 
 # The agent never owns the public TCP port. It accepts a client fd only from
 # the root system broker through $XDG_RUNTIME_DIR/vnc-monitor/agent.sock and
@@ -23,7 +25,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/vnc-monitor %h/.config/vnc-monitor-server %h/.cache/vnc-monitor
+ReadWritePaths=%h/.config/vnc-monitor %h/.config/vnc-monitor-server %h/.cache/vnc-monitor %t/vnc-monitor
 
 [Install]
 WantedBy=graphical-session.target
