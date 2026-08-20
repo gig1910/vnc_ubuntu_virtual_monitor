@@ -12,7 +12,7 @@ if [[ ! -f "$DEB" ]]; then
     exit 1
 fi
 
-for command_name in dpkg-deb grep mktemp; do
+for command_name in dpkg-deb grep mktemp find; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "Required command not found: $command_name" >&2
         exit 1
@@ -43,9 +43,16 @@ depends="$(dpkg-deb -f "$DEB" Depends)"
 [[ -n "$architecture" ]] || { echo "Missing Architecture field" >&2; exit 1; }
 [[ -n "$depends" ]] || { echo "Missing Depends field" >&2; exit 1; }
 
-# The binary package must never depend on build/development tooling.
-if grep -Eiq '(^|[,[:space:]])(build-essential|pkg-config|dpkg-dev|debhelper[^,[:space:]]*|gcc[^,[:space:]]*|g\+\+[^,[:space:]]*|make)([,([:space:]]|$)|-dev([,([:space:]]|$)' <<<"$depends"; then
-    echo "Forbidden build/development dependency found:" >&2
+# The binary package must never depend on development libraries.
+if grep -Eiq '(^|,[[:space:]]*)[^,[:space:]]+-dev([[:space:]]|\(|,|$)' <<<"$depends"; then
+    echo "Forbidden *-dev dependency found:" >&2
+    echo "  $depends" >&2
+    exit 1
+fi
+
+# Nor may compiler/build/packaging tools leak into binary Depends.
+if grep -Eiq '(^|,[[:space:]]*)(build-essential|pkg-config|dpkg-dev|debhelper[^,[:space:]]*|gcc[^,[:space:]]*|g\+\+[^,[:space:]]*|make)([[:space:]]|\(|,|$)' <<<"$depends"; then
+    echo "Forbidden build-tool dependency found:" >&2
     echo "  $depends" >&2
     exit 1
 fi
