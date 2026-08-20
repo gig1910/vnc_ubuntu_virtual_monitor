@@ -36,10 +36,94 @@ int monitor_layout_cache_save(
     const RuntimeConfig *cfg);
 
 /*
+ * Verify that Mutter still exposes the virtual monitor created by
+ * RecordVirtual. On the supported GNOME/Mutter path these connectors are
+ * named Meta-N (the Shell log reports e.g. "Added virtual monitor Meta-0").
+ *
+ * This check deliberately fails closed: if DisplayConfig cannot be read, do
+ * not overwrite a known-good layout cache. This matters for the Shell Stop
+ * action, which removes the virtual monitor before our client worker reaches
+ * its normal teardown path.
+ */
+static inline int
+monitor_layout_cache_virtual_present(
+    MonitorLayoutCache *cache)
+{
+    if (!cache || !cache->bus)
+        return 0;
+
+    GError *error = NULL;
+    GVariant *reply =
+        g_dbus_connection_call_sync(
+            cache->bus,
+            "org.gnome.Mutter.DisplayConfig",
+            "/org/gnome/Mutter/DisplayConfig",
+            "org.gnome.Mutter.DisplayConfig",
+            "GetCurrentState",
+            NULL,
+            NULL,
+            G_DBUS_CALL_FLAGS_NONE,
+            1000,
+            NULL,
+            &error
+        );
+
+    if (!reply) {
+        g_clear_error(&error);
+        return 0;
+    }
+
+    int found = 0;
+    GVariant *physical =
+        g_variant_get_child_value(reply, 1);
+
+    if (physical && g_variant_is_container(physical)) {
+        const gsize count =
+            g_variant_n_children(physical);
+
+        for (gsize i = 0; i < count && !found; i++) {
+            GVariant *monitor =
+                g_variant_get_child_value(physical, i);
+            GVariant *spec = monitor
+                ? g_variant_get_child_value(monitor, 0)
+                : NULL;
+            GVariant *connector_value = spec
+                ? g_variant_get_child_value(spec, 0)
+                : NULL;
+
+            if (connector_value &&
+                g_variant_is_of_type(connector_value,
+                                     G_VARIANT_TYPE_STRING)) {
+                const char *connector =
+                    g_variant_get_string(connector_value, NULL);
+                found = connector &&
+                        g_str_has_prefix(connector, "Meta-");
+            }
+
+            if (connector_value)
+                g_variant_unref(connector_value);
+            if (spec)
+                g_variant_unref(spec);
+            if (monitor)
+                g_variant_unref(monitor);
+        }
+    }
+
+    if (physical)
+        g_variant_unref(physical);
+    g_variant_unref(reply);
+    return found;
+}
+
+/*
  * Production session policy: layout-remember means "remember the latest
  * arrangement", not merely "save once". Keep layout-resave accepted by the
  * parser for configuration compatibility, but force an overwrite when the
  * active client session is being finalized.
+ *
+ * A Shell-side Stop has already removed Meta-N by the time normal teardown is
+ * reached; in that case leave the previous valid cache untouched rather than
+ * replacing it with a physical-monitor-only topology.
  *
  * main.c includes real_monitor.h before this header, so only the session
  * orchestration path gets the compatibility wrapper. monitor_layout_cache.c
@@ -52,6 +136,9 @@ monitor_layout_cache_save_latest(
 {
     if (!cfg)
         return -1;
+
+    if (!monitor_layout_cache_virtual_present(cache))
+        return 0;
 
     RuntimeConfig effective = *cfg;
     effective.layout_resave = 1;
