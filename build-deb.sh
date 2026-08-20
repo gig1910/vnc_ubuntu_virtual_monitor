@@ -290,6 +290,8 @@ install -Dm0644 CHANGELOG.md \
     "$stage/usr/share/doc/vnc-monitor/CHANGELOG.md"
 install -Dm0644 SECURITY.md \
     "$stage/usr/share/doc/vnc-monitor/SECURITY.md"
+install -Dm0644 LICENSE \
+    "$stage/usr/share/doc/vnc-monitor/LICENSE"
 install -Dm0644 docs/INSTALL.md \
     "$stage/usr/share/doc/vnc-monitor/INSTALL.md"
 install -Dm0644 docs/ARCHITECTURE.md \
@@ -342,12 +344,11 @@ Priority: optional
 Architecture: $architecture
 Maintainer: $DEB_MAINTAINER
 Depends: $runtime_deps, pipewire
-Recommends: gnome-shell
 Description: GNOME Wayland virtual monitor over VNC
  VNC Monitor exposes a real Mutter virtual monitor from the active GNOME
  Wayland session through a view-only RA2r VNC server. It uses PipeWire capture,
  PAM authentication, adaptive JPEG/CopyRect transport and strong single-connect
- session ownership.
+ session ownership. A GNOME Wayland session is required at runtime.
 EOF
 
 cat >"$stage/DEBIAN/postinst" <<'EOF'
