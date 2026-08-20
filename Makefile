@@ -181,10 +181,14 @@ install: all
 		printf '%s\n' 'Migrated existing RA2 server identity to $(USER_RA2_KEY)'; \
 	fi
 
-install-service: install install-pam-service install-broker-service
+# Upgrade order is deliberate: replace/restart the old standalone user daemon
+# as an agent first so TCP/5901 is released before the system broker starts.
+install-service: install install-pam-service
 	install -Dm0644 systemd/vnc-monitor.service "$(USER_SERVICE)"
 	systemctl --user daemon-reload
-	systemctl --user enable --now vnc-monitor.service
+	systemctl --user enable vnc-monitor.service
+	systemctl --user restart vnc-monitor.service
+	@$(MAKE) --no-print-directory install-broker-service
 	@$(MAKE) --no-print-directory status-service
 
 uninstall-service:
