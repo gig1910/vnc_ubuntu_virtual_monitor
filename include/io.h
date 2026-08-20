@@ -4,6 +4,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/*
+ * Optional monotonic deadline for this thread's io_* waits. A positive value
+ * starts/replaces the deadline; clear it after the bounded protocol phase.
+ */
+int io_deadline_set_ms(int timeout_ms);
+void io_deadline_clear(void);
+
 /* 1=success, 0=EOF, -1=error */
 int io_read_exact_status(int fd, void *buf, size_t len);
 int io_read_exact(int fd, void *buf, size_t len);
