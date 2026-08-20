@@ -111,23 +111,7 @@ private key: 0600
 
 Deleting or rotating the key changes server identity and may require client-side re-acceptance.
 
-The binary `.deb` verifier explicitly rejects packages containing `*.pem`; private RA2 identities are never shipped in the package.
-
-## Historical private-key exposure
-
-A development RA2 private key was committed in earlier Git history. Removing it from the current tree and ignoring `*.pem` does **not** remove that object from historical refs.
-
-That historical key must be treated as compromised if the repository or its history has been publicly accessible.
-
-Required remediation before relying on a clean public history:
-
-1. purge the historical private-key object from every published/reachable Git ref;
-2. verify the sensitive blob/path is no longer reachable from rewritten history;
-3. rotate every RA2 server identity derived from or equal to the exposed development key;
-4. re-accept/verify the new identity on the target viewer;
-5. never reuse the exposed development key.
-
-History rewriting changes commit IDs and should be performed as a deliberate repository-maintenance operation, not mixed casually into transport/runtime commits.
+The binary `.deb` verifier explicitly rejects packages containing `*.pem`; private RA2 identities are never shipped in the package. Runtime private keys should remain outside the repository and must not be committed.
 
 ## Network exposure
 

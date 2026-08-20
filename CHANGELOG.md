@@ -149,8 +149,7 @@ First beta/stabilization release.
 
 - full-screen high-motion content remains limited by the old VNC viewer's JPEG/display/request path;
 - an earlier stale 32x32 progressive-repair tile race remains under observation;
-- only one external viewer is served at a time;
-- historical Git refs still require RA2 private-key history purge and identity rotation.
+- only one external viewer is served at a time.
 
 ## 0.0.25 — adaptive JPEG / CopyRect development line
 
