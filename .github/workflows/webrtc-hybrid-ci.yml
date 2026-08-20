@@ -32,6 +32,7 @@ jobs:
             build-essential \
             pkg-config \
             dpkg-dev \
+            util-linux \
             libvncserver-dev \
             libssl-dev \
             nettle-dev \
@@ -49,6 +50,19 @@ jobs:
           make clean
           make -j"$(nproc)" all auth-helper
 
+      - name: Broker protocol regression
+        run: |
+          mkdir -p build
+          cc -Iinclude -O2 -Wall -Wextra \
+            tests/broker_protocol_test.c src/broker_protocol.c \
+            -o build/broker_protocol_test
+          ./build/broker_protocol_test
+
       - name: Build and verify Debian package
         run: |
-          ./build-deb.sh --clean --jobs "$(nproc)"
+          # build-deb.sh intentionally refuses root. GitHub container jobs run
+          # as root, so execute the package builder as an unprivileged account
+          # instead of weakening the script's normal safety check.
+          chown -R nobody:nogroup "$GITHUB_WORKSPACE"
+          runuser -u nobody -- \
+            ./build-deb.sh --clean --jobs "$(nproc)"
