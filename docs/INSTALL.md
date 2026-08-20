@@ -11,6 +11,46 @@ VNC Monitor is split deliberately into two privilege domains:
 
 Do not convert the main daemon to a root system service. Doing so breaks the session ownership model and is not a supported installation.
 
+## Unified installer
+
+The preferred beta installation entrypoint is the executable repository-root script:
+
+```bash
+./install.sh
+```
+
+It performs the complete build and installation of both service layers in the correct privilege context:
+
+1. builds `vnc-monitor`, the PAM helper and generated PAM socket unit;
+2. installs/updates the PAM helper plus `vnc-monitor-auth.socket` / `vnc-monitor-auth@.service` using the Makefile's scoped `sudo` operations;
+3. installs `~/.local/bin/vnc-monitor` and `~/.config/systemd/user/vnc-monitor.service`;
+4. explicitly restarts both the auth socket and user daemon so an upgrade immediately runs the newly installed binaries/units;
+5. prints the final status of both layers.
+
+The script must be run as the logged-in GNOME desktop user, **not** through `sudo`.
+
+Default parallelism is 20 jobs:
+
+```bash
+./install.sh
+```
+
+Clean rebuild:
+
+```bash
+./install.sh --clean
+```
+
+Override build parallelism:
+
+```bash
+./install.sh --jobs 8
+# or
+JOBS=8 ./install.sh
+```
+
+The installer intentionally does **not** run `git pull`; updating source code and installing it remain separate operations.
+
 ## Build dependencies
 
 The build uses `pkg-config` for:
@@ -33,14 +73,14 @@ After switching from a pre-beta checkout, perform one clean build because source
 ```bash
 git switch 0.1.0-beta
 git pull
-make clean
-make -j20
+./install.sh --clean
 ```
 
-After that, ordinary incremental builds are sufficient:
+After that, ordinary incremental installs are sufficient:
 
 ```bash
-make -j20
+git pull --ff-only
+./install.sh
 ```
 
 `-MMD -MP` dependency files are generated automatically, so header changes rebuild their dependants.
@@ -59,19 +99,19 @@ The beta stores it under:
 ~/.config/vnc-monitor/ra2-server-key.pem
 ```
 
-`make install`/`make install-service` migrates the existing local key when the new path does not yet exist. This preserves the server identity already accepted by the old viewer.
+`make install`/`make install-service` (and therefore `./install.sh`) migrates the existing local key when the new path does not yet exist. This preserves the server identity already accepted by the old viewer.
 
 The file must remain mode `0600`; the directory is mode `0700`.
 
-## Install and start
+## Manual install and start
 
-Run as the logged-in desktop user:
+For development/debugging, the underlying Makefile target remains supported:
 
 ```bash
 make install-service
 ```
 
-Do not run `sudo make install-service`. The Makefile invokes `sudo` only for the PAM helper and its systemd system units.
+Run it as the logged-in desktop user. Do not run `sudo make install-service`. The Makefile invokes `sudo` only for the PAM helper and its systemd system units.
 
 The target performs:
 
@@ -81,6 +121,8 @@ The target performs:
 4. install/update the PAM helper and socket;
 5. install `~/.config/systemd/user/vnc-monitor.service`;
 6. run `systemctl --user enable --now vnc-monitor.service`.
+
+For upgrades, `./install.sh` is preferred because it also explicitly restarts already-active units after installation.
 
 ## Service behaviour
 
