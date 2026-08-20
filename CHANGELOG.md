@@ -2,6 +2,29 @@
 
 All notable project milestones are summarized here. Development commits before the beta checkpoint were intentionally experimental and are condensed by behavior rather than reproduced commit-by-commit.
 
+## 0.1.0-beta.4 — 2026-08-20
+
+GNOME/Mutter lifecycle and monitor-layout persistence refinement.
+
+### Changed
+
+- GNOME's system screen-sharing **Stop** control now revokes the corresponding VNC connection instead of leaving an authenticated viewer attached after the virtual monitor disappears;
+- normal VNC disconnect saves the latest live Mutter layout before removing the virtual monitor, so user-adjusted placement is restored on the next connection;
+- a layout cache is applied only when it contains the virtual Mutter `Meta-*` connector expected for the VNC monitor;
+- teardown preserves the last valid layout cache if GNOME has already removed the virtual monitor, preventing a physical-monitor-only state from replacing the virtual-monitor arrangement;
+- lifecycle teardown waits for Mutter monitor-topology changes rather than treating the local monitor object as removed before the desktop has processed the change;
+- `make clean` removes stale `src/*.o` and `src/*.d` artifacts left by source files removed between revisions.
+
+### Runtime validation
+
+Confirmed on the target Ubuntu 26.04 GNOME Wayland host with the legacy iPad VNC client:
+
+- ordinary VNC disconnect removes the virtual monitor cleanly;
+- a changed virtual-monitor arrangement is persisted and restored on reconnect;
+- GNOME screen-sharing Stop removes the virtual monitor and terminates the VNC connection;
+- subsequent reconnects create a fresh RemoteDesktop/ScreenCast session normally;
+- strong single-connect, broker/session routing, RA2r/PAM authentication and view-only transport remain unchanged.
+
 ## 0.1.0-beta.3 — 2026-08-20
 
 System-broker / per-user-agent security architecture.
