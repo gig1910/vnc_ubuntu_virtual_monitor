@@ -1,7 +1,10 @@
 #include "mutter_virtual_monitor.h"
 #include "log.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <string.h>
+#include <unistd.h>
 
 #define RD_BUS "org.gnome.Mutter.RemoteDesktop"
 #define RD_MANAGER_PATH "/org/gnome/Mutter/RemoteDesktop"
@@ -14,12 +17,110 @@
 #define SC_SESSION_IFACE "org.gnome.Mutter.ScreenCast.Session"
 #define SC_STREAM_IFACE "org.gnome.Mutter.ScreenCast.Stream"
 
+#define DISPLAY_CONFIG_BUS "org.gnome.Mutter.DisplayConfig"
+#define DISPLAY_CONFIG_PATH "/org/gnome/Mutter/DisplayConfig"
+#define DISPLAY_CONFIG_IFACE "org.gnome.Mutter.DisplayConfig"
+
+#define TOPOLOGY_SETTLE_TIMEOUT_MS 1500
+#define TOPOLOGY_NEAR_CLOSE_US 250000
+
 typedef struct {
     GMainLoop *loop;
     uint32_t node_id;
     int got_node;
     int timed_out;
 } StreamWait;
+
+/*
+ * There is only one external viewer slot. Keep one process-wide notification
+ * pipe stable across internal virtual-monitor recreation so SetDesktopSize
+ * cannot accidentally look like an external Stop request to the RFB relay.
+ */
+static int lifecycle_pipe[2] = {-1, -1};
+static gsize lifecycle_pipe_initialized = 0;
+
+static int
+set_fd_flags(int fd)
+{
+    int fd_flags = fcntl(fd, F_GETFD);
+    if (fd_flags < 0 || fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0)
+        return -1;
+
+    int status_flags = fcntl(fd, F_GETFL);
+    if (status_flags < 0 ||
+        fcntl(fd, F_SETFL, status_flags | O_NONBLOCK) < 0)
+        return -1;
+
+    return 0;
+}
+
+static void
+ensure_lifecycle_pipe(void)
+{
+    if (!g_once_init_enter(&lifecycle_pipe_initialized))
+        return;
+
+    int fds[2] = {-1, -1};
+    if (pipe(fds) == 0 &&
+        set_fd_flags(fds[0]) == 0 &&
+        set_fd_flags(fds[1]) == 0) {
+        lifecycle_pipe[0] = fds[0];
+        lifecycle_pipe[1] = fds[1];
+    }
+    else {
+        if (fds[0] >= 0)
+            close(fds[0]);
+        if (fds[1] >= 0)
+            close(fds[1]);
+        LOG_ERROR("Could not create Mutter lifecycle notification pipe: %s",
+                  strerror(errno));
+    }
+
+    g_once_init_leave(&lifecycle_pipe_initialized, 1);
+}
+
+int
+mutter_virtual_monitor_lifecycle_fd(void)
+{
+    ensure_lifecycle_pipe();
+    return lifecycle_pipe[0];
+}
+
+void
+mutter_virtual_monitor_lifecycle_drain(void)
+{
+    ensure_lifecycle_pipe();
+    if (lifecycle_pipe[0] < 0)
+        return;
+
+    unsigned char buffer[64];
+    for (;;) {
+        ssize_t n = read(lifecycle_pipe[0], buffer, sizeof(buffer));
+        if (n > 0)
+            continue;
+        if (n < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+}
+
+static void
+notify_external_lifecycle_close(void)
+{
+    ensure_lifecycle_pipe();
+    if (lifecycle_pipe[1] < 0)
+        return;
+
+    const unsigned char byte = 1;
+    ssize_t n;
+    do {
+        n = write(lifecycle_pipe[1], &byte, sizeof(byte));
+    } while (n < 0 && errno == EINTR);
+
+    /* EAGAIN only means a close notification is already pending. */
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+        LOG_DEBUG("Could not signal Mutter lifecycle close: %s", strerror(errno));
+}
 
 static int
 call_object_path(GDBusConnection *bus,
@@ -173,6 +274,254 @@ stream_timeout(gpointer user_data)
     return G_SOURCE_REMOVE;
 }
 
+static void
+lifecycle_signal(GDBusConnection *connection,
+                 const char *sender_name,
+                 const char *object_path,
+                 const char *interface_name,
+                 const char *signal_name,
+                 GVariant *parameters,
+                 gpointer user_data)
+{
+    (void)connection;
+    (void)sender_name;
+    (void)object_path;
+    (void)parameters;
+
+    MutterVirtualMonitor *monitor = user_data;
+
+    if (strcmp(interface_name, SC_SESSION_IFACE) == 0 &&
+        strcmp(signal_name, "Closed") == 0) {
+        int notify_external = 0;
+
+        g_mutex_lock(&monitor->lifecycle_mutex);
+        if (!monitor->lifecycle_closed) {
+            monitor->lifecycle_closed = 1;
+            monitor->lifecycle_closed_at_us = g_get_monotonic_time();
+            monitor->lifecycle_display_change_seq_at_close =
+                monitor->lifecycle_display_change_seq;
+            notify_external = !monitor->lifecycle_intentional_stop;
+        }
+        g_cond_broadcast(&monitor->lifecycle_cond);
+        g_mutex_unlock(&monitor->lifecycle_mutex);
+
+        if (notify_external) {
+            LOG_INFO("Mutter ScreenCast session was stopped externally");
+            notify_external_lifecycle_close();
+        }
+        return;
+    }
+
+    if (strcmp(interface_name, DISPLAY_CONFIG_IFACE) == 0 &&
+        strcmp(signal_name, "MonitorsChanged") == 0) {
+        g_mutex_lock(&monitor->lifecycle_mutex);
+        monitor->lifecycle_display_change_seq++;
+        monitor->lifecycle_last_display_change_us = g_get_monotonic_time();
+        g_cond_broadcast(&monitor->lifecycle_cond);
+        g_mutex_unlock(&monitor->lifecycle_mutex);
+    }
+}
+
+static gpointer
+lifecycle_thread_main(gpointer user_data)
+{
+    MutterVirtualMonitor *monitor = user_data;
+    GMainContext *context = g_main_context_new();
+    g_main_context_push_thread_default(context);
+
+    guint closed_subscription =
+        g_dbus_connection_signal_subscribe(monitor->bus,
+                                           SC_BUS,
+                                           SC_SESSION_IFACE,
+                                           "Closed",
+                                           monitor->sc_session_path,
+                                           NULL,
+                                           G_DBUS_SIGNAL_FLAGS_NONE,
+                                           lifecycle_signal,
+                                           monitor,
+                                           NULL);
+
+    guint monitors_subscription =
+        g_dbus_connection_signal_subscribe(monitor->bus,
+                                           DISPLAY_CONFIG_BUS,
+                                           DISPLAY_CONFIG_IFACE,
+                                           "MonitorsChanged",
+                                           DISPLAY_CONFIG_PATH,
+                                           NULL,
+                                           G_DBUS_SIGNAL_FLAGS_NONE,
+                                           lifecycle_signal,
+                                           monitor,
+                                           NULL);
+
+    g_mutex_lock(&monitor->lifecycle_mutex);
+    monitor->lifecycle_context = g_main_context_ref(context);
+    monitor->lifecycle_closed_subscription = closed_subscription;
+    monitor->lifecycle_monitors_subscription = monitors_subscription;
+    monitor->lifecycle_ready = 1;
+    g_cond_broadcast(&monitor->lifecycle_cond);
+    g_mutex_unlock(&monitor->lifecycle_mutex);
+
+    for (;;) {
+        g_mutex_lock(&monitor->lifecycle_mutex);
+        int stop_requested = monitor->lifecycle_stop_requested;
+        g_mutex_unlock(&monitor->lifecycle_mutex);
+
+        if (stop_requested)
+            break;
+
+        (void)g_main_context_iteration(context, TRUE);
+    }
+
+    if (closed_subscription != 0)
+        g_dbus_connection_signal_unsubscribe(monitor->bus,
+                                             closed_subscription);
+    if (monitors_subscription != 0)
+        g_dbus_connection_signal_unsubscribe(monitor->bus,
+                                             monitors_subscription);
+
+    g_mutex_lock(&monitor->lifecycle_mutex);
+    monitor->lifecycle_closed_subscription = 0;
+    monitor->lifecycle_monitors_subscription = 0;
+    GMainContext *stored_context = monitor->lifecycle_context;
+    monitor->lifecycle_context = NULL;
+    g_cond_broadcast(&monitor->lifecycle_cond);
+    g_mutex_unlock(&monitor->lifecycle_mutex);
+
+    if (stored_context)
+        g_main_context_unref(stored_context);
+
+    g_main_context_pop_thread_default(context);
+    g_main_context_unref(context);
+    return NULL;
+}
+
+static int
+start_lifecycle_watcher(MutterVirtualMonitor *monitor)
+{
+    ensure_lifecycle_pipe();
+
+    g_mutex_init(&monitor->lifecycle_mutex);
+    g_cond_init(&monitor->lifecycle_cond);
+    monitor->lifecycle_sync_initialized = 1;
+
+    GError *error = NULL;
+    monitor->lifecycle_thread =
+        g_thread_try_new("vnc-mutter-lifecycle",
+                         lifecycle_thread_main,
+                         monitor,
+                         &error);
+
+    if (!monitor->lifecycle_thread) {
+        LOG_ERROR("Could not start Mutter lifecycle watcher: %s",
+                  error ? error->message : "unknown error");
+        g_clear_error(&error);
+        g_cond_clear(&monitor->lifecycle_cond);
+        g_mutex_clear(&monitor->lifecycle_mutex);
+        monitor->lifecycle_sync_initialized = 0;
+        return -1;
+    }
+
+    g_mutex_lock(&monitor->lifecycle_mutex);
+    while (!monitor->lifecycle_ready)
+        g_cond_wait(&monitor->lifecycle_cond, &monitor->lifecycle_mutex);
+    g_mutex_unlock(&monitor->lifecycle_mutex);
+
+    return 0;
+}
+
+static void
+wait_for_topology_settle(MutterVirtualMonitor *monitor)
+{
+    if (!monitor->lifecycle_sync_initialized)
+        return;
+
+    const gint64 deadline =
+        g_get_monotonic_time() +
+        (gint64)TOPOLOGY_SETTLE_TIMEOUT_MS * 1000;
+
+    int closed = 0;
+    int topology_seen = 0;
+
+    g_mutex_lock(&monitor->lifecycle_mutex);
+
+    while (!monitor->lifecycle_closed) {
+        if (!g_cond_wait_until(&monitor->lifecycle_cond,
+                               &monitor->lifecycle_mutex,
+                               deadline))
+            break;
+    }
+
+    closed = monitor->lifecycle_closed;
+
+    while (closed) {
+        const int changed_after_close =
+            monitor->lifecycle_display_change_seq >
+            monitor->lifecycle_display_change_seq_at_close;
+
+        gint64 delta_us =
+            monitor->lifecycle_last_display_change_us -
+            monitor->lifecycle_closed_at_us;
+        if (delta_us < 0)
+            delta_us = -delta_us;
+
+        const int changed_near_close =
+            monitor->lifecycle_last_display_change_us > 0 &&
+            delta_us <= TOPOLOGY_NEAR_CLOSE_US;
+
+        if (changed_after_close || changed_near_close) {
+            topology_seen = 1;
+            break;
+        }
+
+        if (!g_cond_wait_until(&monitor->lifecycle_cond,
+                               &monitor->lifecycle_mutex,
+                               deadline))
+            break;
+    }
+
+    g_mutex_unlock(&monitor->lifecycle_mutex);
+
+    if (!closed) {
+        LOG_DEBUG("Mutter ScreenCast Closed was not observed during teardown");
+    }
+    else if (!topology_seen) {
+        LOG_DEBUG("Mutter DisplayConfig did not signal a topology change within %d ms",
+                  TOPOLOGY_SETTLE_TIMEOUT_MS);
+    }
+    else {
+        LOG_DEBUG("Mutter monitor topology settled after ScreenCast close");
+    }
+}
+
+static void
+stop_lifecycle_watcher(MutterVirtualMonitor *monitor)
+{
+    if (!monitor->lifecycle_sync_initialized)
+        return;
+
+    GMainContext *context = NULL;
+
+    g_mutex_lock(&monitor->lifecycle_mutex);
+    monitor->lifecycle_stop_requested = 1;
+    if (monitor->lifecycle_context)
+        context = g_main_context_ref(monitor->lifecycle_context);
+    g_mutex_unlock(&monitor->lifecycle_mutex);
+
+    if (context) {
+        g_main_context_wakeup(context);
+        g_main_context_unref(context);
+    }
+
+    if (monitor->lifecycle_thread) {
+        g_thread_join(monitor->lifecycle_thread);
+        monitor->lifecycle_thread = NULL;
+    }
+
+    g_cond_clear(&monitor->lifecycle_cond);
+    g_mutex_clear(&monitor->lifecycle_mutex);
+    monitor->lifecycle_sync_initialized = 0;
+}
+
 int
 mutter_virtual_monitor_start(MutterVirtualMonitor *monitor,
                              int timeout_ms,
@@ -249,6 +598,9 @@ mutter_virtual_monitor_start(MutterVirtualMonitor *monitor,
                          &monitor->stream_path) < 0)
         goto fail;
 
+    if (start_lifecycle_watcher(monitor) < 0)
+        goto fail;
+
     StreamWait wait = {0};
     wait.loop = g_main_loop_new(NULL, FALSE);
 
@@ -309,7 +661,20 @@ mutter_virtual_monitor_stop(MutterVirtualMonitor *monitor)
     if (!monitor)
         return;
 
-    if (monitor->started && monitor->bus && monitor->rd_session_path) {
+    int already_closed = 0;
+
+    if (monitor->lifecycle_sync_initialized) {
+        g_mutex_lock(&monitor->lifecycle_mutex);
+        already_closed = monitor->lifecycle_closed;
+        if (!already_closed)
+            monitor->lifecycle_intentional_stop = 1;
+        g_mutex_unlock(&monitor->lifecycle_mutex);
+    }
+
+    if (monitor->started &&
+        !already_closed &&
+        monitor->bus &&
+        monitor->rd_session_path) {
         /* Stopping RD is what removes the virtual monitor from GNOME. */
         (void)call_void(monitor->bus,
                         RD_BUS,
@@ -317,6 +682,11 @@ mutter_virtual_monitor_stop(MutterVirtualMonitor *monitor)
                         RD_SESSION_IFACE,
                         "Stop");
     }
+
+    if (monitor->started)
+        wait_for_topology_settle(monitor);
+
+    stop_lifecycle_watcher(monitor);
 
     monitor->started = 0;
     monitor->node_id = 0;
