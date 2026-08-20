@@ -1,7 +1,7 @@
 CC ?= gcc
 
 CPPFLAGS += -D_GNU_SOURCE -Iinclude
-CFLAGS   += -O2 -Wall -Wextra -Wpedantic -pthread -MMD -MP
+CFLAGS   += -O2 -Wall -Wextra -pthread -MMD -MP
 
 PACKAGES := libvncserver openssl nettle glib-2.0 gio-2.0 \
 	gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 libpipewire-0.3
