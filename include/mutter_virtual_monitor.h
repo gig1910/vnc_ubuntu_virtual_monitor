@@ -15,24 +15,19 @@ typedef struct {
     int started;
 
     /*
-     * The RFB relay does not run a GLib main loop. A dedicated context/thread
-     * watches ScreenCast.Session.Closed and DisplayConfig.MonitorsChanged.
+     * Mutter's shell Stop action is authoritative even on versions where a
+     * usable Session.Closed signal is not delivered to this client. A small
+     * watcher therefore verifies that the exact RemoteDesktop session object
+     * remains alive and translates its disappearance to the RFB relay fd.
      */
     GThread *lifecycle_thread;
-    GMainContext *lifecycle_context;
     GMutex lifecycle_mutex;
-    GCond lifecycle_cond;
-    guint lifecycle_closed_subscription;
-    guint lifecycle_monitors_subscription;
-    guint lifecycle_display_change_seq;
-    guint lifecycle_display_change_seq_at_close;
-    gint64 lifecycle_closed_at_us;
-    gint64 lifecycle_last_display_change_us;
     int lifecycle_sync_initialized;
-    int lifecycle_ready;
     int lifecycle_stop_requested;
-    int lifecycle_closed;
     int lifecycle_intentional_stop;
+    int lifecycle_closed;
+    guint32 lifecycle_last_display_serial;
+    guint32 lifecycle_display_serial_before_close;
 } MutterVirtualMonitor;
 
 int mutter_virtual_monitor_start(
@@ -42,9 +37,9 @@ int mutter_virtual_monitor_start(
 
 /*
  * Stable process-wide notification fd used by the single active RFB relay.
- * It becomes readable when Mutter closes the active ScreenCast session for an
- * external reason (for example GNOME Shell's Stop sharing action). Internal
- * monitor recreation/teardown does not signal this fd.
+ * It becomes readable when Mutter destroys the active RemoteDesktop session
+ * externally (for example GNOME Shell's Stop sharing action). Internal monitor
+ * recreation/teardown never signals this fd.
  */
 int mutter_virtual_monitor_lifecycle_fd(void);
 void mutter_virtual_monitor_lifecycle_drain(void);
