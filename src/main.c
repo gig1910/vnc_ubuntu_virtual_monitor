@@ -14,12 +14,26 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int running;
+    int client_fd;
+    char peer_addr[INET_ADDRSTRLEN];
+
+    const RuntimeConfig *cfg;
+    FrameBridge *frames;
+    PipelineStats *pipeline_stats;
+} ClientSlot;
 
 static int
 create_public_listener(const RuntimeConfig *cfg)
@@ -47,16 +61,61 @@ create_public_listener(const RuntimeConfig *cfg)
 }
 
 static void
+set_client_socket_option(int fd,
+                         int level,
+                         int option,
+                         int value,
+                         const char *name)
+{
+    if (setsockopt(fd, level, option, &value, sizeof(value)) < 0) {
+        LOG_DEBUG("Could not set client %s=%d: %s",
+                  name,
+                  value,
+                  strerror(errno));
+    }
+}
+
+static void
 configure_external_socket(int client_fd, const RuntimeConfig *cfg)
 {
-    if (setsockopt(client_fd,
-                   SOL_SOCKET,
-                   SO_SNDBUF,
-                   &cfg->external_send_buffer,
-                   sizeof(cfg->external_send_buffer)) < 0) {
-        LOG_DEBUG("Could not set external SO_SNDBUF: %s", strerror(errno));
-        return;
-    }
+    set_client_socket_option(client_fd,
+                             SOL_SOCKET,
+                             SO_SNDBUF,
+                             cfg->external_send_buffer,
+                             "SO_SNDBUF");
+
+    /*
+     * Detect a vanished Wi-Fi/LAN peer even when the framebuffer is static.
+     * This is deliberately TCP liveness, not an application-idle timeout:
+     * healthy viewers may stay connected indefinitely without RFB activity.
+     */
+    set_client_socket_option(client_fd,
+                             SOL_SOCKET,
+                             SO_KEEPALIVE,
+                             1,
+                             "SO_KEEPALIVE");
+    set_client_socket_option(client_fd,
+                             IPPROTO_TCP,
+                             TCP_KEEPIDLE,
+                             cfg->client_keepalive_idle_s,
+                             "TCP_KEEPIDLE");
+    set_client_socket_option(client_fd,
+                             IPPROTO_TCP,
+                             TCP_KEEPINTVL,
+                             cfg->client_keepalive_interval_s,
+                             "TCP_KEEPINTVL");
+    set_client_socket_option(client_fd,
+                             IPPROTO_TCP,
+                             TCP_KEEPCNT,
+                             cfg->client_keepalive_probes,
+                             "TCP_KEEPCNT");
+#ifdef TCP_USER_TIMEOUT
+    set_client_socket_option(client_fd,
+                             IPPROTO_TCP,
+                             TCP_USER_TIMEOUT,
+                             cfg->client_user_timeout_ms,
+                             "TCP_USER_TIMEOUT");
+#endif
 
     if (!vnc_log_enabled(VNC_LOG_DEBUG))
         return;
@@ -72,6 +131,27 @@ configure_external_socket(int client_fd, const RuntimeConfig *cfg)
                   cfg->external_send_buffer,
                   actual);
     }
+
+    LOG_DEBUG("Client liveness: keepalive idle=%ds interval=%ds probes=%d user-timeout=%dms",
+              cfg->client_keepalive_idle_s,
+              cfg->client_keepalive_interval_s,
+              cfg->client_keepalive_probes,
+              cfg->client_user_timeout_ms);
+}
+
+static void
+reject_additional_client(int client_fd, const char *peer_addr)
+{
+    /* RST makes a second viewer fail immediately instead of waiting in EOF. */
+    struct linger reset = {
+        .l_onoff = 1,
+        .l_linger = 0
+    };
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+
+    LOG_INFO("Rejected additional client: %s (strong single-connect policy)",
+             peer_addr ? peer_addr : "unknown");
+    close(client_fd);
 }
 
 static void
@@ -153,6 +233,112 @@ out:
     ra2_session_clear(&session);
 }
 
+static void *
+client_worker(void *arg)
+{
+    ClientSlot *slot = arg;
+
+    pthread_mutex_lock(&slot->mutex);
+    int client_fd = slot->client_fd;
+    char peer_addr[INET_ADDRSTRLEN];
+    snprintf(peer_addr, sizeof(peer_addr), "%s", slot->peer_addr);
+    const RuntimeConfig *cfg = slot->cfg;
+    FrameBridge *frames = slot->frames;
+    PipelineStats *pipeline_stats = slot->pipeline_stats;
+    pthread_mutex_unlock(&slot->mutex);
+
+    LOG_INFO("Client connected: %s", peer_addr);
+    serve_client(client_fd, cfg, frames, pipeline_stats);
+
+    shutdown_signal_unregister_fd(client_fd);
+    close(client_fd);
+    LOG_INFO("Client disconnected: %s", peer_addr);
+
+    pthread_mutex_lock(&slot->mutex);
+    slot->client_fd = -1;
+    slot->running = 0;
+    pthread_cond_broadcast(&slot->cond);
+    pthread_mutex_unlock(&slot->mutex);
+    return NULL;
+}
+
+static int
+start_client_worker(ClientSlot *slot,
+                    int client_fd,
+                    const char *peer_addr,
+                    const RuntimeConfig *cfg,
+                    FrameBridge *frames,
+                    PipelineStats *pipeline_stats)
+{
+    pthread_mutex_lock(&slot->mutex);
+
+    if (slot->running) {
+        pthread_mutex_unlock(&slot->mutex);
+        return 1;
+    }
+
+    slot->running = 1;
+    slot->client_fd = client_fd;
+    slot->cfg = cfg;
+    slot->frames = frames;
+    slot->pipeline_stats = pipeline_stats;
+    snprintf(slot->peer_addr,
+             sizeof(slot->peer_addr),
+             "%s",
+             peer_addr ? peer_addr : "unknown");
+
+    pthread_mutex_unlock(&slot->mutex);
+
+    if (shutdown_signal_register_fd(client_fd) < 0)
+        LOG_DEBUG("Could not register client socket for shutdown");
+
+    configure_external_socket(client_fd, cfg);
+
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        shutdown_signal_unregister_fd(client_fd);
+        pthread_mutex_lock(&slot->mutex);
+        slot->running = 0;
+        slot->client_fd = -1;
+        pthread_cond_broadcast(&slot->cond);
+        pthread_mutex_unlock(&slot->mutex);
+        return -1;
+    }
+
+    (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    pthread_t thread;
+    int rc = pthread_create(&thread, &attr, client_worker, slot);
+    pthread_attr_destroy(&attr);
+
+    if (rc != 0) {
+        shutdown_signal_unregister_fd(client_fd);
+        pthread_mutex_lock(&slot->mutex);
+        slot->running = 0;
+        slot->client_fd = -1;
+        pthread_cond_broadcast(&slot->cond);
+        pthread_mutex_unlock(&slot->mutex);
+        errno = rc;
+        return -1;
+    }
+
+    return 0;
+}
+
+static void
+wait_for_client_slot(ClientSlot *slot)
+{
+    pthread_mutex_lock(&slot->mutex);
+
+    if (slot->running && slot->client_fd >= 0)
+        (void)shutdown(slot->client_fd, SHUT_RDWR);
+
+    while (slot->running)
+        pthread_cond_wait(&slot->cond, &slot->mutex);
+
+    pthread_mutex_unlock(&slot->mutex);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -191,11 +377,26 @@ main(int argc, char **argv)
         return 1;
     }
 
+    ClientSlot client_slot;
+    memset(&client_slot, 0, sizeof(client_slot));
+    client_slot.client_fd = -1;
+
+    if (pthread_mutex_init(&client_slot.mutex, NULL) != 0 ||
+        pthread_cond_init(&client_slot.cond, NULL) != 0) {
+        LOG_ERROR("Failed to initialize single-client session slot");
+        frame_bridge_destroy(&frames);
+        shutdown_signal_cleanup();
+        pipeline_stats_destroy(&pipeline_stats);
+        return 1;
+    }
+
     int listen_fd = create_public_listener(&cfg);
     if (listen_fd < 0) {
         LOG_ERROR("Could not create public listener on TCP/%d: %s",
                   cfg.public_port,
                   strerror(errno));
+        pthread_cond_destroy(&client_slot.cond);
+        pthread_mutex_destroy(&client_slot.mutex);
         frame_bridge_destroy(&frames);
         shutdown_signal_cleanup();
         pipeline_stats_destroy(&pipeline_stats);
@@ -205,7 +406,7 @@ main(int argc, char **argv)
     if (shutdown_signal_register_fd(listen_fd) < 0)
         LOG_DEBUG("Could not register public listener for shutdown");
 
-    LOG_INFO("VNC Monitor %s ready on TCP/%d (screen=%s fallback=%dx%d; virtual monitor is created on client connection)",
+    LOG_INFO("VNC Monitor %s ready on TCP/%d (strong single-connect; screen=%s fallback=%dx%d; virtual monitor is created on client connection)",
              VNC_MONITOR_VERSION,
              cfg.public_port,
              runtime_config_screen_size_mode_name(cfg.screen_size_mode),
@@ -264,23 +465,36 @@ main(int argc, char **argv)
                         peer_addr,
                         sizeof(peer_addr));
 
-        LOG_INFO("Client connected: %s", peer_addr);
+        int start_rc = start_client_worker(&client_slot,
+                                           client_fd,
+                                           peer_addr,
+                                           &cfg,
+                                           &frames,
+                                           &pipeline_stats);
 
-        if (shutdown_signal_register_fd(client_fd) < 0)
-            LOG_DEBUG("Could not register client socket for shutdown");
+        if (start_rc > 0) {
+            reject_additional_client(client_fd, peer_addr);
+            continue;
+        }
 
-        configure_external_socket(client_fd, &cfg);
-        serve_client(client_fd, &cfg, &frames, &pipeline_stats);
-
-        shutdown_signal_unregister_fd(client_fd);
-        close(client_fd);
-        LOG_INFO("Client disconnected: %s", peer_addr);
+        if (start_rc < 0) {
+            LOG_ERROR("Could not start client session for %s: %s",
+                      peer_addr,
+                      strerror(errno));
+            close(client_fd);
+        }
     }
 
     LOG_INFO("Stopping VNC Monitor");
 
     shutdown_signal_unregister_fd(listen_fd);
     close(listen_fd);
+
+    /* The shared framebuffer/stats outlive the only permitted client worker. */
+    wait_for_client_slot(&client_slot);
+
+    pthread_cond_destroy(&client_slot.cond);
+    pthread_mutex_destroy(&client_slot.mutex);
     frame_bridge_destroy(&frames);
     shutdown_signal_cleanup();
     pipeline_stats_destroy(&pipeline_stats);
