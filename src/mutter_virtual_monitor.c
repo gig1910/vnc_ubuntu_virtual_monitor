@@ -290,7 +290,7 @@ lifecycle_signal(GDBusConnection *connection,
 
     MutterVirtualMonitor *monitor = user_data;
 
-    if (strcmp(interface_name, SC_SESSION_IFACE) == 0 &&
+    if (strcmp(interface_name, RD_SESSION_IFACE) == 0 &&
         strcmp(signal_name, "Closed") == 0) {
         int notify_external = 0;
 
@@ -306,7 +306,7 @@ lifecycle_signal(GDBusConnection *connection,
         g_mutex_unlock(&monitor->lifecycle_mutex);
 
         if (notify_external) {
-            LOG_INFO("Mutter ScreenCast session was stopped externally");
+            LOG_INFO("Mutter RemoteDesktop session was stopped externally");
             notify_external_lifecycle_close();
         }
         return;
@@ -331,10 +331,10 @@ lifecycle_thread_main(gpointer user_data)
 
     guint closed_subscription =
         g_dbus_connection_signal_subscribe(monitor->bus,
-                                           SC_BUS,
-                                           SC_SESSION_IFACE,
+                                           RD_BUS,
+                                           RD_SESSION_IFACE,
                                            "Closed",
-                                           monitor->sc_session_path,
+                                           monitor->rd_session_path,
                                            NULL,
                                            G_DBUS_SIGNAL_FLAGS_NONE,
                                            lifecycle_signal,
@@ -482,14 +482,14 @@ wait_for_topology_settle(MutterVirtualMonitor *monitor)
     g_mutex_unlock(&monitor->lifecycle_mutex);
 
     if (!closed) {
-        LOG_DEBUG("Mutter ScreenCast Closed was not observed during teardown");
+        LOG_DEBUG("Mutter RemoteDesktop Closed was not observed during teardown");
     }
     else if (!topology_seen) {
         LOG_DEBUG("Mutter DisplayConfig did not signal a topology change within %d ms",
                   TOPOLOGY_SETTLE_TIMEOUT_MS);
     }
     else {
-        LOG_DEBUG("Mutter monitor topology settled after ScreenCast close");
+        LOG_DEBUG("Mutter monitor topology settled after RemoteDesktop close");
     }
 }
 
