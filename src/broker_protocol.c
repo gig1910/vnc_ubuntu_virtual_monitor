@@ -8,18 +8,45 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-int
-vnc_broker_send_handoff(int control_fd,
-                        int client_fd,
-                        uid_t uid,
-                        const char *session_id,
-                        const char *peer_addr)
+const char *
+vnc_broker_transport_name(uint16_t transport)
 {
+    switch (transport) {
+        case VNC_BROKER_TRANSPORT_VNC:
+            return "vnc";
+        case VNC_BROKER_TRANSPORT_WEBRTC:
+            return "webrtc";
+        default:
+            return "unknown";
+    }
+}
+
+int
+vnc_broker_send_handoff_transport(int control_fd,
+                                  VncBrokerTransport transport,
+                                  int client_fd,
+                                  uid_t uid,
+                                  const char *session_id,
+                                  const char *peer_addr)
+{
+    if (transport != VNC_BROKER_TRANSPORT_VNC &&
+        transport != VNC_BROKER_TRANSPORT_WEBRTC) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if ((transport == VNC_BROKER_TRANSPORT_VNC && client_fd < 0) ||
+        (transport == VNC_BROKER_TRANSPORT_WEBRTC && client_fd >= 0)) {
+        errno = EINVAL;
+        return -1;
+    }
+
     VncBrokerHandoff handoff;
     memset(&handoff, 0, sizeof(handoff));
 
     handoff.magic = VNC_BROKER_PROTOCOL_MAGIC;
     handoff.version = VNC_BROKER_PROTOCOL_VERSION;
+    handoff.transport = (uint16_t)transport;
     handoff.uid = (uint32_t)uid;
 
     if (session_id)
@@ -39,14 +66,17 @@ vnc_broker_send_handoff(int control_fd,
     memset(&msg, 0, sizeof(msg));
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
 
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &client_fd, sizeof(client_fd));
+    if (client_fd >= 0) {
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &client_fd, sizeof(client_fd));
+    }
 
     ssize_t n;
     do {
@@ -54,6 +84,21 @@ vnc_broker_send_handoff(int control_fd,
     } while (n < 0 && errno == EINTR);
 
     return n == (ssize_t)sizeof(handoff) ? 0 : -1;
+}
+
+int
+vnc_broker_send_handoff(int control_fd,
+                        int client_fd,
+                        uid_t uid,
+                        const char *session_id,
+                        const char *peer_addr)
+{
+    return vnc_broker_send_handoff_transport(control_fd,
+                                             VNC_BROKER_TRANSPORT_VNC,
+                                             client_fd,
+                                             uid,
+                                             session_id,
+                                             peer_addr);
 }
 
 int
@@ -111,10 +156,17 @@ vnc_broker_recv_handoff(int control_fd,
         }
     }
 
-    if (received_fd < 0 ||
-        handoff->magic != VNC_BROKER_PROTOCOL_MAGIC ||
+    if (handoff->magic != VNC_BROKER_PROTOCOL_MAGIC ||
         handoff->version != VNC_BROKER_PROTOCOL_VERSION ||
-        handoff->session_id[0] == '\0') {
+        handoff->session_id[0] == '\0' ||
+        (handoff->transport != VNC_BROKER_TRANSPORT_VNC &&
+         handoff->transport != VNC_BROKER_TRANSPORT_WEBRTC)) {
+        errno = EPROTO;
+        goto fail;
+    }
+
+    if ((handoff->transport == VNC_BROKER_TRANSPORT_VNC && received_fd < 0) ||
+        (handoff->transport == VNC_BROKER_TRANSPORT_WEBRTC && received_fd >= 0)) {
         errno = EPROTO;
         goto fail;
     }
