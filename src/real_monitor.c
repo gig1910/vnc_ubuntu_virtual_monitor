@@ -5,6 +5,27 @@
 #include <inttypes.h>
 #include <string.h>
 
+static void
+real_monitor_stop_internal(RealMonitor *real, int log_removed)
+{
+    if (!real)
+        return;
+
+    if (real->active) {
+        if (real->capture_backend == CAPTURE_BACKEND_PIPEWIRE)
+            pipewire_capture_stop(&real->pipewire_capture);
+        else
+            gstreamer_capture_stop(&real->gstreamer_capture);
+
+        mutter_virtual_monitor_stop(&real->monitor);
+    }
+
+    real->active = 0;
+
+    if (log_removed)
+        LOG_INFO("Virtual monitor removed");
+}
+
 int
 real_monitor_start(RealMonitor *real,
                    const RuntimeConfig *cfg,
@@ -81,18 +102,76 @@ real_monitor_start(RealMonitor *real,
     return 0;
 }
 
+int
+real_monitor_resize(RealMonitor *real,
+                    RuntimeConfig *cfg,
+                    FrameBridge *bridge,
+                    PipelineStats *stats,
+                    int width,
+                    int height)
+{
+    if (!real || !cfg || !bridge || width <= 0 || height <= 0)
+        return -1;
+
+    if (cfg->width == width && cfg->height == height)
+        return 0;
+
+    int old_width = cfg->width;
+    int old_height = cfg->height;
+
+    LOG_INFO("Resizing virtual monitor: %dx%d -> %dx%d",
+             old_width,
+             old_height,
+             width,
+             height);
+
+    real_monitor_stop_internal(real, 0);
+
+    if (frame_bridge_resize(bridge, width, height) < 0) {
+        LOG_ERROR("Could not resize FrameBridge to %dx%d", width, height);
+        cfg->width = old_width;
+        cfg->height = old_height;
+        (void)real_monitor_start(real, cfg, bridge, stats);
+        return -1;
+    }
+
+    cfg->width = width;
+    cfg->height = height;
+
+    if (real_monitor_start(real, cfg, bridge, stats) == 0) {
+        LOG_INFO("Virtual monitor resize complete: %dx%d", width, height);
+        return 0;
+    }
+
+    LOG_ERROR("Virtual monitor resize to %dx%d failed; restoring %dx%d",
+              width,
+              height,
+              old_width,
+              old_height);
+
+    real_monitor_stop_internal(real, 0);
+
+    if (frame_bridge_resize(bridge, old_width, old_height) < 0) {
+        LOG_ERROR("Could not restore FrameBridge to %dx%d", old_width, old_height);
+        return -1;
+    }
+
+    cfg->width = old_width;
+    cfg->height = old_height;
+
+    if (real_monitor_start(real, cfg, bridge, stats) < 0) {
+        LOG_ERROR("Could not restore previous virtual monitor after failed resize");
+        return -1;
+    }
+
+    LOG_INFO("Previous virtual monitor restored: %dx%d",
+             old_width,
+             old_height);
+    return -1;
+}
+
 void
 real_monitor_stop(RealMonitor *real)
 {
-    if (!real)
-        return;
-
-    if (real->capture_backend == CAPTURE_BACKEND_PIPEWIRE)
-        pipewire_capture_stop(&real->pipewire_capture);
-    else
-        gstreamer_capture_stop(&real->gstreamer_capture);
-
-    mutter_virtual_monitor_stop(&real->monitor);
-    real->active = 0;
-    LOG_INFO("Virtual monitor removed");
+    real_monitor_stop_internal(real, 1);
 }
