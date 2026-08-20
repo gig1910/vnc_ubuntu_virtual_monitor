@@ -21,7 +21,7 @@ SOURCES := \
 	src/test_pattern.c \
 	src/frame_bridge.c \
 	src/frame_diff.c \
-	src/adaptive_rfb.c \
+	src/adaptive_rfb_copyrect.c \
 	src/pipeline_stats.c \
 	src/monitor_layout_cache.c \
 	src/mutter_virtual_monitor.c \
