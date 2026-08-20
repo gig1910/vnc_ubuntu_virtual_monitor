@@ -5,11 +5,13 @@
 #include <sys/types.h>
 
 #define VNC_BROKER_PROTOCOL_MAGIC       0x564d4231u /* VMB1 */
-#define VNC_BROKER_PROTOCOL_VERSION     2u
+#define VNC_BROKER_PROTOCOL_VERSION     1u
 #define VNC_BROKER_SESSION_ID_MAX       64
 #define VNC_BROKER_PEER_ADDR_MAX        64
 
 typedef enum {
+    /* Protocol-v1 handoffs from beta.3 used zero in this former reserved field. */
+    VNC_BROKER_TRANSPORT_LEGACY_VNC = 0,
     VNC_BROKER_TRANSPORT_VNC = 1,
     VNC_BROKER_TRANSPORT_WEBRTC = 2
 } VncBrokerTransport;
@@ -45,6 +47,10 @@ int vnc_broker_send_handoff(int control_fd,
  * VNC transports one accepted TCP fd with SCM_RIGHTS.
  * WebRTC is broker-terminated HTTPS/WSS and therefore carries no browser fd;
  * its signalling/control messages will use the broker-agent control channel.
+ *
+ * The current fixed-size protocol remains wire-version 1. The old reserved
+ * uint16_t is reused as this discriminator; value 0 remains legacy VNC so
+ * beta.3 broker/agent processes can coexist briefly during an upgrade.
  */
 int vnc_broker_send_handoff_transport(int control_fd,
                                       VncBrokerTransport transport,
