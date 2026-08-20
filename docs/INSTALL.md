@@ -13,6 +13,8 @@ Do not convert the main daemon to a root system service. Doing so breaks the ses
 
 The internal LibVNCServer backend is session-scoped in beta.2: `127.0.0.1:5903` is opened only after a viewer has completed RA2r/PAM authentication and is closed on disconnect.
 
+The public server policy is **strong single-connect**: exactly one viewer may own the virtual monitor. While that session runs, the public listener remains responsive only so extra connection attempts can be rejected immediately instead of waiting in the listen backlog.
+
 ## Unified installer
 
 The preferred installation/upgrade entrypoint is:
@@ -183,6 +185,10 @@ backend-port=5903
 backend-bind=127.0.0.1
 external-send-buffer=65536
 backend-recv-buffer=65536
+client-keepalive-idle=15
+client-keepalive-interval=5
+client-keepalive-probes=3
+client-user-timeout-ms=20000
 
 [ra2]
 record-size=16384
@@ -191,17 +197,40 @@ coalesce-us=500
 key=$HOME/.config/vnc-monitor/ra2-server-key.pem
 auth-socket=/run/vnc-monitor-auth.sock
 
-[rfb]
-zrle=on
-raw=on
-cursor=on
-newfbsize=on
-
 [logging]
 level=info
 ```
 
 Paths accept absolute paths, `~/...`, or `$HOME/...`.
+
+An existing local config created before the liveness keys were introduced does not need to be rewritten: missing keys inherit the built-in defaults shown above.
+
+## Strong single-connect and lost-client handling
+
+The server does not support concurrent viewers in beta.2. The active connection owns the entire virtual-display session from RA2 negotiation through monitor teardown.
+
+Unlike the older blocking listener implementation, the public `accept()` loop remains active while the one client session runs. A second connection is accepted only long enough to detect the conflict, then its socket is reset/closed immediately and an `info` log entry reports the rejection. The active viewer is not interrupted.
+
+The active external socket is configured with TCP liveness detection before RA2 negotiation:
+
+```ini
+[network]
+client-keepalive-idle=15
+client-keepalive-interval=5
+client-keepalive-probes=3
+client-user-timeout-ms=20000
+```
+
+Meaning:
+
+- `client-keepalive-idle` — seconds of transport idleness before the kernel starts keepalive probing;
+- `client-keepalive-interval` — seconds between unanswered keepalive probes;
+- `client-keepalive-probes` — number of failed probes allowed;
+- `client-user-timeout-ms` — maximum period for unacknowledged transmitted TCP data (`TCP_USER_TIMEOUT`).
+
+These values detect a **dead peer**, not an idle application. A healthy iPad/viewer showing a static image remains connected indefinitely because it continues to answer TCP keepalive probes.
+
+If Wi-Fi disappears, the client sleeps hard, or the route is otherwise lost without FIN/RST, the kernel eventually reports the socket failure. That causes the RA2 relay to exit, the per-session backend/capture/Mutter monitor to be removed, and the single-client slot to become available again. Exact detection time is kernel/network-state dependent; with the defaults it is intended to be in the order of tens of seconds rather than indefinite.
 
 ## Display size: auto vs fixed
 
@@ -286,7 +315,14 @@ RA2r/PAM
   -> adaptive RFB transport
 ```
 
-Disconnect tears down the backend, capture and virtual monitor and returns to the public listener.
+While active:
+
+```text
+second client -> immediate reset/reject
+lost active TCP peer -> keepalive/user-timeout -> teardown
+```
+
+Disconnect or detected dead peer tears down the backend, capture and virtual monitor and returns to the public listener.
 
 ## Service commands
 
@@ -319,6 +355,8 @@ level=debug
 ```
 
 then restart the user service. Available values are `error`, `info`, `debug`, and `trace` (or `0..3`). Use `trace` only for short diagnostics.
+
+At `info`, rejected extra clients are visible. At `debug`, the effective TCP keepalive/user-timeout values are also logged when a client socket is accepted.
 
 CLI `--verbose` still overrides the config for foreground tests.
 
