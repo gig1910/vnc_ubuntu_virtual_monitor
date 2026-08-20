@@ -61,6 +61,42 @@ frame_bridge_init(
     return 0;
 }
 
+int
+frame_bridge_resize(
+    FrameBridge *bridge,
+    int width,
+    int height)
+{
+    if (!bridge || !bridge->initialized || width <= 0 || height <= 0)
+        return -1;
+
+    pthread_mutex_lock(&bridge->mutex);
+    if (bridge->width == width && bridge->height == height) {
+        pthread_mutex_unlock(&bridge->mutex);
+        return 0;
+    }
+    pthread_mutex_unlock(&bridge->mutex);
+
+    uint8_t *new_pixels =
+        calloc((size_t)width * (size_t)height, 4);
+    if (!new_pixels)
+        return -1;
+
+    pthread_mutex_lock(&bridge->mutex);
+
+    uint8_t *old_pixels = bridge->pixels;
+    bridge->pixels = new_pixels;
+    bridge->width = width;
+    bridge->height = height;
+    bridge->sequence++;
+    pthread_cond_broadcast(&bridge->cond);
+
+    pthread_mutex_unlock(&bridge->mutex);
+
+    free(old_pixels);
+    return 0;
+}
+
 void
 frame_bridge_clear(FrameBridge *bridge)
 {
@@ -103,27 +139,22 @@ frame_bridge_publish_bgrx(
     int width,
     int height)
 {
-    if (
-        !bridge ||
-        !bridge->initialized ||
-        !data ||
-        width != bridge->width ||
-        height != bridge->height ||
-        stride < width * 4
-    )
+    if (!bridge || !bridge->initialized || !data || stride < width * 4)
         return -1;
 
     pthread_mutex_lock(&bridge->mutex);
 
-    size_t row_bytes =
-        (size_t)width * 4;
+    if (width != bridge->width || height != bridge->height) {
+        pthread_mutex_unlock(&bridge->mutex);
+        return -1;
+    }
+
+    size_t row_bytes = (size_t)width * 4;
 
     for (int y = 0; y < height; y++) {
         memcpy(
-            bridge->pixels +
-                (size_t)y * row_bytes,
-            data +
-                (size_t)y * (size_t)stride,
+            bridge->pixels + (size_t)y * row_bytes,
+            data + (size_t)y * (size_t)stride,
             row_bytes
         );
     }
@@ -162,16 +193,13 @@ frame_bridge_consume(
             4
         );
 
-        *last_sequence =
-            bridge->sequence;
-
+        *last_sequence = bridge->sequence;
         changed = 1;
     }
 
     pthread_mutex_unlock(&bridge->mutex);
     return changed;
 }
-
 
 int
 frame_bridge_wait_for_change(
