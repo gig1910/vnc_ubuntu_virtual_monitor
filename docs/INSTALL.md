@@ -1,297 +1,132 @@
 # Installation and service operation
 
-This document describes the supported `0.1.0-beta.2` deployment model on a GNOME Wayland desktop.
+This document describes the `0.1.0-beta.3` broker/agent deployment model for GNOME Wayland.
 
-## Runtime model
+## Runtime roles
 
-VNC Monitor has two privilege domains:
+VNC Monitor has three privilege/lifecycle roles:
 
-- `vnc-monitor.service` is a **systemd user service** running as the logged-in GNOME user so it can reach session D-Bus, Mutter RemoteDesktop/ScreenCast and PipeWire;
-- `vnc-monitor-auth.socket` + `vnc-monitor-auth@.service` are **system units** exposing the privileged PAM helper through `/run/vnc-monitor-auth.sock`.
+1. `vnc-monitor-broker.service` — **system service**, owns the machine-wide public TCP listener and queries logind `seat0.ActiveSession`;
+2. `vnc-monitor.service` — **systemd user service**, runs `vnc-monitor --agent` inside each GNOME Wayland login session and owns RA2/Mutter/PipeWire/RFB work;
+3. `vnc-monitor-auth.socket` + `vnc-monitor-auth@.service` — **system PAM helper**, authenticates only the Unix account owning the calling user-agent process.
 
-Do not convert the main daemon into a root system service.
+The capture/RA2 daemon must remain unprivileged; do not convert it into a root system service.
 
-The public server is intentionally **STRONG SINGLE CONNECT**. Exactly one accepted viewer owns the display session. The public listener remains responsive while that session runs only so additional connections can be immediately reset/rejected.
+## Session-selection policy
 
-The internal LibVNCServer backend is session-scoped: `127.0.0.1:5903` exists only after successful RA2r/PAM authentication and is removed on disconnect.
+A new external connection is routed only when `seat0` currently selects a local active Wayland `Class=user` session.
+
+GDM/greeter is not served.
+
+The connection is then bound to that exact logind Session ID + UID. `Switch User`, logoff or another seat0 session transition terminates the connection and removes its virtual monitor. It is never moved to GDM or another user's desktop.
+
+To see a different user's active desktop, reconnect and authenticate again as that user.
 
 ## Configuration layers
 
-The daemon reads configuration in this order:
+The user agent reads:
 
 ```text
 built-in defaults
     < /etc/vnc-monitor/config.ini
     < ~/.config/vnc-monitor/config.ini
-    < command-line options
+    < CLI
 ```
 
-Both persistent files are optional.
+An explicit `--config FILE` replaces the normal per-user override while preserving the `/etc` baseline.
 
-An explicit:
+The machine-wide broker port is special: `[network] port` is read **only** from `/etc/vnc-monitor/config.ini` by `vnc-monitor-broker`.
 
-```bash
-vnc-monitor --config /path/to/file.ini
-```
+Per-user configuration may override capture/display/transport/RA2 behaviour but cannot move the public machine listener.
 
-replaces the normal per-user override path but does **not** disable the system baseline:
+## Build dependencies
 
-```text
-built-ins < /etc/vnc-monitor/config.ini < --config FILE < CLI
-```
+Source and `.deb` builders preflight:
 
-The parser is strict. Unknown sections/keys and invalid values are startup errors.
+- `make`, `cc`, `pkg-config`, `nproc`;
+- `libvncserver`, OpenSSL, nettle, GLib/GIO;
+- GStreamer base/app/video;
+- PipeWire;
+- libjpeg compile/link;
+- PAM compile/link.
 
-Repository template:
-
-```text
-config/vnc-monitor.conf
-```
-
-The `.deb` installs that template as:
-
-```text
-/etc/vnc-monitor/config.ini
-```
-
-and marks it as a package conffile so administrator edits are preserved by dpkg upgrade semantics.
-
-Source installation creates the per-user file once:
-
-```text
-~/.config/vnc-monitor/config.ini
-```
-
-and preserves it on later source upgrades. Package installation does not create or overwrite files in user home directories.
-
-Show the effective configuration:
-
-```bash
-vnc-monitor --show-config
-```
-
-The output lists both config paths and shows the final effective values.
-
-## Source install / upgrade
-
-Run from the repository as the logged-in GNOME desktop user:
-
-```bash
-./install.sh
-```
-
-Do **not** run it through `sudo`. The script invokes `sudo` itself only for the PAM helper and system units.
-
-The installer:
-
-1. checks required commands and development libraries before changing anything;
-2. builds with all logical CPUs by default (`make -j"$(nproc)"`);
-3. builds the daemon, PAM helper and source-install socket unit;
-4. creates `~/.config/vnc-monitor/config.ini` only when absent;
-5. installs/updates both privilege domains;
-6. restarts the auth socket and user daemon only after successful build/install;
-7. prints effective config and final service status.
-
-Clean rebuild:
-
-```bash
-./install.sh --clean
-```
-
-Optional job limit:
-
-```bash
-./install.sh --jobs 8
-# or
-JOBS=8 ./install.sh
-```
-
-The installer intentionally does not run `git pull`.
-
-### Source build dependency preflight
-
-Required commands include `make`, `cc`, `pkg-config`, `nproc`, `mktemp`, `install`, `sed`, `systemctl` and `sudo`.
-
-Development modules checked through `pkg-config --exists`:
-
-- `libvncserver`;
-- `openssl`;
-- `nettle`;
-- `glib-2.0`;
-- `gio-2.0`;
-- `gstreamer-1.0`;
-- `gstreamer-app-1.0`;
-- `gstreamer-video-1.0`;
-- `libpipewire-0.3`.
-
-libjpeg and PAM are checked by real compile/link probes against `-ljpeg` and `-lpam`.
-
-Typical Ubuntu **build** packages are:
+Typical Ubuntu build packages:
 
 ```bash
 sudo apt install \
-  build-essential pkg-config \
+  build-essential pkg-config dpkg-dev \
   libvncserver-dev libssl-dev nettle-dev libglib2.0-dev \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libpipewire-0.3-dev libjpeg-dev libpam0g-dev
 ```
 
-These are build-machine requirements, not runtime dependencies of a compiled package.
+These are **build-machine dependencies only**. The compiled `.deb` derives runtime shared-library dependencies from its ELF files with `dpkg-shlibdeps`.
 
-## Build a binary Debian/Ubuntu package
+## Build binary `.deb`
 
-Build as a normal user:
-
-```bash
-./build-deb.sh
-```
-
-The builder does not use `sudo`.
-
-Default parallelism is:
-
-```text
-make -j"$(nproc)"
-```
-
-Optional clean build:
+First beta.3 build:
 
 ```bash
+git switch broker-agent
+git pull --ff-only
 ./build-deb.sh --clean
 ```
 
-Optional job/output overrides:
+The clean build is intentional because beta.3 adds new broker/protocol objects and changes `main.c` lifecycle ownership.
+
+Expected output:
+
+```text
+dist/vnc-monitor_0.1.0~beta.3-1_amd64.deb
+```
+
+The builder runs `tools/verify-deb.sh` automatically. A valid build ends with:
+
+```text
+===== VNC MONITOR: PACKAGE VERIFY =====
+...
+Result:       OK
+```
+
+The package contains the broker, user agent, PAM helper, system/user units, `/etc/vnc-monitor/config.ini` and documentation. It never contains a RA2 private key.
+
+## Package install
 
 ```bash
-./build-deb.sh --jobs 8
-./build-deb.sh --output-dir /tmp/packages
-# or
-JOBS=8 OUT_DIR=/tmp/packages ./build-deb.sh
+sudo apt install ./dist/vnc-monitor_0.1.0~beta.3-1_amd64.deb
 ```
 
-The package revision can be changed without modifying the application version:
+The package:
 
-```bash
-DEB_REVISION=2 ./build-deb.sh
-```
+- enables/restarts the PAM socket;
+- enables the system broker;
+- ships a global user-unit Wants link under `graphical-session.target.wants`, so future graphical login sessions automatically start their agent;
+- does not write into arbitrary users' home directories.
 
-### Binary package build preflight
+### Already-running graphical session
 
-In addition to the project compiler/library checks, the package builder requires:
-
-- `dpkg-deb`;
-- `dpkg-shlibdeps`;
-- `dpkg-architecture`.
-
-On Ubuntu these packaging tools are normally provided by `dpkg` / `dpkg-dev`.
-
-The builder extracts `VNC_MONITOR_VERSION` from `include/config.h` and converts prerelease ordering to Debian form. For example:
-
-```text
-0.1.0-beta.2 -> 0.1.0~beta.2-1
-```
-
-The tilde keeps the beta version ordered before a later final `0.1.0` package.
-
-### What is inside the `.deb`
-
-Main files:
-
-```text
-/usr/bin/vnc-monitor
-/usr/libexec/vnc-monitor-auth-helper
-
-/usr/lib/systemd/user/vnc-monitor.service
-/usr/lib/systemd/system/vnc-monitor-auth.socket
-/usr/lib/systemd/system/vnc-monitor-auth@.service
-
-/etc/vnc-monitor/config.ini
-/etc/pam.d/vnc-monitor
-
-/usr/share/doc/vnc-monitor/...
-```
-
-The package service runs `/usr/bin/vnc-monitor`. It relies on the daemon's normal layered config loading and therefore does not hard-code `--config`.
-
-The package PAM socket is generic and does not contain the username of the machine that built the package. Its Unix socket is locally reachable, while the root helper uses `SO_PEERCRED` and rejects any authentication request whose requested username does not match the Unix account owning the connecting process.
-
-### Runtime dependencies
-
-`build-deb.sh` runs `dpkg-shlibdeps` against the two compiled ELF executables:
-
-```text
-/usr/bin/vnc-monitor
-/usr/libexec/vnc-monitor-auth-helper
-```
-
-The generated shared-library dependencies are written to the package `Depends` field, along with the required PipeWire runtime.
-
-Compiler/build tooling and development packages are **not** runtime dependencies of the finished `.deb`:
-
-```text
-NOT runtime dependencies:
-  build-essential
-  gcc / make
-  pkg-config
-  dpkg-dev
-  lib*-dev
-```
-
-Inspect the finished metadata with:
-
-```bash
-dpkg-deb --info dist/vnc-monitor_*.deb
-```
-
-### Install the `.deb`
-
-Typical output filename:
-
-```text
-dist/vnc-monitor_0.1.0~beta.2-1_amd64.deb
-```
-
-Install through apt so runtime dependencies are resolved:
-
-```bash
-sudo apt install ./dist/vnc-monitor_0.1.0~beta.2-1_amd64.deb
-```
-
-The package post-install step reloads system units and enables/restarts:
-
-```text
-vnc-monitor-auth.socket
-```
-
-The GNOME-facing daemon remains a user service and is deliberately not globally enabled for every account. Enable it once as the intended desktop user:
+A root package maintainer script cannot safely reload every existing user's `systemd --user` manager. Therefore after first install/upgrade, in the currently logged-in GNOME account run:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now vnc-monitor.service
+systemctl --user restart vnc-monitor.service
+sudo systemctl restart vnc-monitor-broker.service
 ```
 
-This avoids having multiple simultaneously logged-in desktop users all trying to bind the same public TCP port.
+This is especially important for beta.2 -> beta.3 because the old beta.2 user daemon owned the public TCP port itself. The beta.3 broker has unlimited start retries and package configuration does not fail if that old listener temporarily owns the port.
 
-## Migrating an existing source installation to `.deb`
+## Migrating an old source installation to `.deb`
 
-A source installation places overrides in higher-priority systemd paths:
-
-```text
-~/.config/systemd/user/vnc-monitor.service
-/etc/systemd/system/vnc-monitor-auth.socket
-/etc/systemd/system/vnc-monitor-auth@.service
-```
-
-Those would override units installed by the package under `/usr/lib/systemd/...`.
-
-Before the first package installation, remove only the source-installed service files/binaries:
+Old source installs place higher-priority unit files in the user's/system `/etc` paths. Remove those overrides before installing the package while preserving user state:
 
 ```bash
 make uninstall-service
+make uninstall-broker-service 2>/dev/null || true
 make uninstall-pam-service
+sudo apt install ./dist/vnc-monitor_0.1.0~beta.3-1_amd64.deb
 ```
 
-These targets preserve the user's:
+Preserved state includes:
 
 ```text
 ~/.config/vnc-monitor/config.ini
@@ -300,207 +135,146 @@ These targets preserve the user's:
 ~/.cache/vnc-monitor/
 ```
 
-Then install and enable the package service:
+Then reload/restart the current user agent and broker as shown above.
+
+## Source install / upgrade
+
+Run as the logged-in GNOME desktop user, not root:
 
 ```bash
-sudo apt install ./dist/vnc-monitor_0.1.0~beta.2-1_amd64.deb
-systemctl --user daemon-reload
-systemctl --user enable --now vnc-monitor.service
+./install.sh --clean
 ```
 
-The existing per-user config remains a higher-priority override above the new `/etc/vnc-monitor/config.ini` baseline.
+`install.sh` invokes `sudo` only for system broker/PAM files.
 
-## Supported production config
-
-```ini
-[capture]
-backend=pipewire
-timeout-ms=5000
-cursor=metadata
-fps=60
-
-[display]
-mode=auto
-width=1024
-height=768
-layout-remember=on
-layout-resave=off
-
-[transport]
-vnc-fps=source
-latest-only=on
-diff-detect=on
-diff-tile-size=32
-
-[network]
-port=5901
-backend-port=5903
-backend-bind=127.0.0.1
-external-send-buffer=65536
-backend-recv-buffer=65536
-client-keepalive-idle=15
-client-keepalive-interval=5
-client-keepalive-probes=3
-client-user-timeout-ms=20000
-client-handshake-timeout-ms=60000
-
-[ra2]
-record-size=16384
-coalesce=on
-coalesce-us=500
-key=$HOME/.config/vnc-monitor/ra2-server-key.pem
-auth-socket=/run/vnc-monitor-auth.sock
-
-[logging]
-level=info
-```
-
-Paths accept absolute paths, `~/...`, and `$HOME/...`.
-
-Missing optional keys inherit the value from the previous configuration layer, ultimately falling back to built-in defaults.
-
-## Strong single-connect policy
-
-The slot is reserved immediately at `accept()`, before RA2/PAM completes. Therefore a second connection cannot race the first during authentication.
-
-The active session runs in one client worker. The main listener continues accepting only to enforce the policy. If another client arrives while the slot is owned, its socket is immediately reset and an `info` log entry is emitted:
+The beta.2 -> beta.3 source upgrade order is deliberate:
 
 ```text
-Rejected additional client: ADDRESS (strong single-connect policy)
+build everything
+  -> replace user binary/unit
+  -> restart old standalone daemon as --agent (releases TCP port)
+  -> install/start system broker
 ```
 
-This is not multi-client support: there is still exactly one virtual monitor, capture pipeline and adaptive RFB session.
+This avoids a deterministic public-port collision.
 
-## Lost-client protection
+Source installation creates `/etc/vnc-monitor/config.ini` only if absent and creates the user's `~/.config/vnc-monitor/config.ini` only if absent. Both are preserved later.
 
-### Established session: TCP liveness
+## PAM socket in multi-user mode
 
-```ini
-client-keepalive-idle=15
-client-keepalive-interval=5
-client-keepalive-probes=3
-client-user-timeout-ms=20000
-```
-
-These map to Linux TCP keepalive/user-timeout controls. They detect transport failure and are **not** application-idle timers. A healthy viewer displaying a static image may stay connected indefinitely.
-
-If Wi-Fi/LAN connectivity disappears without FIN/RST, TCP failure propagates through the RA2 relay. The session then stops LibVNCServer, capture and Mutter and releases the sole slot.
-
-### Unauthenticated/stalled client: handshake deadline
-
-```ini
-client-handshake-timeout-ms=60000
-```
-
-This is one monotonic deadline for the bounded handshake `io_*` phase. It is not reset by individual bytes, so a silent or trickle-slow peer cannot reserve the sole slot forever.
-
-After successful authentication the deadline is cleared completely.
-
-## Display size: auto vs fixed
-
-### `mode=auto`
-
-```ini
-[display]
-mode=auto
-width=1024
-height=768
-```
-
-`width` / `height` are initial/fallback dimensions.
-
-A viewer advertising RFB `ExtendedDesktopSize` can send `SetDesktopSize`. For a valid one-screen request the server coordinates Mutter/PipeWire, FrameBridge, adaptive transport and LibVNCServer framebuffer resize without changing the persistent fallback for the next session.
-
-A viewer supporting only `NewFBSize` can receive a server-side size change but cannot tell the server what size it wants, so it stays on the configured fallback.
-
-### `mode=fixed`
-
-```ini
-[display]
-mode=fixed
-width=1024
-height=768
-```
-
-The configured dimensions are mandatory and client `SetDesktopSize` requests are rejected with `ResizeProhibited`.
-
-## RA2 identity
-
-Per-user identity path:
+The PAM socket is intentionally reachable by local user agents:
 
 ```text
-~/.config/vnc-monitor/ra2-server-key.pem
+/run/vnc-monitor-auth.sock
+SocketMode=0666
 ```
 
-It remains in the user's home for both source and package installations. It is mode `0600` and is not installed into `/etc` or embedded in the package.
+This is not the authorization boundary. The root helper obtains `SO_PEERCRED` from the connecting process and refuses any requested username different from that process' Unix account.
 
-## Service lifecycle
+Thus a `bob` agent can authenticate `bob` only; it cannot test/authenticate `gig` credentials.
 
-Idle:
+## Service status
 
-```text
-public TCP listener active
-no client worker
-no virtual monitor
-no PipeWire capture
-no internal LibVNCServer listener
-```
-
-Active:
-
-```text
-one accepted client owns the slot
-RA2r/PAM
-  -> Mutter virtual monitor
-  -> PipeWire capture
-  -> per-session LibVNCServer 127.0.0.1:5903
-  -> adaptive RFB transport
-```
-
-On clean disconnect, dead-peer detection, handshake failure/deadline, or daemon shutdown, the session is torn down and the slot becomes available again.
-
-## Service commands
-
-User daemon:
+System broker:
 
 ```bash
-systemctl --user status vnc-monitor.service
-systemctl --user restart vnc-monitor.service
-systemctl --user stop vnc-monitor.service
-journalctl --user -u vnc-monitor.service -f
+systemctl status vnc-monitor-broker.service --no-pager -l
+journalctl -u vnc-monitor-broker.service -n 100 --no-pager
+```
+
+Current user agent:
+
+```bash
+systemctl --user status vnc-monitor.service --no-pager -l
+journalctl --user -u vnc-monitor.service -n 100 --no-pager
 ```
 
 PAM layer:
 
 ```bash
-systemctl status vnc-monitor-auth.socket
+systemctl status vnc-monitor-auth.socket --no-pager -l
+ls -l /run/vnc-monitor-auth.sock
 ```
 
-For source installs, combined project status is also available through:
+Source installation aggregate:
 
 ```bash
 make status-support
 ```
 
-## Uninstall
+## Expected idle state
 
-### Source installation
-
-```bash
-make uninstall-service
-make uninstall-pam-service
+```text
+vnc-monitor-broker: listening on system [network] port
+vnc-monitor --agent: waiting on /run/user/UID/vnc-monitor/agent.sock
+no virtual monitor
+no PipeWire capture
+no internal LibVNCServer listener
 ```
 
-Delete user config/identity/layout only when explicitly intended:
+## Expected connection state
 
-```bash
-make purge-config
+```text
+broker accepts external client
+  -> validates current logind seat0 Session ID/UID
+  -> passes TCP fd with SCM_RIGHTS
+  -> matching user agent performs RA2/PAM
+  -> virtual monitor/capture starts
+  -> internal LibVNCServer starts
 ```
 
-### Binary package
+Second external clients are rejected immediately.
+
+## Switch User / logoff test
+
+With an established VNC session:
+
+1. invoke GNOME Switch User or log out;
+2. the old VNC client must disconnect;
+3. the virtual monitor must disappear;
+4. a new connection while GDM is active must be rejected;
+5. after logging in as another user, reconnect and authenticate as that user;
+6. credentials for the inactive previous account must be rejected by the active user's PAM boundary.
+
+The old connection must never resume even if the machine later switches back to the same account.
+
+## Display sizing
+
+Default:
+
+```ini
+[display]
+mode=auto
+width=1024
+height=768
+```
+
+`auto` uses width/height as initial/fallback dimensions and allows clients supporting RFB `ExtendedDesktopSize` to request another size. Older clients supporting only `NewFBSize` cannot communicate preferred dimensions and use the fallback.
+
+`fixed` forces the configured dimensions and rejects client resize.
+
+## Standalone developer mode
+
+For focused diagnostics only, running without `--agent` retains a direct public listener:
+
+```bash
+./vnc-monitor --verbose debug
+```
+
+Do not run standalone mode at the same time as the production broker on the same public port.
+
+## Removal
+
+Binary package:
 
 ```bash
 sudo apt remove vnc-monitor
 ```
 
-Package removal does not delete per-user config, RA2 identity or layout/cache data from home directories.
+Source stack:
+
+```bash
+make uninstall-support
+```
+
+User config, RA2 identity and layout/cache remain unless intentionally purged.
