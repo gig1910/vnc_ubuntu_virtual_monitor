@@ -3,6 +3,10 @@ Description=VNC Monitor active-session broker
 Documentation=https://github.com/gig1910/vnc_ubuntu_virtual_monitor
 After=systemd-logind.service network.target
 Requires=systemd-logind.service
+# During beta.2 -> beta.3 upgrade the old per-user standalone daemon may still
+# own the public port until that user's manager reloads/restarts the new agent.
+# Do not permanently rate-limit broker retries during that short handoff.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
