@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 
 static int
 copy_text(const char *name, char *out, size_t out_size, const char *value)
@@ -56,7 +57,11 @@ expand_path(const char *name, char *out, size_t out_size, const char *value)
 }
 
 static int
-parse_int(const char *name, const char *value, int min_value, int max_value, int *out)
+parse_int(const char *name,
+          const char *value,
+          int min_value,
+          int max_value,
+          int *out)
 {
     errno = 0;
     char *end = NULL;
@@ -337,6 +342,7 @@ static const ConfigBinding config_bindings[] = {
     {"ra2", "key", "ra2-key"},
     {"ra2", "auth-socket", "auth-socket"},
 
+    /* Historical compatibility settings; not part of the normal template. */
     {"rfb", "zrle", "zrle"},
     {"rfb", "raw", "raw"},
     {"rfb", "cursor", "cursor"},
@@ -358,16 +364,16 @@ find_config_binding(const char *group, const char *key)
 }
 
 static int
-load_config_file(RuntimeConfig *cfg, int explicit_config)
+load_config_file_at(RuntimeConfig *cfg, const char *path, int required)
 {
+    if (!path || !*path)
+        return 0;
+
     GKeyFile *keyfile = g_key_file_new();
     GError *error = NULL;
 
-    if (!g_key_file_load_from_file(keyfile,
-                                   cfg->config_file,
-                                   G_KEY_FILE_NONE,
-                                   &error)) {
-        if (!explicit_config &&
+    if (!g_key_file_load_from_file(keyfile, path, G_KEY_FILE_NONE, &error)) {
+        if (!required &&
             error && error->domain == G_FILE_ERROR && error->code == G_FILE_ERROR_NOENT) {
             g_clear_error(&error);
             g_key_file_free(keyfile);
@@ -376,7 +382,7 @@ load_config_file(RuntimeConfig *cfg, int explicit_config)
 
         fprintf(stderr,
                 "Cannot load config %s: %s\n",
-                cfg->config_file,
+                path,
                 error ? error->message : "unknown error");
         g_clear_error(&error);
         g_key_file_free(keyfile);
@@ -389,12 +395,16 @@ load_config_file(RuntimeConfig *cfg, int explicit_config)
     for (gsize gi = 0; gi < group_count; gi++) {
         gsize key_count = 0;
         GError *keys_error = NULL;
-        gchar **keys = g_key_file_get_keys(keyfile, groups[gi], &key_count, &keys_error);
+        gchar **keys = g_key_file_get_keys(keyfile,
+                                           groups[gi],
+                                           &key_count,
+                                           &keys_error);
 
         if (!keys) {
             fprintf(stderr,
-                    "Cannot read config group [%s]: %s\n",
+                    "Cannot read config group [%s] from %s: %s\n",
                     groups[gi],
+                    path,
                     keys_error ? keys_error->message : "unknown error");
             g_clear_error(&keys_error);
             g_strfreev(groups);
@@ -409,7 +419,7 @@ load_config_file(RuntimeConfig *cfg, int explicit_config)
                         "Unknown config key %s/%s in %s\n",
                         groups[gi],
                         keys[ki],
-                        cfg->config_file);
+                        path);
                 g_strfreev(keys);
                 g_strfreev(groups);
                 g_key_file_free(keyfile);
@@ -423,9 +433,10 @@ load_config_file(RuntimeConfig *cfg, int explicit_config)
                                                  &value_error);
             if (!value) {
                 fprintf(stderr,
-                        "Cannot read config value %s/%s: %s\n",
+                        "Cannot read config value %s/%s from %s: %s\n",
                         groups[gi],
                         keys[ki],
+                        path,
                         value_error ? value_error->message : "unknown error");
                 g_clear_error(&value_error);
                 g_strfreev(keys);
@@ -438,7 +449,7 @@ load_config_file(RuntimeConfig *cfg, int explicit_config)
             if (apply_setting(cfg, binding->setting, value) < 0) {
                 fprintf(stderr,
                         "While reading %s [%s] %s\n",
-                        cfg->config_file,
+                        path,
                         groups[gi],
                         keys[ki]);
                 g_free(value);
@@ -459,7 +470,10 @@ load_config_file(RuntimeConfig *cfg, int explicit_config)
 }
 
 static int
-prescan_config_path(RuntimeConfig *cfg, int argc, char **argv, int *explicit_config)
+prescan_config_path(RuntimeConfig *cfg,
+                    int argc,
+                    char **argv,
+                    int *explicit_config)
 {
     *explicit_config = 0;
 
@@ -469,13 +483,22 @@ prescan_config_path(RuntimeConfig *cfg, int argc, char **argv, int *explicit_con
                 fprintf(stderr, "Missing value for --config\n");
                 return -1;
             }
-            if (expand_path("config", cfg->config_file, sizeof(cfg->config_file), argv[++i]) < 0)
+
+            if (expand_path("config",
+                            cfg->config_file,
+                            sizeof(cfg->config_file),
+                            argv[++i]) < 0) {
                 return -1;
+            }
             *explicit_config = 1;
         }
         else if (strncmp(argv[i], "--config=", 9) == 0) {
-            if (expand_path("config", cfg->config_file, sizeof(cfg->config_file), argv[i] + 9) < 0)
+            if (expand_path("config",
+                            cfg->config_file,
+                            sizeof(cfg->config_file),
+                            argv[i] + 9) < 0) {
                 return -1;
+            }
             *explicit_config = 1;
         }
     }
@@ -487,6 +510,10 @@ void
 runtime_config_defaults(RuntimeConfig *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
+
+    snprintf(cfg->system_config_file,
+             sizeof(cfg->system_config_file),
+             "/etc/vnc-monitor/config.ini");
 
     const char *home = getenv("HOME");
     const char *config_home = getenv("XDG_CONFIG_HOME");
@@ -512,7 +539,7 @@ runtime_config_defaults(RuntimeConfig *cfg)
                  home);
     }
     else {
-        snprintf(cfg->config_file, sizeof(cfg->config_file), "./vnc-monitor.ini");
+        cfg->config_file[0] = '\0';
         snprintf(cfg->ra2_key_file, sizeof(cfg->ra2_key_file), "./ra2-server-key.pem");
     }
 
@@ -572,8 +599,10 @@ runtime_config_usage(const char *argv0)
         "Usage: %s [options]\n"
         "\n"
         "Configuration:\n"
-        "  --config FILE                INI config [~/.config/vnc-monitor/config.ini]\n"
-        "  Config is loaded after built-in defaults; CLI options override it.\n"
+        "  system baseline:             /etc/vnc-monitor/config.ini\n"
+        "  user override:               ~/.config/vnc-monitor/config.ini\n"
+        "  --config FILE                replace the normal user override path\n"
+        "  Precedence: built-ins < system < user/--config < CLI.\n"
         "\n"
         "Wayland capture:\n"
         "  --capture-backend MODE       pipewire|gstreamer\n"
@@ -596,7 +625,7 @@ runtime_config_usage(const char *argv0)
         "  --client-keepalive-interval N Seconds between keepalive probes [5]\n"
         "  --client-keepalive-probes N  Failed probes before dead peer [3]\n"
         "  --client-user-timeout-ms N   Max unacknowledged TCP time [20000]\n"
-        "  --client-handshake-timeout-ms N RA2/PAM phase timeout [60000]\n"
+        "  --client-handshake-timeout-ms N Total RA2/PAM I/O deadline [60000]\n"
         "\n"
         "Virtual monitor:\n"
         "  --screen-mode MODE           auto|fixed [auto]\n"
@@ -633,12 +662,22 @@ runtime_config_usage(const char *argv0)
         argv0);
 }
 
+static const char *
+config_state(const char *path)
+{
+    if (!path || !*path)
+        return "disabled";
+    return access(path, R_OK) == 0 ? "present" : "not present";
+}
+
 void
 runtime_config_print(const RuntimeConfig *cfg)
 {
     printf(
         "VNC Monitor %s configuration:\n"
-        "  config file:       %s\n"
+        "  system config:     %s (%s)\n"
+        "  user/override:     %s (%s)\n"
+        "  precedence:        built-ins < system < user/override < CLI\n"
         "  capture backend:   %s\n"
         "  capture timeout:   %d ms\n"
         "  Mutter cursor:     %s\n"
@@ -665,7 +704,10 @@ runtime_config_print(const RuntimeConfig *cfg)
         "  security:          view-only, clipboard=off, file-transfer=off\n"
         "  log level:         %s (%d)\n",
         VNC_MONITOR_VERSION,
-        cfg->config_file,
+        cfg->system_config_file,
+        config_state(cfg->system_config_file),
+        cfg->config_file[0] ? cfg->config_file : "(none)",
+        config_state(cfg->config_file),
         runtime_config_capture_backend_name(cfg->capture_backend),
         cfg->capture_timeout_ms,
         runtime_config_mutter_cursor_name(cfg->mutter_cursor_mode),
@@ -787,6 +829,7 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
         {NULL, 0, NULL, 0}
     };
 
+    /* Version/help remain usable even if a persistent config is broken. */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {
             printf("%s\n", VNC_MONITOR_VERSION);
@@ -802,7 +845,13 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
     if (prescan_config_path(cfg, argc, argv, &explicit_config) < 0)
         return -1;
 
-    if (load_config_file(cfg, explicit_config) < 0)
+    /*
+     * System baseline is always optional. The normal per-user file is also
+     * optional. An explicitly requested --config file is required.
+     */
+    if (load_config_file_at(cfg, cfg->system_config_file, 0) < 0)
+        return -1;
+    if (load_config_file_at(cfg, cfg->config_file, explicit_config) < 0)
         return -1;
 
     int show_config = 0;
@@ -817,7 +866,7 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
 
         switch (c) {
             case OPT_CONFIG:
-                /* Already handled before loading the config file. */
+                /* Already handled before loading persistent config layers. */
                 break;
             case OPT_CAPTURE_BACKEND: setting = "capture-backend"; break;
             case OPT_CAPTURE_TIMEOUT_MS: setting = "capture-timeout-ms"; break;

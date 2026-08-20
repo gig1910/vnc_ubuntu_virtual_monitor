@@ -2,6 +2,72 @@
 
 All notable project milestones are summarized here. Development commits before the beta checkpoint were intentionally experimental and are condensed by behavior rather than reproduced commit-by-commit.
 
+## 0.1.0-beta.3 — 2026-08-20
+
+System-broker / per-user-agent security architecture.
+
+### Added
+
+- `vnc-monitor-broker`, a small root system service that owns the machine-wide public VNC listener;
+- logind `seat0.ActiveSession` routing: only the current active local `Class=user`, `Type=wayland`, `Remote=false` session is attachable;
+- exact VNC connection binding to logind **Session ID + UID**, not merely a Unix username;
+- Unix `SOCK_SEQPACKET` broker/agent control channel under `$XDG_RUNTIME_DIR/vnc-monitor/agent.sock`;
+- zero-copy TCP descriptor handoff from broker to agent through `SCM_RIGHTS`;
+- broker-held duplicate TCP descriptor used solely as a policy-revocation handle;
+- agent control guard: broker death/restart closes an already handed-off VNC session rather than allowing it to continue without active-session policy enforcement;
+- package-level global `graphical-session.target` Wants link so future graphical logins automatically start their user agent;
+- `RuntimeDirectory=vnc-monitor` for the hardened user service;
+- namespace-aware broker peer verification: when host root is mapped to overflow UID in the agent namespace, the immutable `SO_PEERCRED` PID must belong exactly to `/system.slice/vnc-monitor-broker.service`;
+- broker-aware `.deb` verification for binaries, units, Wants link, conffiles, private-key absence, runtime dependencies and required sandbox access to `/run/user`.
+
+### Security policy
+
+- GDM/greeter is deliberately not served;
+- Fast User Switching never transfers an existing VNC connection to another login session;
+- lock/switch-user/logoff or any change away from the bound logind Session ID permanently disconnects the VNC client and tears down its virtual monitor;
+- returning to the same Unix user still requires a new VNC connection and new RA2/PAM authentication;
+- while another user is active, an inactive `gig` session is not selectable even if its user manager remains alive;
+- after broker routing, the PAM helper independently requires the RA2 username to equal the Unix account owning the active user agent (`SO_PEERCRED`);
+- source and package installs use a generic local PAM socket because multi-user agents must reach it; the privileged helper's same-account `SO_PEERCRED` check remains the authorization boundary;
+- overflow/unmapped UID is never trusted by value alone.
+
+### Changed
+
+- production `vnc-monitor.service` now runs `/usr/bin/vnc-monitor --agent` (or the source-install equivalent) and no longer binds the public TCP port;
+- the public `[network] port` is machine-wide broker policy read only from `/etc/vnc-monitor/config.ini` in broker mode;
+- per-user config still controls the active user's capture/display/transport/RA2 settings but cannot move the machine-wide public listener;
+- system broker keeps strong single-connect ownership and immediately resets additional clients;
+- beta.2 TCP keepalive, `TCP_USER_TIMEOUT` and monotonic handshake deadline remain in the handed-off user-agent socket path;
+- broker sandbox keeps `/home` and `/root` inaccessible while exposing `/run/user` read-only for agent-socket discovery; `ProtectHome=yes` is intentionally not used because it also hides `/run/user`;
+- source upgrade order restarts beta.2 standalone as `--agent` before starting the broker, preventing a deterministic TCP/5901 collision;
+- package broker retries are not permanently start-limited during beta.2 -> beta.3 handoff;
+- standalone direct-listener mode remains available only for development/foreground diagnostics.
+
+### Debian packaging
+
+- executable `build-deb.sh` builds with `make -j"$(nproc)"` by default and performs compiler/library/`dpkg` preflight;
+- runtime shared-library dependencies are generated from all compiled ELF files through `dpkg-shlibdeps`;
+- no compiler, `pkg-config`, `dpkg-dev`, `debhelper` or `*-dev` package is propagated into binary `Depends`;
+- package layout uses `/usr/bin`, `/usr/libexec`, `/usr/lib/systemd/system` and `/usr/lib/systemd/user`;
+- `/etc/vnc-monitor/config.ini` is a package conffile and system baseline;
+- effective agent config precedence is `built-ins < /etc/vnc-monitor/config.ini < user/--config < CLI`;
+- package installation keeps RA2 identity/layout/user overrides in the user's home rather than creating home files from root maintainer scripts;
+- package version conversion uses Debian prerelease ordering, e.g. `0.1.0-beta.3` -> `0.1.0~beta.3-1`;
+- real Ubuntu 26.04 package builds were validated with `tools/verify-deb.sh` and runtime-only `Depends`.
+
+### Runtime validation
+
+Confirmed on the target Ubuntu 26.04 GNOME Wayland host with the legacy iPad client:
+
+- normal broker -> active `gig` agent -> RA2r/PAM -> virtual-monitor path works;
+- second simultaneous viewer is rejected immediately;
+- vanished Wi-Fi/powered-off client is cleaned up automatically;
+- Switch User / lock transition to GDM revokes the bound VNC connection and removes the monitor;
+- GDM/greeter does not receive new VNC sessions;
+- another local account (`guest`) receives connections only while its own Wayland session is active;
+- credentials for a different/inactive Unix account are rejected;
+- switching back to `gig` requires a fresh connection and authentication.
+
 ## 0.1.0-beta.2 — 2026-08-20
 
 Configuration, dynamic-display and single-session hardening release.
@@ -28,10 +94,10 @@ Configuration, dynamic-display and single-session hardening release.
 ### Changed
 
 - `display.width` / `display.height` are initial/fallback dimensions in `auto` mode and exact dimensions in `fixed` mode;
-- the internal LibVNCServer backend is now session-scoped: loopback TCP/5903 exists only after RA2r/PAM authentication and is removed on disconnect;
+- the internal LibVNCServer backend is session-scoped: loopback TCP/5903 exists only after RA2r/PAM authentication and is removed on disconnect;
 - client-requested size changes are session-local and do not mutate the persistent fallback used by the next viewer;
 - the public listener remains responsive during the active session solely to reject extra clients immediately; this does not enable multi-client streaming;
-- a lost/half-open active TCP peer now tears itself down through kernel liveness detection instead of potentially holding the only session slot indefinitely;
+- a lost/half-open active TCP peer tears itself down through kernel liveness detection instead of potentially holding the only session slot indefinitely;
 - the single-client slot is reserved from `accept()`, so a second client is rejected even while the first is negotiating authentication;
 - the handshake I/O deadline is cleared after successful authentication, so a healthy long-lived/static VNC session has no application-idle timeout;
 - daemon shutdown waits for the only active client worker to finish before shared framebuffer/statistics state is destroyed;
@@ -84,7 +150,7 @@ First beta/stabilization release.
 - full-screen high-motion content remains limited by the old VNC viewer's JPEG/display/request path;
 - an earlier stale 32x32 progressive-repair tile race remains under observation;
 - only one external viewer is served at a time;
-- Git history still requires secret-history purge and RA2 identity rotation before any public release.
+- historical Git refs still require RA2 private-key history purge and identity rotation.
 
 ## 0.0.25 — adaptive JPEG / CopyRect development line
 

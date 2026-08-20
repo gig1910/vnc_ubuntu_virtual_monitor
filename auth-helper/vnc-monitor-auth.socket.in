@@ -3,9 +3,11 @@ Description=VNC Monitor PAM authentication socket
 
 [Socket]
 ListenStream=/run/vnc-monitor-auth.sock
-SocketUser=@SOCKET_USER@
-SocketGroup=@SOCKET_GROUP@
-SocketMode=0600
+# Multi-user broker mode requires every local user agent to reach this socket.
+# vnc-monitor-auth-helper enforces SO_PEERCRED and authenticates only the Unix
+# username that owns the connecting agent process, so this is not an oracle
+# for testing another local account's password.
+SocketMode=0666
 Accept=yes
 RemoveOnStop=yes
 

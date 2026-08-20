@@ -1,5 +1,5 @@
 [Unit]
-Description=VNC Monitor for the active GNOME Wayland session
+Description=VNC Monitor agent for the active GNOME Wayland session
 Documentation=https://github.com/gig1910/vnc_ubuntu_virtual_monitor
 PartOf=graphical-session.target
 After=graphical-session.target pipewire.service
@@ -7,20 +7,25 @@ Wants=pipewire.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/vnc-monitor --config %h/.config/vnc-monitor/config.ini
+ExecStart=%h/.local/bin/vnc-monitor --agent
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s
 UMask=0077
+RuntimeDirectory=vnc-monitor
+RuntimeDirectoryMode=0700
 
-# The daemon must read the user's installed binary/config and write only its
-# own identity/cache. Session D-Bus and PipeWire live under XDG_RUNTIME_DIR and
-# are intentionally not isolated away.
+# The agent never owns the public TCP port. It accepts a client fd only from
+# the root system broker through $XDG_RUNTIME_DIR/vnc-monitor/agent.sock and
+# then runs RA2/PAM/Mutter/PipeWire entirely as this desktop user.
+#
+# Configuration remains layered: /etc/vnc-monitor/config.ini is the system
+# baseline and ~/.config/vnc-monitor/config.ini is this user's override.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/vnc-monitor %h/.config/vnc-monitor-server %h/.cache/vnc-monitor
+ReadWritePaths=%h/.config/vnc-monitor %h/.config/vnc-monitor-server %h/.cache/vnc-monitor %t/vnc-monitor
 
 [Install]
 WantedBy=graphical-session.target

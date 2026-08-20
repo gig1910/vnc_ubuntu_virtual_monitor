@@ -1,0 +1,44 @@
+[Unit]
+Description=VNC Monitor active-session broker
+Documentation=https://github.com/gig1910/vnc_ubuntu_virtual_monitor
+After=systemd-logind.service network.target
+Requires=systemd-logind.service
+# During beta.2 -> beta.3 upgrade the old per-user standalone daemon may still
+# own the public port until that user's manager reloads/restarts the new agent.
+# Do not permanently rate-limit broker retries during that short handoff.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/vnc-monitor-broker
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+
+# The broker owns only the public TCP listener, reads logind state on the
+# system bus, and hands accepted sockets to the active user's agent.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+
+# Do not use ProtectHome=yes here: systemd also hides /run/user with that
+# setting, while the broker must connect to /run/user/<uid>/vnc-monitor/agent.sock.
+# Keep actual home directories inaccessible and expose /run/user read-only.
+ProtectHome=no
+InaccessiblePaths=/home /root
+ReadOnlyPaths=/run/user
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

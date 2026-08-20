@@ -1,81 +1,116 @@
 # VNC Monitor for GNOME Wayland
 
-`vnc-monitor` turns a VNC-capable tablet into a view-only extended monitor for the current GNOME Wayland desktop session.
+`vnc-monitor` turns a VNC-capable tablet into a view-only extended monitor for the **currently active local GNOME Wayland login session**.
 
-## Beta status
+Current beta: **`0.1.0-beta.3`**.
 
-Current beta: `0.1.0-beta.2`.
+## Production architecture
 
-The production path uses Mutter RemoteDesktop/ScreenCast, native PipeWire capture, LibVNCServer, RA2r authentication with PAM, adaptive JPEG21 transport, CopyRect motion reuse and progressive lossless repair.
-
-The virtual monitor exists only while a VNC client is connected and is removed after disconnect.
-
-## Quick install / upgrade
-
-Run as the logged-in GNOME desktop user:
-
-```bash
-git switch 0.1.0-beta
-git pull --ff-only
-./install.sh
-```
-
-For a deliberately clean rebuild:
-
-```bash
-./install.sh --clean
-```
-
-Before compilation the installer verifies the required build tools, all `pkg-config` modules, libjpeg and PAM development headers/libraries. The build uses all available logical CPUs by default (`nproc`).
-
-The installer builds and installs both privilege domains:
-
-- `vnc-monitor.service` — systemd **user** service for the active GNOME Wayland session;
-- `vnc-monitor-auth.socket` + `vnc-monitor-auth@.service` — system units for PAM authentication.
-
-It must **not** be run with `sudo`; sudo is invoked internally only for the PAM/system-unit installation.
-
-Existing services are upgraded in place and restarted only after a successful build/install.
-
-## Persistent configuration
-
-The service reads:
+Beta.3 separates machine-wide connection policy from per-user display/capture work:
 
 ```text
-~/.config/vnc-monitor/config.ini
+VNC viewer
+    |
+    | TCP :5901
+    v
+vnc-monitor-broker              root system service
+    |
+    | logind seat0.ActiveSession gate
+    | SCM_RIGHTS: pass accepted TCP fd
+    v
+vnc-monitor --agent             active user's systemd --user service
+    |
+    | RA2r + PAM as that same Unix user
+    v
+Mutter virtual monitor -> PipeWire -> adaptive RFB
 ```
 
-On first install it is created from `config/vnc-monitor.conf` with mode `0600`. Subsequent upgrades preserve the local file unchanged.
+The broker owns only the public listener and session-selection policy. RA2 credentials, PAM authentication, Mutter, PipeWire and framebuffer processing remain in the unprivileged user agent.
 
-Configuration precedence is:
+The virtual monitor exists only while an authenticated VNC client is connected and is removed on disconnect or policy revocation.
+
+## Session security policy
+
+The broker routes a new connection only when `seat0` has an active **local Wayland `Class=user` session**. GDM/greeter, remote sessions and non-Wayland targets are rejected.
+
+Each accepted connection is bound to the exact logind **Session ID + UID** active at handoff time. It is never moved to another login session.
 
 ```text
-built-in defaults < config.ini < command-line options
+active session = gig
+VNC connects -> agent(gig) -> RA2 username must be gig
 ```
 
-Show the effective configuration without starting the server:
+If the machine switches away from that login session or the session disappears:
 
-```bash
-vnc-monitor --show-config
+```text
+Switch User / logoff / seat0 leaves bound Session ID
+        -> broker shutdown(TCP)
+        -> agent RFB session exits
+        -> virtual monitor removed
+        -> old VNC connection is permanently dead
 ```
 
-or explicitly:
+Returning to the same Unix user does **not** restore the old connection. To see Bob's active desktop, reconnect while Bob's graphical session is active and authenticate as Bob.
 
-```bash
-~/.local/bin/vnc-monitor \
-  --config ~/.config/vnc-monitor/config.ini \
-  --show-config
+The PAM helper independently verifies `SO_PEERCRED` and authenticates only the Unix account owning the calling agent. An inactive user's agent is never selected merely because its user manager still exists after Fast User Switching.
+
+GDM is deliberately **not served**.
+
+## Runtime validation
+
+Beta.3 has been exercised on the target Ubuntu 26.04 GNOME Wayland host with the legacy iPad VNC client. Confirmed scenarios include:
+
+- normal RA2r/PAM connection to the active `gig` session;
+- virtual monitor creation on connect and teardown on disconnect;
+- immediate rejection of a second simultaneous viewer;
+- automatic teardown when the client disappears from Wi-Fi / powers off;
+- Switch User or lock transition to GDM immediately revokes the existing VNC connection;
+- new VNC connections are rejected while GDM/greeter is active;
+- after logging into another local account, the broker routes only to that account's active agent;
+- credentials for a different/inactive Unix account are rejected;
+- switching back to the original account requires a new VNC connection and fresh authentication.
+
+## Strong single-connect
+
+There is one machine-wide external VNC session at a time. The broker keeps the public listener responsive while a session exists solely to reject additional clients immediately instead of leaving them in the TCP backlog.
+
+Lost-peer protection:
+
+```ini
+[network]
+client-keepalive-idle=15
+client-keepalive-interval=5
+client-keepalive-probes=3
+client-user-timeout-ms=20000
+client-handshake-timeout-ms=60000
 ```
 
-After editing the installed config:
+TCP keepalive/user-timeout detect a vanished network peer; they are not application-idle timers. The handshake timeout is one monotonic deadline for the unauthenticated RA2/PAM phase.
 
-```bash
-systemctl --user restart vnc-monitor.service
+## Configuration
+
+Agent configuration is layered:
+
+```text
+built-in defaults
+    < /etc/vnc-monitor/config.ini
+    < ~/.config/vnc-monitor/config.ini
+    < CLI
 ```
 
-### Display sizing
+An explicit `--config FILE` replaces the normal per-user override path but still loads `/etc/vnc-monitor/config.ini` first.
 
-The default is:
+### Machine-wide broker port
+
+`[network] port` is special in broker mode. The system broker reads its public port **only** from:
+
+```text
+/etc/vnc-monitor/config.ini
+```
+
+A per-user config cannot move the machine-wide public listener. Other capture/display/transport/RA2 settings remain per-user through the normal layered agent configuration.
+
+Default display sizing:
 
 ```ini
 [display]
@@ -84,162 +119,132 @@ width=1024
 height=768
 ```
 
-`mode=auto` means `width`/`height` are the **initial/fallback** framebuffer size. A viewer that advertises RFB `ExtendedDesktopSize` and sends `SetDesktopSize` may request a different size during the session; Mutter/PipeWire and the RFB framebuffer are resized together.
+Older viewers that cannot send RFB `ExtendedDesktopSize` use the configured fallback dimensions.
 
-Older viewers that only support `NewFBSize` can accept a server-side size change but cannot tell the server what size they want. They therefore use the configured fallback.
-
-To force one exact size and reject client resize requests:
-
-```ini
-[display]
-mode=fixed
-width=1024
-height=768
-```
-
-### Strong single-connect policy
-
-The beta intentionally serves **exactly one viewer at a time**. This is a fixed server policy, not a configurable client-count limit.
-
-The public listener stays active while the first session is running so a second TCP connection can be detected and rejected immediately instead of sitting in the listen backlog. The second socket is closed with an immediate reset and the active session is left untouched. The slot is reserved from `accept()`, so this also applies while the first viewer is still authenticating.
-
-Connection protection is configured under `[network]`:
-
-```ini
-client-keepalive-idle=15
-client-keepalive-interval=5
-client-keepalive-probes=3
-client-user-timeout-ms=20000
-client-handshake-timeout-ms=60000
-```
-
-The keepalive/user-timeout settings detect a vanished Wi-Fi/LAN peer and automatically tear down the abandoned session, releasing the single-client slot and removing its virtual monitor. They are **not** application-idle timers: a healthy viewer showing a completely static desktop may remain connected indefinitely.
-
-`client-handshake-timeout-ms` is a single monotonic deadline for the bounded unauthenticated RA2/auth-helper `io_*` phase. It is not reset by each received byte, so a silent or trickle-slow client cannot monopolize the only slot forever. After successful authentication the deadline is cleared completely; the long-lived VNC session is governed only by TCP liveness.
-
-## Runtime behaviour
-
-Idle:
-
-```text
-vnc-monitor.service
-    -> listens on public TCP/5901
-    -> no internal LibVNCServer listener
-    -> no virtual monitor
-    -> no PipeWire capture
-```
-
-Connected:
-
-```text
-VNC viewer
-    -> RFB 3.8 / RA2r
-    -> PAM authentication
-    -> Mutter virtual monitor
-    -> PipeWire BGRx + cursor metadata
-    -> per-session LibVNCServer backend
-    -> adaptive RFB transport
-    -> encrypted RA2r relay
-```
-
-While connected:
-
-```text
-second viewer -> immediate reject/reset
-lost active peer -> TCP keepalive/user-timeout -> automatic session teardown
-stalled unauthenticated peer -> monotonic handshake deadline -> slot release
-```
-
-Disconnect:
-
-```text
-internal RFB backend stops
-capture stops
-virtual monitor is removed
-layout is remembered
-service returns to idle listener state
-```
-
-## Security properties
-
-The beta is intentionally display-only:
-
-- keyboard input ignored;
-- pointer/touch input ignored;
-- clipboard input disabled;
-- file transfer disabled;
-- persistent RA2 server identity stored mode `0600`;
-- authentication delegated to the PAM helper over a local Unix socket.
-
-The historical RA2 private key must be purged from Git history and the identity rotated before making the repository public. See [`SECURITY.md`](SECURITY.md).
-
-## Logging
-
-The persistent config uses:
-
-```ini
-[logging]
-level=info
-```
-
-Available levels:
-
-```text
-error   only errors
-info    lifecycle/connect/disconnect/rejected extra clients
-debug   negotiation/capture/transport/TCP liveness and handshake deadline
-trace   per-update transport diagnostics
-```
-
-CLI override example:
+## Build a binary `.deb`
 
 ```bash
-./vnc-monitor --verbose debug
+./build-deb.sh --clean
 ```
 
-Live service log:
+The builder uses `make -j"$(nproc)"` by default, runs dependency preflight, derives runtime ELF dependencies with `dpkg-shlibdeps`, and validates the package with `tools/verify-deb.sh`.
+
+Generated package name follows:
+
+```text
+dist/vnc-monitor_0.1.0~beta.3-<revision>_amd64.deb
+```
+
+The binary package contains:
+
+```text
+/usr/bin/vnc-monitor
+/usr/libexec/vnc-monitor-broker
+/usr/libexec/vnc-monitor-auth-helper
+/usr/lib/systemd/system/vnc-monitor-broker.service
+/usr/lib/systemd/system/vnc-monitor-auth.socket
+/usr/lib/systemd/system/vnc-monitor-auth@.service
+/usr/lib/systemd/user/vnc-monitor.service
+/etc/vnc-monitor/config.ini
+/etc/pam.d/vnc-monitor
+```
+
+The user agent is package-wanted by `graphical-session.target`, so future graphical login sessions start their own agent without package scripts writing into arbitrary home directories.
+
+For a graphical session already running during install/upgrade:
 
 ```bash
+systemctl --user daemon-reload
+systemctl --user restart vnc-monitor.service
+sudo systemctl restart vnc-monitor-broker.service
+```
+
+## Source install / upgrade
+
+Run as the logged-in GNOME desktop user, not root:
+
+```bash
+git pull --ff-only
+./install.sh --clean
+```
+
+Source installation creates/preserves both:
+
+```text
+/etc/vnc-monitor/config.ini
+~/.config/vnc-monitor/config.ini
+```
+
+and preserves the user's RA2 identity/layout state.
+
+## Runtime services
+
+```bash
+systemctl status vnc-monitor-broker.service --no-pager -l
+systemctl status vnc-monitor-auth.socket --no-pager -l
+systemctl --user status vnc-monitor.service --no-pager -l
+```
+
+Logs:
+
+```bash
+journalctl -u vnc-monitor-broker.service -f
 journalctl --user -u vnc-monitor.service -f
 ```
 
-## Documentation
+Idle state:
 
-- [`docs/INSTALL.md`](docs/INSTALL.md) — build, config, installation and systemd operation;
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Mutter/PipeWire/RA2r/RFB transport architecture;
-- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — diagnostics and recovery;
-- [`SECURITY.md`](SECURITY.md) — security invariants and release cleanup;
-- [`CHANGELOG.md`](CHANGELOG.md) — beta changes and historical milestones.
+```text
+broker owns public TCP listener
+user agents wait on $XDG_RUNTIME_DIR/vnc-monitor/agent.sock
+no virtual monitor
+no PipeWire capture
+no internal LibVNCServer listener
+```
 
-## Build manually
+Connected state:
 
-The unified installer is preferred for normal deployment. For development:
+```text
+broker validates active seat0 Session ID/UID
+    -> passes TCP fd to matching user agent
+    -> RA2/PAM
+    -> Mutter virtual monitor
+    -> PipeWire BGRx + cursor metadata
+    -> per-session LibVNCServer backend
+    -> adaptive JPEG21 / CopyRect / lossless repair
+```
+
+## Existing transport/security properties
+
+Beta.3 retains the proven transport path:
+
+- native PipeWire capture, GStreamer fallback;
+- PipeWire `SPA_META_Cursor` cursor metadata;
+- RA2r with persistent per-user RSA identity;
+- PAM authentication;
+- strict view-only input boundary;
+- latest-only/backpressure handling;
+- adaptive JPEG21 active transport;
+- standard CopyRect motion reuse;
+- progressive lossless ZRLE repair;
+- client-driven framebuffer resize for viewers supporting `ExtendedDesktopSize`.
+
+The server remains display-only: keyboard, pointer/touch, clipboard input and file transfer are disabled.
+
+## Standalone developer mode
+
+Running the binary without `--agent` still starts the direct public listener for focused development/diagnostics:
 
 ```bash
-make -j"$(nproc)"
 ./vnc-monitor --verbose debug
 ```
 
-The Makefile uses `-MMD -MP`, so included headers participate in dependency tracking.
+Production systemd units do **not** use standalone mode.
 
-## Service status
+## Documentation
 
-```bash
-systemctl --user status vnc-monitor.service
-systemctl status vnc-monitor-auth.socket
-```
-
-or:
-
-```bash
-make status-support
-```
-
-## Uninstall
-
-```bash
-make uninstall-service
-make uninstall-pam-service
-```
-
-User config/identity/layout data are preserved unless `make purge-config` is explicitly requested.
+- [`docs/INSTALL.md`](docs/INSTALL.md)
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)
+- [`SECURITY.md`](SECURITY.md)
+- [`CHANGELOG.md`](CHANGELOG.md)
