@@ -41,6 +41,7 @@ PAM_BUILD_DIR := $(BUILD_DIR)/pam-service
 PAM_HELPER := auth-helper/vnc-monitor-auth-helper
 PAM_SOCKET_TEMPLATE := auth-helper/vnc-monitor-auth.socket.in
 PAM_SOCKET_GENERATED := $(PAM_BUILD_DIR)/vnc-monitor-auth.socket
+CONFIG_TEMPLATE := config/vnc-monitor.conf
 
 USER_BIN_DIR := $(HOME)/.local/bin
 USER_SYSTEMD_DIR := $(HOME)/.config/systemd/user
@@ -48,6 +49,7 @@ USER_CONFIG_DIR := $(HOME)/.config/vnc-monitor
 LEGACY_LAYOUT_DIR := $(HOME)/.config/vnc-monitor-server
 USER_CACHE_DIR := $(HOME)/.cache/vnc-monitor
 USER_SERVICE := $(USER_SYSTEMD_DIR)/vnc-monitor.service
+USER_CONFIG_FILE := $(USER_CONFIG_DIR)/config.ini
 USER_RA2_KEY := $(USER_CONFIG_DIR)/ra2-server-key.pem
 LEGACY_RA2_KEY := ./ra2-server-key.pem
 
@@ -128,6 +130,12 @@ install: all
 	install -Dm0755 "$(TARGET)" "$(USER_BIN_DIR)/vnc-monitor"
 	@mkdir -p "$(USER_CONFIG_DIR)" "$(LEGACY_LAYOUT_DIR)" "$(USER_CACHE_DIR)"
 	@chmod 700 "$(USER_CONFIG_DIR)" "$(LEGACY_LAYOUT_DIR)" "$(USER_CACHE_DIR)"
+	@if [ ! -e "$(USER_CONFIG_FILE)" ]; then \
+		install -m0600 "$(CONFIG_TEMPLATE)" "$(USER_CONFIG_FILE)"; \
+		printf '%s\n' 'Created default config: $(USER_CONFIG_FILE)'; \
+	else \
+		printf '%s\n' 'Preserving existing config: $(USER_CONFIG_FILE)'; \
+	fi
 	@if [ ! -e "$(USER_RA2_KEY)" ] && [ -f "$(LEGACY_RA2_KEY)" ]; then \
 		install -m0600 "$(LEGACY_RA2_KEY)" "$(USER_RA2_KEY)"; \
 		printf '%s\n' 'Migrated existing RA2 server identity to $(USER_RA2_KEY)'; \
@@ -159,7 +167,7 @@ logs-service:
 
 purge-config:
 	rm -rf "$(USER_CONFIG_DIR)" "$(LEGACY_LAYOUT_DIR)" "$(USER_CACHE_DIR)"
-	@echo 'User VNC Monitor config/cache removed (including RA2 identity and layout cache).'
+	@echo 'User VNC Monitor config/cache removed (including config, RA2 identity and layout cache).'
 
 # Current runtime support is the user daemon plus PAM auth socket/helper.
 install-support: install-service
