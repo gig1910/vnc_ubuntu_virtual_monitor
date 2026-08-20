@@ -72,11 +72,13 @@ required_paths=(
     usr/lib/systemd/system/vnc-monitor-auth.socket
     usr/lib/systemd/system/vnc-monitor-auth@.service
     etc/vnc-monitor/config.ini
+    etc/vnc-monitor/web.ini
     etc/pam.d/vnc-monitor
     usr/share/doc/vnc-monitor/README.md
     usr/share/doc/vnc-monitor/CHANGELOG.md
     usr/share/doc/vnc-monitor/SECURITY.md
     usr/share/doc/vnc-monitor/LICENSE
+    usr/share/doc/vnc-monitor/WEBRTC.md
 )
 
 for path in "${required_paths[@]}"; do
@@ -103,12 +105,23 @@ if find "$root" -type f -name '*.pem' -print -quit | grep -q .; then
     exit 1
 fi
 
+# Browser transport is experimental and must never become externally exposed
+# merely because a package was installed/upgraded.
+grep -Fxq 'enabled=false' "$root/etc/vnc-monitor/web.ini" || {
+    echo "Packaged /etc/vnc-monitor/web.ini is not disabled by default" >&2
+    exit 1
+}
+
 [[ -f "$control/conffiles" ]] || {
     echo "DEBIAN/conffiles is missing" >&2
     exit 1
 }
 grep -Fxq '/etc/vnc-monitor/config.ini' "$control/conffiles" || {
     echo "/etc/vnc-monitor/config.ini is not declared as a conffile" >&2
+    exit 1
+}
+grep -Fxq '/etc/vnc-monitor/web.ini' "$control/conffiles" || {
+    echo "/etc/vnc-monitor/web.ini is not declared as a conffile" >&2
     exit 1
 }
 grep -Fxq '/etc/pam.d/vnc-monitor' "$control/conffiles" || {
@@ -191,6 +204,7 @@ printf 'Version:      %s\n' "$version"
 printf 'Architecture: %s\n' "$architecture"
 printf 'Depends:      %s\n' "$depends"
 printf 'Config:       /etc/vnc-monitor/config.ini (conffile)\n'
+printf 'Web config:   /etc/vnc-monitor/web.ini (conffile, disabled)\n'
 printf 'Broker:       /usr/libexec/vnc-monitor-broker\n'
 printf 'Broker unit:  /usr/lib/systemd/system/vnc-monitor-broker.service\n'
 printf 'Broker IPC:   /run/user visible read-only; /home and /root inaccessible\n'
