@@ -97,6 +97,24 @@ width=1024
 height=768
 ```
 
+### Strong single-connect policy
+
+The beta intentionally serves **exactly one viewer at a time**. This is a fixed server policy, not a configurable client-count limit.
+
+The public listener stays active while the first session is running so a second TCP connection can be detected and rejected immediately instead of sitting in the listen backlog. The second socket is closed with an immediate reset and the active session is left untouched.
+
+The active viewer socket uses TCP liveness protection:
+
+```ini
+[network]
+client-keepalive-idle=15
+client-keepalive-interval=5
+client-keepalive-probes=3
+client-user-timeout-ms=20000
+```
+
+These settings detect a vanished Wi-Fi/LAN peer and automatically tear down the abandoned session, releasing the single-client slot and removing its virtual monitor. They are **not** application-idle timers: a healthy viewer showing a completely static desktop may remain connected indefinitely.
+
 ## Runtime behaviour
 
 Idle:
@@ -120,6 +138,13 @@ VNC viewer
     -> per-session LibVNCServer backend
     -> adaptive RFB transport
     -> encrypted RA2r relay
+```
+
+While connected:
+
+```text
+second viewer -> immediate reject/reset
+lost active peer -> TCP keepalive/user-timeout -> automatic session teardown
 ```
 
 Disconnect:
@@ -158,8 +183,8 @@ Available levels:
 
 ```text
 error   only errors
-info    lifecycle/connect/disconnect
-debug   negotiation/capture/transport summaries
+info    lifecycle/connect/disconnect/rejected extra clients
+debug   negotiation/capture/transport/TCP liveness settings
 trace   per-update transport diagnostics
 ```
 
