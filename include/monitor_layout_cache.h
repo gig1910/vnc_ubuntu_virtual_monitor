@@ -36,6 +36,103 @@ int monitor_layout_cache_save(
     const RuntimeConfig *cfg);
 
 /*
+ * A cache for a virtual-monitor session is only safe to apply when it actually
+ * contains Mutter's virtual connector. A physical-monitor-only cache can be
+ * produced if an older build saves after Shell has already removed Meta-N;
+ * applying such a cache while RecordVirtual is active can tear the new virtual
+ * monitor out from underneath the ScreenCast session.
+ */
+static inline int
+monitor_layout_cache_file_has_virtual(
+    MonitorLayoutCache *cache)
+{
+    if (!cache || !cache->cache_path || !cache->cache_existed)
+        return 0;
+
+    GKeyFile *keyfile = g_key_file_new();
+    GError *error = NULL;
+
+    if (!g_key_file_load_from_file(keyfile,
+                                   cache->cache_path,
+                                   G_KEY_FILE_NONE,
+                                   &error)) {
+        g_clear_error(&error);
+        g_key_file_unref(keyfile);
+        return 0;
+    }
+
+    int found = 0;
+    int logical_count =
+        g_key_file_get_integer(keyfile,
+                               "layout",
+                               "logical-count",
+                               &error);
+
+    if (error || logical_count <= 0) {
+        g_clear_error(&error);
+        g_key_file_unref(keyfile);
+        return 0;
+    }
+
+    for (int logical_index = 0;
+         logical_index < logical_count && !found;
+         logical_index++) {
+        char *group =
+            g_strdup_printf("logical.%d", logical_index);
+        GError *group_error = NULL;
+        int monitor_count =
+            g_key_file_get_integer(keyfile,
+                                   group,
+                                   "monitor-count",
+                                   &group_error);
+
+        if (!group_error && monitor_count > 0) {
+            for (int monitor_index = 0;
+                 monitor_index < monitor_count && !found;
+                 monitor_index++) {
+                char *monitor_group =
+                    g_strdup_printf("logical.%d.monitor.%d",
+                                    logical_index,
+                                    monitor_index);
+                char *connector =
+                    g_key_file_get_string(keyfile,
+                                          monitor_group,
+                                          "connector",
+                                          NULL);
+
+                found = connector &&
+                        g_str_has_prefix(connector, "Meta-");
+
+                g_free(connector);
+                g_free(monitor_group);
+            }
+        }
+
+        g_clear_error(&group_error);
+        g_free(group);
+    }
+
+    g_key_file_unref(keyfile);
+    return found;
+}
+
+static inline int
+monitor_layout_cache_apply_safe(
+    MonitorLayoutCache *cache,
+    const RuntimeConfig *cfg,
+    int timeout_ms)
+{
+    if (cache && cache->cache_existed &&
+        !monitor_layout_cache_file_has_virtual(cache)) {
+        g_printerr("Ignoring cached Mutter layout without a virtual Meta-* monitor: %s\n",
+                   cache->cache_path ? cache->cache_path : "(unknown)");
+        return 0;
+    }
+
+    return monitor_layout_cache_apply(cache, cfg, timeout_ms);
+}
+
+/*
  * Verify that Mutter still exposes the virtual monitor created by
  * RecordVirtual. On the supported GNOME/Mutter path these connectors are
  * named Meta-N (the Shell log reports e.g. "Added virtual monitor Meta-0").
@@ -126,8 +223,8 @@ monitor_layout_cache_virtual_present(
  * replacing it with a physical-monitor-only topology.
  *
  * main.c includes real_monitor.h before this header, so only the session
- * orchestration path gets the compatibility wrapper. monitor_layout_cache.c
- * itself still defines/calls the real function normally.
+ * orchestration path gets these compatibility wrappers. monitor_layout_cache.c
+ * itself still defines/calls the real functions normally.
  */
 static inline int
 monitor_layout_cache_save_latest(
@@ -146,6 +243,8 @@ monitor_layout_cache_save_latest(
 }
 
 #ifdef VNC_MONITOR_REAL_MONITOR_H
+#define monitor_layout_cache_apply(cache, cfg, timeout_ms) \
+    monitor_layout_cache_apply_safe((cache), (cfg), (timeout_ms))
 #define monitor_layout_cache_save(cache, cfg) \
     monitor_layout_cache_save_latest((cache), (cfg))
 #endif
