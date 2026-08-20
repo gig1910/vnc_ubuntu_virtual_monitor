@@ -22,6 +22,18 @@ int real_monitor_start(
     FrameBridge *bridge,
     PipelineStats *stats);
 
+/*
+ * Recreate the Mutter virtual monitor/capture at a new size. On failure the
+ * function attempts to restore the previous monitor and FrameBridge size.
+ */
+int real_monitor_resize(
+    RealMonitor *real,
+    RuntimeConfig *cfg,
+    FrameBridge *bridge,
+    PipelineStats *stats,
+    int width,
+    int height);
+
 void real_monitor_stop(RealMonitor *real);
 
 #endif
