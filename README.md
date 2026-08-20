@@ -10,12 +10,11 @@ The production path uses Mutter RemoteDesktop/ScreenCast, native PipeWire captur
 
 The virtual monitor exists only while a VNC client is connected and is removed after disconnect.
 
-## Quick install / upgrade
+## Source install / upgrade
 
 Run as the logged-in GNOME desktop user:
 
 ```bash
-git switch 0.1.0-beta
 git pull --ff-only
 ./install.sh
 ```
@@ -37,20 +36,93 @@ It must **not** be run with `sudo`; sudo is invoked internally only for the PAM/
 
 Existing services are upgraded in place and restarted only after a successful build/install.
 
-## Persistent configuration
+## Build a binary `.deb`
 
-The service reads:
+A compiled Debian/Ubuntu package can be built with:
 
-```text
-~/.config/vnc-monitor/config.ini
+```bash
+./build-deb.sh
 ```
 
-On first install it is created from `config/vnc-monitor.conf` with mode `0600`. Subsequent upgrades preserve the local file unchanged.
+The builder:
 
-Configuration precedence is:
+- performs the same build-library preflight before compilation;
+- builds with `make -j"$(nproc)"` by default;
+- derives the package version from `VNC_MONITOR_VERSION` (`0.1.0-beta.2` becomes Debian version `0.1.0~beta.2-1`);
+- stages the compiled daemon and PAM helper under `/usr`;
+- installs the system baseline as `/etc/vnc-monitor/config.ini`;
+- installs package-managed systemd units under `/usr/lib/systemd/system` and `/usr/lib/systemd/user`;
+- uses `dpkg-shlibdeps` to calculate **runtime shared-library dependencies only**;
+- creates the final package in `./dist/`.
+
+Build/development packages such as `build-essential`, `pkg-config`, `dpkg-dev` and `*-dev` libraries are requirements of the **build machine only**. They are not copied into the binary package `Depends` field.
+
+Optional clean build:
+
+```bash
+./build-deb.sh --clean
+```
+
+The resulting filename is similar to:
 
 ```text
-built-in defaults < config.ini < command-line options
+dist/vnc-monitor_0.1.0~beta.2-1_amd64.deb
+```
+
+Install it with apt:
+
+```bash
+sudo apt install ./dist/vnc-monitor_0.1.0~beta.2-1_amd64.deb
+```
+
+Then enable the package-installed user service once, as the GNOME desktop user:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now vnc-monitor.service
+```
+
+The PAM socket is a system service and is enabled/restarted by the package. The package socket is generic rather than tied to the username of the build machine; the privileged helper validates the connecting Unix account using `SO_PEERCRED` and only authenticates that same username.
+
+### Migrating from `./install.sh` to `.deb`
+
+A source installation places higher-priority units in `~/.config/systemd/user/` and `/etc/systemd/system/`. Remove those overrides **before** installing the `.deb`:
+
+```bash
+make uninstall-service
+make uninstall-pam-service
+sudo apt install ./dist/vnc-monitor_0.1.0~beta.2-1_amd64.deb
+systemctl --user daemon-reload
+systemctl --user enable --now vnc-monitor.service
+```
+
+The source uninstall targets preserve the per-user config, RA2 identity and layout cache.
+
+## Persistent configuration
+
+Configuration is layered:
+
+```text
+built-in defaults
+    < /etc/vnc-monitor/config.ini
+    < ~/.config/vnc-monitor/config.ini
+    < command-line options
+```
+
+`/etc/vnc-monitor/config.ini` is an optional system baseline. The `.deb` installs it as a package conffile.
+
+`~/.config/vnc-monitor/config.ini` is the optional per-user override. Source installation creates it on first install and preserves it on upgrades. Package installation does not create or overwrite files in a user's home directory.
+
+An explicit:
+
+```bash
+vnc-monitor --config /path/to/file.ini
+```
+
+replaces the normal per-user override path but still loads `/etc/vnc-monitor/config.ini` first. Effective precedence becomes:
+
+```text
+built-ins < /etc/vnc-monitor/config.ini < --config FILE < CLI
 ```
 
 Show the effective configuration without starting the server:
@@ -59,15 +131,7 @@ Show the effective configuration without starting the server:
 vnc-monitor --show-config
 ```
 
-or explicitly:
-
-```bash
-~/.local/bin/vnc-monitor \
-  --config ~/.config/vnc-monitor/config.ini \
-  --show-config
-```
-
-After editing the installed config:
+After editing either persistent config layer:
 
 ```bash
 systemctl --user restart vnc-monitor.service
@@ -169,7 +233,8 @@ The beta is intentionally display-only:
 - clipboard input disabled;
 - file transfer disabled;
 - persistent RA2 server identity stored mode `0600`;
-- authentication delegated to the PAM helper over a local Unix socket.
+- authentication delegated to the PAM helper over a local Unix socket;
+- the privileged helper binds an authentication request to the local caller's Unix UID using `SO_PEERCRED`.
 
 The historical RA2 private key must be purged from Git history and the identity rotated before making the repository public. See [`SECURITY.md`](SECURITY.md).
 
@@ -213,7 +278,7 @@ journalctl --user -u vnc-monitor.service -f
 
 ## Build manually
 
-The unified installer is preferred for normal deployment. For development:
+For development:
 
 ```bash
 make -j"$(nproc)"
@@ -229,7 +294,7 @@ systemctl --user status vnc-monitor.service
 systemctl status vnc-monitor-auth.socket
 ```
 
-or:
+or for a source installation:
 
 ```bash
 make status-support
@@ -237,9 +302,17 @@ make status-support
 
 ## Uninstall
 
+Source installation:
+
 ```bash
 make uninstall-service
 make uninstall-pam-service
 ```
 
-User config/identity/layout data are preserved unless `make purge-config` is explicitly requested.
+Binary package:
+
+```bash
+sudo apt remove vnc-monitor
+```
+
+User config/identity/layout data are preserved unless explicitly removed.
