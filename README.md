@@ -26,6 +26,8 @@ For the first build after switching from an older development branch:
 ./install.sh --clean
 ```
 
+Before compilation the installer verifies the required build tools, all `pkg-config` modules, libjpeg and PAM development headers/libraries. The build then uses all available logical CPUs by default (`nproc`).
+
 The installer builds and installs both privilege domains:
 
 - `vnc-monitor.service` — systemd **user** service for the active GNOME Wayland session;
@@ -110,7 +112,7 @@ journalctl --user -u vnc-monitor.service -f
 The unified installer is preferred for normal deployment. For development:
 
 ```bash
-make -j20
+make -j"$(nproc)"
 ./vnc-monitor --verbose debug
 ```
 
