@@ -7,15 +7,16 @@ Wants=pipewire.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/vnc-monitor --config %h/.config/vnc-monitor/config.ini
+ExecStart=%h/.local/bin/vnc-monitor
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s
 UMask=0077
 
-# The daemon must read the user's installed binary/config and write only its
-# own identity/cache. Session D-Bus and PipeWire live under XDG_RUNTIME_DIR and
-# are intentionally not isolated away.
+# The daemon reads the optional system baseline /etc/vnc-monitor/config.ini
+# and the user's ~/.config/vnc-monitor/config.ini override. It writes only its
+# own identity/cache/layout state. Session D-Bus and PipeWire live under
+# XDG_RUNTIME_DIR and are intentionally not isolated away.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
