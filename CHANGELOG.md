@@ -2,6 +2,18 @@
 
 All notable project milestones are summarized here. Development commits before the beta checkpoint were intentionally experimental and are condensed by behavior rather than reproduced commit-by-commit.
 
+## Unreleased — Debian packaging
+
+- added executable `build-deb.sh` for rootless binary `.deb` builds using `make -j"$(nproc)"`;
+- added packaging preflight for compiler/library and `dpkg` tooling without leaking build dependencies into the binary package;
+- runtime shared-library dependencies are generated from the compiled ELF files through `dpkg-shlibdeps`;
+- package layout uses `/usr/bin`, `/usr/libexec`, `/usr/lib/systemd/system` and `/usr/lib/systemd/user`;
+- `/etc/vnc-monitor/config.ini` is now an optional system baseline read before the per-user config;
+- effective config precedence is `built-ins < /etc/vnc-monitor/config.ini < user/--config < CLI`;
+- package installation keeps RA2 identity/layout/user overrides in the user's home rather than creating home files from root maintainer scripts;
+- package PAM socket is build-user-independent; the helper's existing `SO_PEERCRED` same-account authorization remains the security boundary;
+- package version conversion uses Debian prerelease ordering, e.g. `0.1.0-beta.2` -> `0.1.0~beta.2-1`.
+
 ## 0.1.0-beta.2 — 2026-08-20
 
 Configuration, dynamic-display and single-session hardening release.
