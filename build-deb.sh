@@ -16,8 +16,9 @@ Usage: ./build-deb.sh [--clean] [--jobs N] [--output-dir DIR]
 
 Build a compiled Debian/Ubuntu binary package for the current architecture.
 The resulting .deb contains the system broker, per-user GNOME session agent,
-config, PAM support and systemd units. Build/development packages are checked
-only on this build machine and are NOT added to binary package Depends.
+config, optional broker HTTPS scaffold, PAM support and systemd units.
+Build/development packages are checked only on this build machine and are NOT
+added manually to binary package Depends.
 
 Options:
   --clean            Run make clean before compilation.
@@ -108,6 +109,7 @@ pkg_modules=(
     nettle
     glib-2.0
     gio-2.0
+    libsoup-3.0
     gstreamer-1.0
     gstreamer-app-1.0
     gstreamer-video-1.0
@@ -177,7 +179,7 @@ if ((${#missing_modules[@]})) || ((jpeg_ok == 0)) || ((pam_ok == 0)); then
 Typical Ubuntu build packages are:
   sudo apt install \
     build-essential pkg-config dpkg-dev \
-    libvncserver-dev libssl-dev nettle-dev libglib2.0-dev \
+    libvncserver-dev libssl-dev nettle-dev libglib2.0-dev libsoup-3.0-dev \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
     libpipewire-0.3-dev libjpeg-dev libpam0g-dev
 
@@ -223,6 +225,7 @@ install -Dm0755 vnc-monitor "$stage/usr/bin/vnc-monitor"
 install -Dm0755 vnc-monitor-broker "$stage/usr/libexec/vnc-monitor-broker"
 install -Dm0755 auth-helper/vnc-monitor-auth-helper "$stage/usr/libexec/vnc-monitor-auth-helper"
 install -Dm0644 config/vnc-monitor.conf "$stage/etc/vnc-monitor/config.ini"
+install -Dm0644 config/web.conf "$stage/etc/vnc-monitor/web.ini"
 install -Dm0644 auth-helper/vnc-monitor.pam "$stage/etc/pam.d/vnc-monitor"
 
 mkdir -p "$stage/usr/lib/systemd/user"
@@ -289,9 +292,11 @@ install -Dm0644 LICENSE "$stage/usr/share/doc/vnc-monitor/LICENSE"
 install -Dm0644 docs/INSTALL.md "$stage/usr/share/doc/vnc-monitor/INSTALL.md"
 install -Dm0644 docs/ARCHITECTURE.md "$stage/usr/share/doc/vnc-monitor/ARCHITECTURE.md"
 install -Dm0644 docs/TROUBLESHOOTING.md "$stage/usr/share/doc/vnc-monitor/TROUBLESHOOTING.md"
+install -Dm0644 docs/WEBRTC.md "$stage/usr/share/doc/vnc-monitor/WEBRTC.md"
 
 cat >"$stage/DEBIAN/conffiles" <<'EOF'
 /etc/vnc-monitor/config.ini
+/etc/vnc-monitor/web.ini
 /etc/pam.d/vnc-monitor
 EOF
 
@@ -336,8 +341,9 @@ Description: GNOME Wayland virtual monitor over VNC
  VNC Monitor exposes a real Mutter virtual monitor from the active local GNOME
  Wayland login session through a view-only RA2r VNC server. A root system broker
  owns the public listener and routes each new connection only to the currently
- active seat0 user's unprivileged session agent. Switch-user/logoff revokes the
- bound connection instead of moving it to another login session.
+ active seat0 user's unprivileged session agent. The broker also contains an
+ optional HTTPS scaffold for the developing browser/WebRTC transport, disabled
+ by default. Switch-user/logoff revokes the bound display session.
 EOF
 
 cat >"$stage/DEBIAN/postinst" <<'EOF'
@@ -409,6 +415,8 @@ printf 'For the already-running GNOME session after first install/upgrade, run:\
 printf '  systemctl --user daemon-reload\n'
 printf '  systemctl --user restart vnc-monitor.service\n'
 printf '  sudo systemctl restart vnc-monitor-broker.service\n'
+printf '\nBrowser HTTPS config is installed at /etc/vnc-monitor/web.ini and remains\n'
+printf 'disabled by default until a TLS certificate/key are configured.\n'
 printf '\nIf this machine still has the old ./install.sh source installation, remove\n'
 printf 'its user/system unit overrides first (config and RA2 identity are preserved):\n'
 printf '  make uninstall-service\n'
