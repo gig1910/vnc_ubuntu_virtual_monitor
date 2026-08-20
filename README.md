@@ -159,7 +159,7 @@ Available levels:
 ```text
 error   only errors
 info    lifecycle/connect/disconnect
-DEBUG   negotiation/capture/transport summaries
+debug   negotiation/capture/transport summaries
 trace   per-update transport diagnostics
 ```
 
