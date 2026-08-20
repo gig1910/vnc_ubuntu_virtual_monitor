@@ -21,7 +21,14 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
-ProtectHome=yes
+
+# Do not use ProtectHome=yes here: systemd also hides /run/user with that
+# setting, while the broker must connect to /run/user/<uid>/vnc-monitor/agent.sock.
+# Keep actual home directories inaccessible and expose /run/user read-only.
+ProtectHome=no
+InaccessiblePaths=/home /root
+ReadOnlyPaths=/run/user
+
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
