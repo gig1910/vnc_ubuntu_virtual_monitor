@@ -233,6 +233,14 @@ apply_setting(RuntimeConfig *cfg, const char *name, const char *value)
         return parse_int(name, value, 4096, 4194304, &cfg->external_send_buffer);
     if (strcmp(name, "backend-recv-buffer") == 0)
         return parse_int(name, value, 4096, 4194304, &cfg->backend_receive_buffer);
+    if (strcmp(name, "client-keepalive-idle") == 0)
+        return parse_int(name, value, 1, 3600, &cfg->client_keepalive_idle_s);
+    if (strcmp(name, "client-keepalive-interval") == 0)
+        return parse_int(name, value, 1, 3600, &cfg->client_keepalive_interval_s);
+    if (strcmp(name, "client-keepalive-probes") == 0)
+        return parse_int(name, value, 1, 20, &cfg->client_keepalive_probes);
+    if (strcmp(name, "client-user-timeout-ms") == 0)
+        return parse_int(name, value, 1000, 600000, &cfg->client_user_timeout_ms);
     if (strcmp(name, "diff-detect") == 0)
         return parse_bool(name, value, &cfg->diff_detect);
     if (strcmp(name, "diff-tile-size") == 0)
@@ -315,6 +323,10 @@ static const ConfigBinding config_bindings[] = {
     {"network", "backend-bind", "backend-bind"},
     {"network", "external-send-buffer", "external-send-buffer"},
     {"network", "backend-recv-buffer", "backend-recv-buffer"},
+    {"network", "client-keepalive-idle", "client-keepalive-idle"},
+    {"network", "client-keepalive-interval", "client-keepalive-interval"},
+    {"network", "client-keepalive-probes", "client-keepalive-probes"},
+    {"network", "client-user-timeout-ms", "client-user-timeout-ms"},
 
     {"ra2", "record-size", "ra2-record-size"},
     {"ra2", "coalesce", "ra2-coalesce"},
@@ -516,6 +528,10 @@ runtime_config_defaults(RuntimeConfig *cfg)
 
     cfg->external_send_buffer = 65536;
     cfg->backend_receive_buffer = 65536;
+    cfg->client_keepalive_idle_s = 15;
+    cfg->client_keepalive_interval_s = 5;
+    cfg->client_keepalive_probes = 3;
+    cfg->client_user_timeout_ms = 20000;
     cfg->diff_detect = 1;
     cfg->diff_tile_size = 32;
     cfg->layout_remember = 1;
@@ -572,6 +588,10 @@ runtime_config_usage(const char *argv0)
         "  --backend-bind ADDR          Internal bind address\n"
         "  --external-send-buffer N     External TCP SO_SNDBUF\n"
         "  --backend-recv-buffer N      Backend TCP SO_RCVBUF\n"
+        "  --client-keepalive-idle N    Seconds before TCP keepalive probes [15]\n"
+        "  --client-keepalive-interval N Seconds between keepalive probes [5]\n"
+        "  --client-keepalive-probes N  Failed probes before dead peer [3]\n"
+        "  --client-user-timeout-ms N   Max unacknowledged TCP time [20000]\n"
         "\n"
         "Virtual monitor:\n"
         "  --screen-mode MODE           auto|fixed [auto]\n"
@@ -595,6 +615,8 @@ runtime_config_usage(const char *argv0)
         "Logging:\n"
         "  --verbose LEVEL              0|error, 1|info, 2|debug, 3|trace\n"
         "\n"
+        "Connection policy is fixed in beta: strong single-connect; additional\n"
+        "clients are rejected immediately while one session owns the display.\n"
         "Security is fixed in beta: view-only, clipboard input disabled,\n"
         "file transfer disabled. These are not runtime switches.\n"
         "\n"
@@ -623,6 +645,9 @@ runtime_config_print(const RuntimeConfig *cfg)
         "  layout resave:     %s\n"
         "  public port:       %d\n"
         "  backend:           %s:%d\n"
+        "  connection policy: strong single-connect\n"
+        "  TCP keepalive:     idle=%ds interval=%ds probes=%d\n"
+        "  TCP user timeout:  %d ms\n"
         "  screen mode:       %s\n"
         "  framebuffer:       %dx%d (%s)\n"
         "  RA2 record max:    %d bytes\n"
@@ -648,6 +673,10 @@ runtime_config_print(const RuntimeConfig *cfg)
         cfg->public_port,
         cfg->backend_bind,
         cfg->backend_port,
+        cfg->client_keepalive_idle_s,
+        cfg->client_keepalive_interval_s,
+        cfg->client_keepalive_probes,
+        cfg->client_user_timeout_ms,
         runtime_config_screen_size_mode_name(cfg->screen_size_mode),
         cfg->width,
         cfg->height,
@@ -680,6 +709,10 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
         OPT_LATEST_ONLY,
         OPT_EXTERNAL_SEND_BUFFER,
         OPT_BACKEND_RECV_BUFFER,
+        OPT_CLIENT_KEEPALIVE_IDLE,
+        OPT_CLIENT_KEEPALIVE_INTERVAL,
+        OPT_CLIENT_KEEPALIVE_PROBES,
+        OPT_CLIENT_USER_TIMEOUT_MS,
         OPT_DIFF_DETECT,
         OPT_DIFF_TILE_SIZE,
         OPT_LAYOUT_REMEMBER,
@@ -714,6 +747,10 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
         {"latest-only", required_argument, NULL, OPT_LATEST_ONLY},
         {"external-send-buffer", required_argument, NULL, OPT_EXTERNAL_SEND_BUFFER},
         {"backend-recv-buffer", required_argument, NULL, OPT_BACKEND_RECV_BUFFER},
+        {"client-keepalive-idle", required_argument, NULL, OPT_CLIENT_KEEPALIVE_IDLE},
+        {"client-keepalive-interval", required_argument, NULL, OPT_CLIENT_KEEPALIVE_INTERVAL},
+        {"client-keepalive-probes", required_argument, NULL, OPT_CLIENT_KEEPALIVE_PROBES},
+        {"client-user-timeout-ms", required_argument, NULL, OPT_CLIENT_USER_TIMEOUT_MS},
         {"diff-detect", required_argument, NULL, OPT_DIFF_DETECT},
         {"diff-tile-size", required_argument, NULL, OPT_DIFF_TILE_SIZE},
         {"layout-remember", required_argument, NULL, OPT_LAYOUT_REMEMBER},
@@ -780,6 +817,10 @@ runtime_config_parse(RuntimeConfig *cfg, int argc, char **argv)
             case OPT_LATEST_ONLY: setting = "latest-only"; break;
             case OPT_EXTERNAL_SEND_BUFFER: setting = "external-send-buffer"; break;
             case OPT_BACKEND_RECV_BUFFER: setting = "backend-recv-buffer"; break;
+            case OPT_CLIENT_KEEPALIVE_IDLE: setting = "client-keepalive-idle"; break;
+            case OPT_CLIENT_KEEPALIVE_INTERVAL: setting = "client-keepalive-interval"; break;
+            case OPT_CLIENT_KEEPALIVE_PROBES: setting = "client-keepalive-probes"; break;
+            case OPT_CLIENT_USER_TIMEOUT_MS: setting = "client-user-timeout-ms"; break;
             case OPT_DIFF_DETECT: setting = "diff-detect"; break;
             case OPT_DIFF_TILE_SIZE: setting = "diff-tile-size"; break;
             case OPT_LAYOUT_REMEMBER: setting = "layout-remember"; break;
