@@ -10,7 +10,7 @@ VNC Monitor has three privilege/lifecycle roles:
 2. `vnc-monitor.service` — **systemd user service**, runs `vnc-monitor --agent` inside each GNOME Wayland login session and owns RA2/Mutter/PipeWire/RFB work;
 3. `vnc-monitor-auth.socket` + `vnc-monitor-auth@.service` — **system PAM helper**, authenticates only the Unix account owning the calling user-agent process.
 
-The capture/RA2 daemon must remain unprivileged; do not convert it into a root system service.
+The capture/RA2 daemon remains unprivileged; do not convert it into a root system service.
 
 ## Session-selection policy
 
@@ -18,7 +18,7 @@ A new external connection is routed only when `seat0` currently selects a local 
 
 GDM/greeter is not served.
 
-The connection is then bound to that exact logind Session ID + UID. `Switch User`, logoff or another seat0 session transition terminates the connection and removes its virtual monitor. It is never moved to GDM or another user's desktop.
+The connection is bound to that exact logind Session ID + UID. `Switch User`, lock-to-greeter, logoff or another seat0 transition terminates the connection and removes its virtual monitor. It is never moved to GDM or another user's desktop.
 
 To see a different user's active desktop, reconnect and authenticate again as that user.
 
@@ -64,23 +64,22 @@ These are **build-machine dependencies only**. The compiled `.deb` derives runti
 
 ## Build binary `.deb`
 
-First beta.3 build:
+From the checked-out source tree:
 
 ```bash
-git switch broker-agent
 git pull --ff-only
 ./build-deb.sh --clean
 ```
 
-The clean build is intentional because beta.3 adds new broker/protocol objects and changes `main.c` lifecycle ownership.
+The builder uses `make -j"$(nproc)"` by default and runs `tools/verify-deb.sh` automatically.
 
-Expected output:
+Generated package name follows:
 
 ```text
-dist/vnc-monitor_0.1.0~beta.3-1_amd64.deb
+dist/vnc-monitor_0.1.0~beta.3-<revision>_amd64.deb
 ```
 
-The builder runs `tools/verify-deb.sh` automatically. A valid build ends with:
+A valid build ends with:
 
 ```text
 ===== VNC MONITOR: PACKAGE VERIFY =====
@@ -92,9 +91,13 @@ The package contains the broker, user agent, PAM helper, system/user units, `/et
 
 ## Package install
 
+Install the generated package, for example:
+
 ```bash
-sudo apt install ./dist/vnc-monitor_0.1.0~beta.3-1_amd64.deb
+sudo apt install ./dist/vnc-monitor_0.1.0~beta.3-3_amd64.deb
 ```
+
+The exact Debian revision may be newer; use the file produced by `build-deb.sh`.
 
 The package:
 
@@ -113,18 +116,20 @@ systemctl --user restart vnc-monitor.service
 sudo systemctl restart vnc-monitor-broker.service
 ```
 
-This is especially important for beta.2 -> beta.3 because the old beta.2 user daemon owned the public TCP port itself. The beta.3 broker has unlimited start retries and package configuration does not fail if that old listener temporarily owns the port.
+This is especially important for beta.2 -> beta.3 because the old beta.2 user daemon owned the public TCP port itself.
 
 ## Migrating an old source installation to `.deb`
 
-Old source installs place higher-priority unit files in the user's/system `/etc` paths. Remove those overrides before installing the package while preserving user state:
+Old source installs place higher-priority unit files in user/system override paths. Remove those overrides before installing the package while preserving user state:
 
 ```bash
 make uninstall-service
 make uninstall-broker-service 2>/dev/null || true
 make uninstall-pam-service
-sudo apt install ./dist/vnc-monitor_0.1.0~beta.3-1_amd64.deb
+sudo apt install ./dist/vnc-monitor_0.1.0~beta.3-<revision>_amd64.deb
 ```
+
+Use the actual generated filename in place of `<revision>`.
 
 Preserved state includes:
 
@@ -156,8 +161,6 @@ build everything
   -> install/start system broker
 ```
 
-This avoids a deterministic public-port collision.
-
 Source installation creates `/etc/vnc-monitor/config.ini` only if absent and creates the user's `~/.config/vnc-monitor/config.ini` only if absent. Both are preserved later.
 
 ## PAM socket in multi-user mode
@@ -171,7 +174,23 @@ SocketMode=0666
 
 This is not the authorization boundary. The root helper obtains `SO_PEERCRED` from the connecting process and refuses any requested username different from that process' Unix account.
 
-Thus a `bob` agent can authenticate `bob` only; it cannot test/authenticate `gig` credentials.
+Thus a `guest`/`bob` agent can authenticate only its own Unix account; it cannot test/authenticate `gig` credentials.
+
+## Broker/agent peer verification
+
+The agent socket is private to each runtime directory:
+
+```text
+/run/user/UID/vnc-monitor/agent.sock
+```
+
+The broker validates the agent socket UID against the active logind UID.
+
+The agent validates the broker through `SO_PEERCRED`. On systems where the hardened user service maps only its own UID in a user namespace, host root may appear as an overflow UID. Overflow UID is not trusted by itself; the peer PID must belong exactly to:
+
+```text
+/system.slice/vnc-monitor-broker.service
+```
 
 ## Service status
 
@@ -225,16 +244,17 @@ broker accepts external client
 
 Second external clients are rejected immediately.
 
-## Switch User / logoff test
+## Confirmed beta.3 session tests
 
-With an established VNC session:
+The broker/agent lifecycle has been tested with:
 
-1. invoke GNOME Switch User or log out;
-2. the old VNC client must disconnect;
-3. the virtual monitor must disappear;
-4. a new connection while GDM is active must be rejected;
-5. after logging in as another user, reconnect and authenticate as that user;
-6. credentials for the inactive previous account must be rejected by the active user's PAM boundary.
+1. normal VNC connection to active `gig`;
+2. Switch User / lock transition to GDM, which immediately disconnects the old VNC session;
+3. VNC attempt while GDM is active, which is rejected;
+4. login as another local account (`guest`) and successful routing only to that account's agent;
+5. wrong/inactive account credentials rejected;
+6. switching back to `gig`, requiring a fresh VNC connection and authentication;
+7. second-client immediate rejection and dead Wi-Fi client cleanup.
 
 The old connection must never resume even if the machine later switches back to the same account.
 
