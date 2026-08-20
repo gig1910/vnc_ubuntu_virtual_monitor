@@ -8,9 +8,11 @@ PACKAGES := libvncserver openssl nettle glib-2.0 gio-2.0 \
 
 PKG_CFLAGS := $(shell pkg-config --cflags $(PACKAGES))
 PKG_LIBS   := $(shell pkg-config --libs $(PACKAGES))
+BROKER_LIBS := $(shell pkg-config --libs glib-2.0 gio-2.0)
 
 SOURCES := \
 	src/main.c \
+	src/broker_protocol.c \
 	src/runtime_config.c \
 	src/log.c \
 	src/shutdown_signal.c \
@@ -33,8 +35,11 @@ SOURCES := \
 	src/ra2_stream_coalescer.c
 
 OBJECTS := $(SOURCES:.c=.o)
-DEPS    := $(OBJECTS:.o=.d)
-TARGET  := vnc-monitor
+BROKER_OBJECTS := src/broker.o src/broker_protocol.o src/log.o
+DEPS := $(sort $(OBJECTS:.o=.d) $(BROKER_OBJECTS:.o=.d))
+
+TARGET := vnc-monitor
+BROKER_TARGET := vnc-monitor-broker
 
 BUILD_DIR := build
 PAM_BUILD_DIR := $(BUILD_DIR)/pam-service
@@ -53,20 +58,29 @@ USER_CONFIG_FILE := $(USER_CONFIG_DIR)/config.ini
 USER_RA2_KEY := $(USER_CONFIG_DIR)/ra2-server-key.pem
 LEGACY_RA2_KEY := ./ra2-server-key.pem
 
-# The privileged PAM helper is system-level, while the monitor daemon is a
-# systemd user service so it shares the active GNOME Wayland/session D-Bus.
+SYSTEM_CONFIG_DIR := /etc/vnc-monitor
+SYSTEM_CONFIG_FILE := $(SYSTEM_CONFIG_DIR)/config.ini
+BROKER_BIN := /usr/local/libexec/vnc-monitor-broker
+BROKER_SERVICE := /etc/systemd/system/vnc-monitor-broker.service
+
+# Source installs keep the PAM socket restricted to the invoking desktop user.
+# Binary .deb installs use a generic local socket plus SO_PEERCRED validation.
 AUTH_SOCKET_USER ?= $(shell id -un)
 AUTH_SOCKET_GROUP ?= $(shell id -gn)
 
 .PHONY: all clean \
 	auth-helper pam-service install-pam-service pam-service-status uninstall-pam-service \
+	install-broker-service broker-service-status uninstall-broker-service \
 	install install-service uninstall-service restart-service stop-service status-service logs-service \
 	install-support status-support uninstall-support cleanup-obsolete-support purge-config
 
-all: $(TARGET)
+all: $(TARGET) $(BROKER_TARGET)
 
 $(TARGET): $(OBJECTS)
 	$(CC) $(CFLAGS) $(OBJECTS) -o $@ $(PKG_LIBS) -ljpeg -pthread
+
+$(BROKER_TARGET): $(BROKER_OBJECTS)
+	$(CC) $(CFLAGS) $(BROKER_OBJECTS) -o $@ $(BROKER_LIBS) -pthread
 
 src/%.o: src/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_CFLAGS) -c $< -o $@
@@ -126,6 +140,32 @@ uninstall-pam-service:
 	sudo systemctl daemon-reload
 	@echo 'PAM/systemd authentication support removed.'
 
+install-broker-service: $(BROKER_TARGET)
+	@printf '%s\n' 'Installing system broker...'
+	sudo install -Dm0755 "$(BROKER_TARGET)" "$(BROKER_BIN)"
+	sudo install -Dm0644 systemd/vnc-monitor-broker.service "$(BROKER_SERVICE)"
+	@if [ ! -e "$(SYSTEM_CONFIG_FILE)" ]; then \
+		sudo install -Dm0644 "$(CONFIG_TEMPLATE)" "$(SYSTEM_CONFIG_FILE)"; \
+		printf '%s\n' 'Created system config: $(SYSTEM_CONFIG_FILE)'; \
+	else \
+		printf '%s\n' 'Preserving existing system config: $(SYSTEM_CONFIG_FILE)'; \
+	fi
+	sudo systemctl daemon-reload
+	sudo systemctl enable --now vnc-monitor-broker.service
+	@$(MAKE) --no-print-directory broker-service-status
+
+broker-service-status:
+	@printf '%s\n' '===== BROKER SERVICE ====='
+	@systemctl is-enabled vnc-monitor-broker.service 2>/dev/null || true
+	@systemctl is-active vnc-monitor-broker.service 2>/dev/null || true
+	@systemctl status vnc-monitor-broker.service --no-pager -l 2>/dev/null | sed -n '1,18p' || true
+
+uninstall-broker-service:
+	-sudo systemctl disable --now vnc-monitor-broker.service
+	sudo rm -f "$(BROKER_BIN)" "$(BROKER_SERVICE)"
+	sudo systemctl daemon-reload
+	@echo 'System broker removed. /etc/vnc-monitor/config.ini was preserved.'
+
 install: all
 	install -Dm0755 "$(TARGET)" "$(USER_BIN_DIR)/vnc-monitor"
 	@mkdir -p "$(USER_CONFIG_DIR)" "$(LEGACY_LAYOUT_DIR)" "$(USER_CACHE_DIR)"
@@ -141,7 +181,7 @@ install: all
 		printf '%s\n' 'Migrated existing RA2 server identity to $(USER_RA2_KEY)'; \
 	fi
 
-install-service: install install-pam-service
+install-service: install install-pam-service install-broker-service
 	install -Dm0644 systemd/vnc-monitor.service "$(USER_SERVICE)"
 	systemctl --user daemon-reload
 	systemctl --user enable --now vnc-monitor.service
@@ -151,7 +191,7 @@ uninstall-service:
 	-systemctl --user disable --now vnc-monitor.service
 	rm -f "$(USER_SERVICE)" "$(USER_BIN_DIR)/vnc-monitor"
 	systemctl --user daemon-reload
-	@printf '%s\n' 'User service removed. RA2 identity/config were preserved.'
+	@printf '%s\n' 'User agent removed. RA2 identity/config were preserved.'
 
 restart-service:
 	systemctl --user restart vnc-monitor.service
@@ -169,16 +209,16 @@ purge-config:
 	rm -rf "$(USER_CONFIG_DIR)" "$(LEGACY_LAYOUT_DIR)" "$(USER_CACHE_DIR)"
 	@echo 'User VNC Monitor config/cache removed (including config, RA2 identity and layout cache).'
 
-# Current runtime support is the user daemon plus PAM auth socket/helper.
+# Production support is system broker + per-user agent + PAM helper.
 install-support: install-service
-status-support: status-service pam-service-status
-uninstall-support: uninstall-service uninstall-pam-service
+status-support: broker-service-status status-service pam-service-status
+uninstall-support: uninstall-service uninstall-broker-service uninstall-pam-service
 
-# Remove artifacts left by the old redraw/HW-cursor diagnostics. Current PAM
-# auth and the user service are intentionally preserved.
+# Remove artifacts left by the old redraw/HW-cursor diagnostics. Current PAM,
+# broker and user agent services are intentionally preserved.
 cleanup-obsolete-support:
 	./tools/cleanup-obsolete-support.sh
 
 clean:
-	rm -f $(OBJECTS) $(DEPS) $(TARGET) $(PAM_HELPER)
+	rm -f $(OBJECTS) $(BROKER_OBJECTS) $(DEPS) $(TARGET) $(BROKER_TARGET) $(PAM_HELPER)
 	rm -rf "$(BUILD_DIR)"
