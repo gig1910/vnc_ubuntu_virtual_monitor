@@ -63,11 +63,6 @@ SYSTEM_CONFIG_FILE := $(SYSTEM_CONFIG_DIR)/config.ini
 BROKER_BIN := /usr/local/libexec/vnc-monitor-broker
 BROKER_SERVICE := /etc/systemd/system/vnc-monitor-broker.service
 
-# Source installs keep the PAM socket restricted to the invoking desktop user.
-# Binary .deb installs use a generic local socket plus SO_PEERCRED validation.
-AUTH_SOCKET_USER ?= $(shell id -un)
-AUTH_SOCKET_GROUP ?= $(shell id -gn)
-
 .PHONY: all clean \
 	auth-helper pam-service install-pam-service pam-service-status uninstall-pam-service \
 	install-broker-service broker-service-status uninstall-broker-service \
@@ -94,12 +89,7 @@ auth-helper: $(PAM_HELPER)
 
 $(PAM_SOCKET_GENERATED): $(PAM_SOCKET_TEMPLATE)
 	@mkdir -p "$(PAM_BUILD_DIR)"
-	@case '$(AUTH_SOCKET_USER)' in *[!A-Za-z0-9_.-]*|'') echo 'Invalid AUTH_SOCKET_USER: $(AUTH_SOCKET_USER)' >&2; exit 1;; esac
-	@case '$(AUTH_SOCKET_GROUP)' in *[!A-Za-z0-9_.-]*|'') echo 'Invalid AUTH_SOCKET_GROUP: $(AUTH_SOCKET_GROUP)' >&2; exit 1;; esac
-	@sed \
-		-e 's/@SOCKET_USER@/$(AUTH_SOCKET_USER)/g' \
-		-e 's/@SOCKET_GROUP@/$(AUTH_SOCKET_GROUP)/g' \
-		"$<" > "$@"
+	@cp "$<" "$@"
 
 pam-service: auth-helper $(PAM_SOCKET_GENERATED)
 	@printf '%s\n' \
@@ -108,10 +98,11 @@ pam-service: auth-helper $(PAM_SOCKET_GENERATED)
 		'  PAM:     auth-helper/vnc-monitor.pam' \
 		'  socket:  $(PAM_SOCKET_GENERATED)' \
 		'  service: auth-helper/vnc-monitor-auth@.service' \
-		'  user:    $(AUTH_SOCKET_USER):$(AUTH_SOCKET_GROUP)'
+		'  access:  generic local socket; helper enforces SO_PEERCRED user binding'
 
-# Do not run "sudo make install-pam-service": sudo is used only for the files
-# that need root, preserving the invoking desktop user's uid/gid for the socket.
+# Multi-user broker mode requires every local user agent to reach the PAM
+# socket. The root helper remains the authorization boundary: it authenticates
+# only the Unix username that owns the connecting agent process (SO_PEERCRED).
 install-pam-service: pam-service
 	@printf '%s\n' 'Installing PAM/systemd authentication support...'
 	sudo install -Dm0755 "$(PAM_HELPER)" /usr/local/libexec/vnc-monitor-auth-helper
