@@ -7,15 +7,15 @@ Wants=pipewire.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/vnc-monitor --verbose info
+ExecStart=%h/.local/bin/vnc-monitor --config %h/.config/vnc-monitor/config.ini
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s
 UMask=0077
 
-# The daemon must read the user's installed binary and write only its own
-# identity/cache. Session D-Bus and PipeWire live under XDG_RUNTIME_DIR and are
-# intentionally not isolated away.
+# The daemon must read the user's installed binary/config and write only its
+# own identity/cache. Session D-Bus and PipeWire live under XDG_RUNTIME_DIR and
+# are intentionally not isolated away.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
