@@ -1,67 +1,112 @@
 # Troubleshooting
 
-Start with the normal service log:
+Start with the normal service logs:
 
 ```bash
 systemctl --user status vnc-monitor.service --no-pager -l
 journalctl --user -u vnc-monitor.service -n 100 --no-pager
+systemctl status vnc-monitor-auth.socket --no-pager -l
 ```
 
-The service reads:
+## Confirm which installation is active
+
+A source install normally uses:
 
 ```text
-~/.config/vnc-monitor/config.ini
+~/.local/bin/vnc-monitor
+~/.config/systemd/user/vnc-monitor.service
+/etc/systemd/system/vnc-monitor-auth.socket
 ```
+
+A binary package uses:
+
+```text
+/usr/bin/vnc-monitor
+/usr/lib/systemd/user/vnc-monitor.service
+/usr/lib/systemd/system/vnc-monitor-auth.socket
+```
+
+Higher-priority source-installed units can shadow package units. Check with:
+
+```bash
+systemctl --user cat vnc-monitor.service
+systemctl cat vnc-monitor-auth.socket
+command -v vnc-monitor
+```
+
+If migrating from source install to `.deb`, remove the old unit overrides first:
+
+```bash
+make uninstall-service
+make uninstall-pam-service
+```
+
+These targets preserve user config, RA2 identity and layout state.
+
+## Configuration layers
+
+The daemon reads:
+
+```text
+built-in defaults
+    < /etc/vnc-monitor/config.ini
+    < ~/.config/vnc-monitor/config.ini
+    < CLI
+```
+
+An explicit `--config FILE` replaces the normal user override but still loads `/etc/vnc-monitor/config.ini` first.
 
 Show exactly what the parser sees:
 
 ```bash
-~/.local/bin/vnc-monitor \
-  --config ~/.config/vnc-monitor/config.ini \
-  --show-config
+vnc-monitor --show-config
 ```
 
-For protocol/capture details set `[logging] level=debug` in the config and restart the service. Use `trace` only for short frame-level diagnostics. CLI `--verbose` remains useful for foreground tests.
+The output shows both persistent config paths, whether each exists, and the final effective values.
 
-## Service fails immediately after editing config
+For a source checkout without an installed binary:
 
-Run `--show-config` as above. The beta.2 parser is intentionally strict: an unknown section/key, invalid boolean/range, bad `display.mode`, or malformed path is an error rather than a silently ignored setting.
+```bash
+./vnc-monitor --show-config
+```
 
-The repository default is available at:
+The parser is strict: an unknown section/key, malformed value, bad `display.mode`, or invalid path is an error rather than a silently ignored setting.
+
+The repository template is:
 
 ```text
 config/vnc-monitor.conf
 ```
 
-The installer never overwrites an existing installed config during an upgrade.
+The `.deb` installs it as `/etc/vnc-monitor/config.ini`; source install creates the user copy only when absent.
 
-## Service is not listening on the configured public port
+## Service is not listening on the public port
 
 Check:
 
 ```bash
 systemctl --user status vnc-monitor.service --no-pager -l
-ss -ltnp | grep vnc-monitor
+ss -ltnp | grep -E ':(5901|5903)\b'
 ```
 
 Typical causes:
 
-- the user service was not installed/enabled;
-- another process already owns the configured `[network] port`;
-- the binary under `~/.local/bin/vnc-monitor` is missing or stale;
+- user service not enabled;
+- another process already owns `[network] port`;
+- a stale source unit is shadowing the package unit;
 - config validation failed;
-- a hardening/path error prevents service startup.
+- daemon is running outside the active GNOME Wayland session.
 
-Normal repair/upgrade path:
+For a package install, confirm the packaged service is enabled for the desktop user:
 
 ```bash
-git pull --ff-only
-./install.sh
+systemctl --user daemon-reload
+systemctl --user enable --now vnc-monitor.service
 ```
 
 ## Why TCP/5903 is not listening while idle
 
-This is intentional in beta.2. The internal LibVNCServer backend is session-scoped and is started only **after** RA2r/PAM authentication. It is removed again on disconnect.
+This is intentional. The internal LibVNCServer backend is session-scoped and starts only **after** RA2r/PAM authentication. It is removed on disconnect.
 
 The persistent idle listener is the public `[network] port` (5901 by default).
 
@@ -69,38 +114,34 @@ The persistent idle listener is the public `[network] port` (5901 by default).
 
 This is intentional. The beta has a **strong single-connect** policy: one accepted viewer owns the virtual-display session from RA2 negotiation through teardown.
 
-The public listener remains responsive during that session only so additional connection attempts can be rejected immediately. The second socket is reset/closed and the active viewer is left untouched.
-
-At `info` level the journal should contain:
+The public listener remains responsive only so additional connection attempts can be rejected immediately. At `info` level:
 
 ```text
 Rejected additional client: ADDRESS (strong single-connect policy)
 ```
 
-A second client is also rejected while the first client is still authenticating; the slot is reserved at `accept()`, not only after PAM success.
+The slot is reserved at `accept()`, so a second viewer is also rejected while the first is still authenticating.
 
 ## A client connected but never completed authentication
 
-An unauthenticated connection must not own the only slot forever. The effective config contains:
+The effective config contains:
 
 ```ini
 [network]
 client-handshake-timeout-ms=60000
 ```
 
-This is one monotonic deadline for the bounded handshake `io_*` phase. It is not reset by trickling individual bytes. Once the deadline expires, blocked protocol/auth-helper I/O fails and the connection is torn down. After successful RA2/PAM authentication the deadline is cleared completely.
+This is one monotonic deadline for the bounded handshake `io_*` phase. It is not reset by trickling individual bytes. Once it expires, the negotiation fails and the single-client slot is released.
 
 Check the effective value:
 
 ```bash
-~/.local/bin/vnc-monitor --show-config | grep -i handshake
+vnc-monitor --show-config | grep -i handshake
 ```
-
-A timed-out or otherwise failed negotiation is logged as an RA2 handshake failure and the single-client slot is released.
 
 ## Wi-Fi disappeared but the virtual monitor is still present
 
-The active external socket uses TCP dead-peer detection rather than an application-idle timer. Defaults are:
+The active external socket uses TCP dead-peer detection rather than an application-idle timer:
 
 ```ini
 [network]
@@ -110,57 +151,55 @@ client-keepalive-probes=3
 client-user-timeout-ms=20000
 ```
 
-A healthy viewer showing a completely static desktop is allowed to remain connected indefinitely; it still answers TCP keepalive probes.
+A healthy viewer showing a static desktop may remain connected indefinitely because its TCP stack still responds.
 
-If the route/Wi-Fi disappears without a normal FIN/RST, the kernel needs time to establish that the peer is dead. Exact timing depends on TCP/network state, so do not treat the configured numbers as an exact wall-clock disconnect guarantee. With the defaults, the intent is to recover the abandoned slot in tens of seconds rather than indefinitely.
-
-At `debug`, verify that the socket policy was applied:
+At `debug`, verify the applied policy:
 
 ```text
 Client liveness: keepalive idle=15s interval=5s probes=3 user-timeout=20000ms handshake-deadline=60000ms
 ```
 
-After the socket failure propagates through the RA2 relay, normal teardown should follow:
+After TCP declares the peer dead, the RA2 relay exits and normal teardown removes the virtual monitor and releases the slot.
 
-```text
-Virtual monitor removed
-Client disconnected: ADDRESS
-```
-
-A client process that is still alive enough for its operating system to ACK TCP packets is not a dead TCP peer. This policy deliberately avoids inventing an RFB activity timeout that would disconnect a legitimate static viewer.
-
-## Service is running but the client cannot authenticate
+## Authentication fails
 
 Check the PAM socket:
 
 ```bash
-make pam-service-status
+systemctl status vnc-monitor-auth.socket --no-pager -l
 ls -l /run/vnc-monitor-auth.sock
 ```
 
-The socket is system-level even though the main daemon is a user service.
+For a package install, also confirm the helper path:
 
-At `debug` level the RA2r negotiation should reach the authentication stage. A failure before that can instead indicate a changed RA2 identity, protocol mismatch, or the configured handshake deadline.
+```bash
+systemctl cat vnc-monitor-auth@.service
+ls -l /usr/libexec/vnc-monitor-auth-helper
+```
+
+For a source install the helper is under `/usr/local/libexec/`.
+
+The package socket is generic, but the root helper binds requests to the connecting local process with `SO_PEERCRED`: the requested username must match that process' Unix account before PAM authentication is attempted.
+
+A failure before the PAM stage can indicate a changed RA2 identity, protocol mismatch, or handshake deadline.
 
 ## Client reports a changed server identity
 
-The beta identity path is:
+The per-user identity is:
 
 ```text
 ~/.config/vnc-monitor/ra2-server-key.pem
 ```
 
-Older development versions used `./ra2-server-key.pem` in the checkout. Installation migrates that key only when the beta destination does not already exist.
+Do not casually delete/regenerate this file; a viewer may pin or prompt for the server identity.
 
-Do not casually delete/regenerate this file: a viewer may pin or prompt for the server identity.
+The `.deb` never installs a private key and does not create one from root maintainer scripts. The user daemon creates/loads it in the user's home.
 
 ## Authentication succeeds but no virtual monitor appears
 
-Use `debug` logging and inspect Mutter/session errors.
-
 The daemon must run as the **logged-in GNOME user**, not as a root system service. It needs the user's session D-Bus and PipeWire environment.
 
-Useful checks inside the same desktop account:
+Useful checks:
 
 ```bash
 loginctl show-session "$XDG_SESSION_ID" -p Type -p Class -p Active
@@ -171,39 +210,34 @@ The target session must be Wayland and active.
 
 ## Virtual monitor appears but capture fails
 
-Native PipeWire is the production default. To distinguish a native-capture problem from the Mutter stream itself, run a foreground test with the fallback backend:
+Native PipeWire is the default. To compare against the GStreamer fallback:
 
 ```bash
 systemctl --user stop vnc-monitor.service
-~/.local/bin/vnc-monitor \
-  --config ~/.config/vnc-monitor/config.ini \
-  --capture-backend gstreamer \
-  --verbose debug
+vnc-monitor --capture-backend gstreamer --verbose debug
 ```
 
-Restore the service afterwards:
+Restore afterwards:
 
 ```bash
 systemctl --user start vnc-monitor.service
 ```
 
-Do not run two instances simultaneously on the same public port.
+Do not run two instances on the same public port.
 
-## Client does not change the screen size in `display.mode=auto`
+## Client does not change screen size in `display.mode=auto`
 
-First confirm the effective setting:
+Confirm effective settings:
 
 ```bash
-~/.local/bin/vnc-monitor --show-config | grep -E 'screen mode|framebuffer'
+vnc-monitor --show-config | grep -E 'screen mode|framebuffer'
 ```
 
-`auto` is not display-size guessing. RFB has to provide a client request.
+`auto` is not display-size guessing. The viewer must advertise `ExtendedDesktopSize` (`-308`) and send `SetDesktopSize` to request dimensions.
 
-A viewer must advertise `ExtendedDesktopSize` (`-308`) and send `SetDesktopSize` (client message 251) to request dimensions. A client advertising only `NewFBSize`/`DesktopSize` (`-223`) can **receive** a server resize but cannot tell the server its preferred size.
+A viewer advertising only `NewFBSize`/`DesktopSize` (`-223`) can **receive** a server resize but cannot tell the server its preferred dimensions, so the configured fallback remains in use.
 
-Such clients stay at the configured `[display] width` / `height` fallback.
-
-At `debug`, a capable client request should eventually produce either:
+At `debug`, a capable request should produce either:
 
 ```text
 Accepted client framebuffer resize: WIDTHxHEIGHT
@@ -215,21 +249,23 @@ or a clear rejection/failure message.
 
 Check:
 
-- `[display] mode=auto` rather than `fixed`;
+- `[display] mode=auto`, not `fixed`;
 - requested dimensions are within 64..16384;
-- the request contains exactly one screen at `(0,0)` spanning the requested framebuffer;
-- Mutter/PipeWire can actually create/capture the requested mode;
-- memory allocation did not fail.
+- the request contains one screen at `(0,0)` spanning the framebuffer;
+- Mutter/PipeWire can create/capture the requested mode;
+- memory allocation succeeded.
 
-`fixed` mode deliberately returns RFB `ResizeProhibited`.
-
-If a new Mutter/PipeWire size cannot be created, the server attempts to restore the previous monitor size before rejecting the request.
+`fixed` mode deliberately returns `ResizeProhibited`.
 
 ## Resize succeeds but GNOME placement changes
 
-Layout caches are dimension-specific. A previously unseen framebuffer size can therefore initially use Mutter's default placement.
+Layout caches are dimension-specific under:
 
-Arrange it once in GNOME; on disconnect the layout for those dimensions is saved. Later sessions at that same size can restore it when `[display] layout-remember=on`.
+```text
+~/.config/vnc-monitor-server/
+```
+
+A new framebuffer size can initially use Mutter's default placement. Arrange it once; the layout is saved on disconnect and can be restored later when `layout-remember=on`.
 
 ## Cursor is missing or does not update
 
@@ -240,65 +276,46 @@ Default cursor mode is:
 cursor=metadata
 ```
 
-This uses PipeWire `SPA_META_Cursor` and is the tested production path. Embedded cursor mode is retained as a compatibility choice; it previously failed to generate frames for cursor-only motion on the target setup.
+This uses PipeWire `SPA_META_Cursor` and is the tested production path.
 
 ## GUI movement is jerky
 
-At `trace`, look for `COPY` records. Normal window dragging should often move most pixels locally when the viewer advertises CopyRect.
+At `trace`, look for CopyRect records. Moving windows should often reuse known pixels when the viewer advertises CopyRect.
 
-If no CopyRect is selected:
+Fallback to JPEG21 is safe and expected when an exact translation cannot be verified.
 
-- the change may not be a pure translation;
-- the source may be outside the ±256 px search radius;
-- exact 32x32 verification may reject the candidate;
-- the viewer may not support CopyRect.
+After framebuffer resize, the CopyRect reference is intentionally invalidated and rebuilt from newly delivered pixels.
 
-Fallback to JPEG21 is safe and expected.
+## Full-screen video is slower than local playback
 
-After a framebuffer resize the CopyRect reference is intentionally invalidated and must be re-established from a delivered frame before CopyRect can be used again.
-
-## Full-screen video is much slower than local video playback
-
-This can be viewer-side rather than LAN/server saturation. The VNC path sends framebuffer updates; local video playback can use a dedicated video decoder pipeline and is not directly comparable.
-
-Inspect `debug`/`trace` telemetry for:
-
-- external output queue;
-- backend input queue;
-- TCP unacked packets;
-- RTT;
-- JPEG bytes and rectangle area;
-- source frames coalesced per update.
+This can be viewer-side rather than LAN/server saturation. Inspect `debug`/`trace` telemetry for output/input queues, TCP unacked packets/RTT, JPEG bytes, rectangle area, and source-frame coalescing.
 
 ## Image becomes sharp after motion stops
 
-Expected behaviour. Active regions are intentionally lossy JPEG. During idle time the repair scheduler sends lossless 32x32 ZRLE tiles until the framebuffer is exact.
+Expected. Active regions are lossy JPEG; idle repair sends lossless 32x32 ZRLE tiles until the client framebuffer is exact.
 
 ## Brief stale 32x32 tile during renewed motion
 
-This remains an open beta issue. A repair tile may have been scheduled from an earlier source state just before new motion resumes.
+This remains an open beta issue. A repair tile can have been scheduled from an earlier source state immediately before new motion resumes.
 
-Capture a short `trace` log around a reproducible event; this is the main repair-scheduler correctness item still under observation.
+## Inspect a built `.deb`
 
-## Layout is not restored
+Before installation:
 
-The layout-cache namespace from development versions is retained:
-
-```text
-~/.config/vnc-monitor-server/
+```bash
+dpkg-deb --info dist/vnc-monitor_*.deb
+dpkg-deb --contents dist/vnc-monitor_*.deb
 ```
 
-Check `[display] layout-remember=on`. To intentionally learn a replacement layout, temporarily set `layout-resave=on`, complete a session, then return it to `off`.
+The `Depends` field should contain runtime libraries plus PipeWire, not compiler/development packages such as `build-essential`, `pkg-config`, `dpkg-dev`, or `*-dev` packages.
 
 ## Need maximum diagnostic detail
 
-Stop the service and run:
+Stop the user service and run:
 
 ```bash
 systemctl --user stop vnc-monitor.service
-~/.local/bin/vnc-monitor \
-  --config ~/.config/vnc-monitor/config.ini \
-  --verbose trace 2>&1 | tee vnc-monitor-trace.log
+vnc-monitor --verbose trace 2>&1 | tee vnc-monitor-trace.log
 ```
 
 Trace output can be large. It is intentionally not the service default.
