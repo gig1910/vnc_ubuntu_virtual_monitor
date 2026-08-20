@@ -29,7 +29,7 @@ The broker reads `[network] port` only from:
 
 A user override does not change the machine-wide listener.
 
-After beta.2 -> beta.3 package upgrade, the already-running old beta.2 user service may temporarily still own the port. Run in that graphical account:
+After beta.2 -> beta.3 package upgrade, reload/restart the already-running graphical account and broker:
 
 ```bash
 systemctl --user daemon-reload
@@ -37,13 +37,9 @@ systemctl --user restart vnc-monitor.service
 sudo systemctl restart vnc-monitor-broker.service
 ```
 
-The broker unit is configured not to exhaust its start-limit during this migration handoff.
+## Broker is running but connection is immediately rejected
 
-If another unrelated process owns the configured port, resolve that conflict rather than changing a per-user config.
-
-## Broker is running but every connection is immediately rejected
-
-Check the broker journal. A normal refusal without a routable desktop looks like:
+A normal refusal without a routable desktop looks like:
 
 ```text
 Broker rejected ...: no active local Wayland user session on seat0
@@ -56,9 +52,9 @@ Inspect logind:
 ```bash
 loginctl seat-status seat0
 loginctl list-sessions
+SESSION="$(loginctl show-seat seat0 -p ActiveSession --value)"
+loginctl show-session "$SESSION" -p Id -p User -p Name -p Seat -p Active -p Remote -p Type -p Class -p State
 ```
-
-For the intended target session, confirm it is a local active Wayland user session.
 
 Beta.3 deliberately rejects:
 
@@ -90,7 +86,7 @@ ExecStart=/usr/bin/vnc-monitor --agent
 RuntimeDirectory=vnc-monitor
 ```
 
-For a package installed into an already-running graphical session:
+For an already-running graphical session:
 
 ```bash
 systemctl --user daemon-reload
@@ -98,6 +94,40 @@ systemctl --user restart vnc-monitor.service
 ```
 
 Future graphical logins get the agent automatically through the packaged `graphical-session.target.wants` link.
+
+### `No such file or directory` even though agent.sock exists
+
+The broker must be able to see `/run/user`. The hardened broker unit intentionally uses:
+
+```text
+InaccessiblePaths=/home /root
+ReadOnlyPaths=/run/user
+```
+
+Do not replace this with `ProtectHome=yes`: that also hides `/run/user` from the broker and makes existing agent sockets appear as `ENOENT`.
+
+## Agent says broker peer is not root
+
+On hardened systemd user services, the agent may run in a user namespace mapping only its own UID. Host root can then appear through `SO_PEERCRED` as an overflow UID instead of literal `0`.
+
+Check:
+
+```bash
+A="$(systemctl --user show vnc-monitor.service -p MainPID --value)"
+B="$(systemctl show vnc-monitor-broker.service -p MainPID --value)"
+
+sudo readlink /proc/1/ns/user "/proc/$B/ns/user" "/proc/$A/ns/user"
+sudo cat "/proc/$A/uid_map"
+sudo cat "/proc/$B/uid_map"
+```
+
+Beta.3 does **not** trust overflow UID by itself. The namespace-mapped peer is accepted only when the immutable `SO_PEERCRED` PID belongs exactly to:
+
+```text
+/system.slice/vnc-monitor-broker.service
+```
+
+Arbitrary unmapped local users therefore remain rejected.
 
 ## Wrong user credentials are rejected
 
@@ -108,41 +138,42 @@ The broker selects the current active logind session before RA2 authentication. 
 Example:
 
 ```text
-active desktop: bob
-broker target:  agent uid=bob
+active desktop: guest
+broker target:  agent uid=guest
 RA2 username:   gig
 result:         denied
 ```
 
 To connect as `gig`, `gig` must first be the active local graphical session, then the viewer must reconnect and authenticate as `gig`.
 
-## Switch User does not preserve VNC
+## Switch User / lock / logoff disconnects VNC
 
-Also intentional.
+Intentional.
 
-The VNC connection is bound to the exact logind Session ID active at handoff. When seat0 leaves that Session ID, the broker shuts down its duplicate of the TCP socket. Normal agent teardown then removes the virtual monitor.
+The VNC connection is bound to the exact logind Session ID active at handoff. When seat0 leaves that Session ID, the broker shuts down its duplicate of the TCP socket. Normal agent teardown removes the virtual monitor.
 
 Expected sequence:
 
 ```text
 Broker routed ... logind-session=N
 ...
+Broker seat0 target not attachable: ... class=greeter ...
 Broker disconnecting ...: bound session N is no longer active
 ...
-Client disconnected
+Broker session finished ...
 ```
 
-The connection must not move to GDM or another user. Switching back to the original account still requires a new VNC connection and new RA2/PAM authentication.
+The connection must not move to GDM or another user. Switching back to the original account still requires a new connection and new RA2/PAM authentication.
 
 ## New connection at GDM is rejected
 
 Expected. Beta.3 does not serve the greeter/login screen.
 
-The system broker may still be listening on TCP/5901, but it resets the client because there is no eligible active `Class=user` Wayland target.
+The system broker remains listening on the public port but resets the client because no eligible active `Class=user` Wayland target exists.
 
 ## Broker crashes while VNC is connected
 
-The user-agent keeps a control-channel guard. Loss of the broker control channel shuts down the handed-off VNC socket as a fail-closed policy.
+The user agent keeps a control-channel guard. Loss of the broker control channel shuts down the handed-off VNC socket as a fail-closed policy.
 
 After systemd restarts the broker, the old VNC connection does not resume. Reconnect normally.
 
@@ -154,7 +185,7 @@ The machine-wide broker reserves one external viewer slot. Additional clients ar
 
 ## Wi-Fi disappears but monitor remains
 
-The handed-off client socket still uses the beta.2 TCP liveness policy:
+The handed-off client socket uses:
 
 ```ini
 [network]
@@ -166,9 +197,9 @@ client-user-timeout-ms=20000
 
 These are transport-liveness settings, not image/activity timers. A healthy static VNC session can remain indefinitely.
 
-When a vanished peer is detected, the user-agent exits the RFB relay, sends `DONE` to the broker and removes the virtual monitor.
+When a vanished peer is detected, the user agent exits the RFB relay, sends `DONE` to the broker and removes the virtual monitor.
 
-## Client connects but stalls before authentication
+## Client stalls before authentication
 
 The active agent applies:
 
@@ -185,20 +216,15 @@ Check:
 ```bash
 systemctl status vnc-monitor-auth.socket --no-pager -l
 ls -l /run/vnc-monitor-auth.sock
-```
-
-Multi-user beta.3 intentionally uses a generic local socket (`0666`). Security is enforced by the privileged helper using `SO_PEERCRED`: it only authenticates the Unix username that owns the connecting agent.
-
-If authentication worked in beta.2 but not beta.3, make sure an old source-installed socket unit with `SocketUser=`/`SocketMode=0600` is not overriding the generic beta.3 unit:
-
-```bash
 systemctl cat vnc-monitor-auth.socket
 systemctl show vnc-monitor-auth.socket -p FragmentPath
 ```
 
-## Confirm package paths
+Multi-user beta.3 intentionally uses a generic local socket (`0666`). Security is enforced by the privileged helper using `SO_PEERCRED`: it authenticates only the Unix username owning the connecting agent.
 
-Package install should resolve to:
+An old source-installed socket unit with `SocketUser=`/`SocketMode=0600` can override the packaged unit and prevent other local accounts from authenticating.
+
+## Confirm package paths
 
 ```bash
 systemctl show vnc-monitor-broker.service -p FragmentPath
@@ -224,13 +250,13 @@ Source-install overrides use `/etc/systemd/system`, `~/.config/systemd/user`, `/
 /usr/bin/vnc-monitor --show-config
 ```
 
-Agent precedence is:
+Agent precedence:
 
 ```text
 built-ins < /etc/vnc-monitor/config.ini < user/--config < CLI
 ```
 
-Remember that the displayed effective per-user `public port` is relevant to standalone developer mode; the production broker's actual public port comes only from `/etc/vnc-monitor/config.ini`.
+The displayed per-user `public port` is relevant to standalone developer mode; the production broker's actual public port comes only from `/etc/vnc-monitor/config.ini`.
 
 ## Authentication succeeds but no monitor appears
 
