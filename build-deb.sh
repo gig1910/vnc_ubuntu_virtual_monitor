@@ -403,6 +403,8 @@ printf '\n===== VNC MONITOR: PACKAGE INFO =====\n'
 dpkg-deb --info "$out_file"
 printf '\nRuntime Depends:\n  %s\n' "$runtime_deps"
 
+"$ROOT_DIR/tools/verify-deb.sh" "$out_file"
+
 printf '\nBuilt package:\n  %s\n' "$out_file"
 printf '\nInstall with:\n  sudo apt install %q\n' "$out_file"
 printf '\nThen, as the GNOME desktop user, enable the user service once:\n'
