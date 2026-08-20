@@ -2,7 +2,7 @@
 
 This branch adds a browser-native WebRTC transport without removing the proven VNC path.
 
-The security model is shared by both transports. There is exactly one machine-wide authenticated display session at a time, regardless of whether the client is VNC or WebRTC.
+The security model is shared by both transports. There is exactly one machine-wide display-session slot at a time, regardless of whether the client is VNC or WebRTC.
 
 ## Non-negotiable invariants
 
@@ -78,14 +78,14 @@ The HTTPS certificate protects login and signalling. WebRTC media is independent
 
 ## Broker state machine
 
-The current `active` boolean will evolve into an explicit state machine:
+The broker now uses one transport-neutral state machine instead of the old `active` / `revoked` booleans:
 
 ```text
 IDLE
   |
   +-- VNC TCP accepted --------------------> AUTH_VNC
   |                                             |
-  |                                      RA2/PAM success
+  |                                      FD handoff succeeds
   |                                             v
   |                                         ACTIVE_VNC
   |
@@ -94,11 +94,25 @@ IDLE
                                          PAM success
                                                 v
                                            ACTIVE_WEBRTC
+                                                |
+                                                v
+                                            REVOKING
+                                                |
+                                                v
+                                              IDLE
 ```
 
-`AUTH_VNC`, `AUTH_WEB`, `ACTIVE_VNC` and `ACTIVE_WEBRTC` all own the same global slot. A second VNC connection or second web login attempt is rejected while any of those states is occupied.
+`AUTH_VNC`, `AUTH_WEB`, `ACTIVE_VNC`, `ACTIVE_WEBRTC` and `REVOKING` all own the same global slot. A second VNC connection or second web authentication attempt is rejected while any of those states is occupied.
 
-Authentication phases must have finite monotonic deadlines so a silent or trickle-slow client cannot monopolize the only slot indefinitely.
+### VNC state semantics
+
+`ACTIVE_VNC` means that the broker-owned global slot and accepted VNC socket have been handed to the selected user agent. It does **not** mean the root broker independently observed RA2/PAM success.
+
+That distinction is deliberate. In the proven beta.3 security boundary, RA2/PAM remains entirely in the unprivileged active-user agent. The root broker selects the eligible logind session, passes the socket, keeps its duplicate for revocation and enforces the exact Session ID + UID binding. It does not duplicate VNC authentication logic.
+
+The existing VNC handshake timeout in the agent still prevents an unauthenticated slow client from occupying the slot indefinitely.
+
+For WebRTC, `AUTH_WEB` is a real broker-visible authentication phase because the browser login endpoint itself terminates in the broker.
 
 ## Web authentication flow
 
@@ -154,11 +168,11 @@ The first implementation should prefer a widely supported browser codec and low-
 
 ## Session revocation
 
-For VNC the broker currently owns a duplicate of the client TCP fd and can revoke the session with `shutdown()`.
+For VNC the broker owns a duplicate of the client TCP fd and revokes the session with `shutdown()`.
 
 WebRTC media uses independent ICE/DTLS sockets, so revocation cannot rely on closing the HTTPS/WSS connection alone.
 
-The broker-agent control channel therefore becomes the authoritative lifetime guard for WebRTC. On any policy revocation the broker must explicitly terminate the control session; the agent must then synchronously:
+The broker-agent control channel therefore becomes the authoritative lifetime guard for WebRTC. The state machine already contains the no-client-fd revocation branch: if a future WebRTC session has no external TCP descriptor, revocation shuts down the bound broker-agent control channel. The agent must then synchronously:
 
 1. close `webrtcbin` / ICE transports;
 2. stop the capture pipeline;
@@ -166,7 +180,7 @@ The broker-agent control channel therefore becomes the authoritative lifetime gu
 4. remove the virtual monitor;
 5. clear all per-session authentication/signalling state.
 
-The same control-channel-loss rule should also remain a fail-safe if the broker crashes or restarts.
+The same control-channel-loss rule remains a fail-safe if the broker crashes or restarts.
 
 ## Transport discriminator and wire compatibility
 
@@ -188,8 +202,8 @@ WebRTC handoff intentionally carries no browser fd because HTTPS/WSS terminates 
 
 ## Planned implementation order
 
-1. Transport-aware broker handoff without changing existing VNC behaviour or wire compatibility. **Started in this branch.**
-2. Replace broker `active` boolean with one transport-neutral global session state machine.
+1. Transport-aware broker handoff without changing existing VNC behaviour or wire compatibility. **Done.**
+2. Replace broker `active` / `revoked` booleans with one transport-neutral global session state machine. **Done.**
 3. Add broker HTTPS listener, TLS configuration and static login page.
 4. Add broker-agent PAM request/reply messages for web authentication.
 5. Add authenticated WSS signalling and explicit broker `REVOKE` control message.
