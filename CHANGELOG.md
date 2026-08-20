@@ -2,6 +2,39 @@
 
 All notable project milestones are summarized here. Development commits before the beta checkpoint were intentionally experimental and are condensed by behavior rather than reproduced commit-by-commit.
 
+## 0.1.0-beta.2 — 2026-08-20
+
+Configuration and dynamic-display release.
+
+### Added
+
+- persistent strict INI configuration at `~/.config/vnc-monitor/config.ini`;
+- repository config template `config/vnc-monitor.conf`;
+- precedence `built-in defaults < config < CLI`;
+- `--config FILE` and `--show-config`;
+- owned storage for configurable paths/addresses rather than pointers into parser-temporary data;
+- `[display] mode=auto|fixed`;
+- client-driven RFB resize through LibVNCServer `setDesktopSizeHook` for viewers supporting `ExtendedDesktopSize` / `SetDesktopSize`;
+- transactional Mutter/PipeWire + FrameBridge + adaptive-transport + RFB framebuffer resize;
+- CopyRect reference reallocation/invalidation after resize while preserving negotiated JPEG21 capability;
+- dimension-specific layout-cache refresh after a successful resize;
+- effective-config output at the end of `install.sh`.
+
+### Changed
+
+- `display.width` / `display.height` are initial/fallback dimensions in `auto` mode and exact dimensions in `fixed` mode;
+- the internal LibVNCServer backend is now session-scoped: loopback TCP/5903 exists only after RA2r/PAM authentication and is removed on disconnect;
+- client-requested size changes are session-local and do not mutate the persistent fallback used by the next viewer;
+- systemd user service starts the daemon with the persistent config instead of hard-coding log level arguments;
+- installer creates the default config once and preserves local edits on later upgrades;
+- installer continues to use `nproc` parallelism and dependency preflight before build/install.
+
+### RFB sizing semantics
+
+- clients advertising `ExtendedDesktopSize` can request a single-screen framebuffer size in `auto` mode;
+- `fixed` mode rejects `SetDesktopSize` with `ResizeProhibited`;
+- clients supporting only `NewFBSize` can receive size changes but cannot tell the server what size they prefer, so they use the configured fallback dimensions.
+
 ## 0.1.0-beta.1 — 2026-08-20
 
 First beta/stabilization release.
