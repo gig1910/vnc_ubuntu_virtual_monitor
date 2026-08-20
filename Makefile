@@ -13,6 +13,7 @@ BROKER_LIBS := $(shell pkg-config --libs glib-2.0 gio-2.0)
 SOURCES := \
 	src/main.c \
 	src/broker_protocol.c \
+	src/broker_peercred.c \
 	src/runtime_config.c \
 	src/log.c \
 	src/shutdown_signal.c \
@@ -76,6 +77,12 @@ $(TARGET): $(OBJECTS)
 
 $(BROKER_TARGET): $(BROKER_OBJECTS)
 	$(CC) $(CFLAGS) $(BROKER_OBJECTS) -o $@ $(BROKER_LIBS) -pthread
+
+# main.c is the only translation unit that verifies broker SO_PEERCRED. Force
+# the namespace-aware compatibility wrapper there; every other getsockopt()
+# call in the project continues to use libc directly.
+src/main.o: src/main.c include/broker_peercred.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_CFLAGS) -include include/broker_peercred.h -c $< -o $@
 
 src/%.o: src/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_CFLAGS) -c $< -o $@
