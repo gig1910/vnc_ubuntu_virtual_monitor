@@ -1,0 +1,66 @@
+#!/bin/sh
+set -e
+
+restart_active_wayland_agent() {
+    active_session="$(
+        loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null || true
+    )"
+
+    [ -n "$active_session" ] || return 0
+
+    active="$(
+        loginctl show-session "$active_session" -p Active --value 2>/dev/null || true
+    )"
+    remote="$(
+        loginctl show-session "$active_session" -p Remote --value 2>/dev/null || true
+    )"
+    class="$(
+        loginctl show-session "$active_session" -p Class --value 2>/dev/null || true
+    )"
+    type="$(
+        loginctl show-session "$active_session" -p Type --value 2>/dev/null || true
+    )"
+    user="$(
+        loginctl show-session "$active_session" -p Name --value 2>/dev/null || true
+    )"
+
+    [ "$active" = "yes" ] || return 0
+    [ "$remote" = "no" ] || return 0
+    [ "$class" = "user" ] || return 0
+    [ "$type" = "wayland" ] || return 0
+    [ -n "$user" ] || return 0
+
+    if systemctl --user --machine="$user@.host" daemon-reload >/dev/null 2>&1 &&
+       systemctl --user --machine="$user@.host" restart vnc-monitor.service >/dev/null 2>&1; then
+        echo "VNC Monitor: started agent for active Wayland user $user"
+    else
+        echo "VNC Monitor: could not start the active Wayland user agent automatically; it will start on the next graphical login" >&2
+    fi
+}
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+
+    # Enable the user agent globally through systemd rather than shipping a
+    # hand-made vendor Wants symlink. This makes `systemctl --user is-enabled`
+    # report the effective enabled state and applies to every future graphical
+    # login without writing into individual home directories.
+    systemctl --global enable vnc-monitor.service >/dev/null 2>&1 || true
+
+    systemctl enable vnc-monitor-auth.socket vnc-monitor-broker.service >/dev/null
+    systemctl restart vnc-monitor-auth.socket
+
+    # A package can be installed while GNOME is already running. The newly
+    # enabled graphical-session.target dependency is not retroactively started,
+    # so explicitly reload/restart only the currently active local Wayland
+    # user's systemd --user manager. The .host transport was verified on the
+    # target Ubuntu 26.04 system and does not require modifying the user's home.
+    restart_active_wayland_agent
+
+    # Keep the broker non-fatal during upgrades/fresh installs. If there is no
+    # eligible active agent it will reject connections until the next graphical
+    # login rather than making dpkg fail.
+    systemctl restart vnc-monitor-broker.service >/dev/null 2>&1 || true
+fi
+
+exit 0
