@@ -78,7 +78,7 @@ fi
 printf '\n===== VNC MONITOR: DEB BUILD PREFLIGHT =====\n'
 
 required_commands=(
-    make cc pkg-config nproc mktemp install sed ln
+    make cc pkg-config nproc mktemp install sed
     dpkg-deb dpkg-shlibdeps dpkg-architecture
 )
 missing_commands=()
@@ -197,7 +197,7 @@ if [[ -z "$upstream_version" ]]; then
     exit 1
 fi
 
-# Debian sorts '~' before the final release, so 0.1.0~beta.3 < 0.1.0.
+# Debian sorts '~' before the final release, so 0.1.0~beta.4 < 0.1.0.
 deb_upstream_version="${upstream_version/-beta./~beta.}"
 deb_upstream_version="${deb_upstream_version/-rc./~rc.}"
 deb_version="${deb_upstream_version}-${DEB_REVISION}"
@@ -255,9 +255,6 @@ WantedBy=graphical-session.target
 EOF
 chmod 0644 "$stage/usr/lib/systemd/user/vnc-monitor.service"
 
-mkdir -p "$stage/usr/lib/systemd/user/graphical-session.target.wants"
-ln -s ../vnc-monitor.service "$stage/usr/lib/systemd/user/graphical-session.target.wants/vnc-monitor.service"
-
 mkdir -p "$stage/usr/lib/systemd/system"
 sed 's#/usr/local/libexec/vnc-monitor-broker#/usr/libexec/vnc-monitor-broker#' \
     systemd/vnc-monitor-broker.service >"$stage/usr/lib/systemd/system/vnc-monitor-broker.service"
@@ -289,6 +286,10 @@ install -Dm0644 LICENSE "$stage/usr/share/doc/vnc-monitor/LICENSE"
 install -Dm0644 docs/INSTALL.md "$stage/usr/share/doc/vnc-monitor/INSTALL.md"
 install -Dm0644 docs/ARCHITECTURE.md "$stage/usr/share/doc/vnc-monitor/ARCHITECTURE.md"
 install -Dm0644 docs/TROUBLESHOOTING.md "$stage/usr/share/doc/vnc-monitor/TROUBLESHOOTING.md"
+
+install -Dm0755 packaging/debian/postinst "$stage/DEBIAN/postinst"
+install -Dm0755 packaging/debian/prerm "$stage/DEBIAN/prerm"
+install -Dm0755 packaging/debian/postrm "$stage/DEBIAN/postrm"
 
 cat >"$stage/DEBIAN/conffiles" <<'EOF'
 /etc/vnc-monitor/config.ini
@@ -340,56 +341,6 @@ Description: GNOME Wayland virtual monitor over VNC
  bound connection instead of moving it to another login session.
 EOF
 
-cat >"$stage/DEBIAN/postinst" <<'EOF'
-#!/bin/sh
-set -e
-
-if [ -d /run/systemd/system ]; then
-    systemctl daemon-reload
-    systemctl enable vnc-monitor-auth.socket vnc-monitor-broker.service >/dev/null
-    systemctl restart vnc-monitor-auth.socket
-
-    # beta.2 had a per-user standalone daemon that could still own the public
-    # port until the already-running user's manager reloads/restarts beta.3 as
-    # --agent. Do not fail the package transaction on that temporary conflict.
-    # The broker unit retries without StartLimit exhaustion and will bind after
-    # the current graphical user restarts the packaged agent.
-    systemctl restart vnc-monitor-broker.service >/dev/null 2>&1 || true
-fi
-
-exit 0
-EOF
-chmod 0755 "$stage/DEBIAN/postinst"
-
-cat >"$stage/DEBIAN/prerm" <<'EOF'
-#!/bin/sh
-set -e
-
-case "$1" in
-    remove|deconfigure)
-        if [ -d /run/systemd/system ]; then
-            systemctl disable --now vnc-monitor-broker.service >/dev/null 2>&1 || true
-            systemctl disable --now vnc-monitor-auth.socket >/dev/null 2>&1 || true
-        fi
-        ;;
-esac
-
-exit 0
-EOF
-chmod 0755 "$stage/DEBIAN/prerm"
-
-cat >"$stage/DEBIAN/postrm" <<'EOF'
-#!/bin/sh
-set -e
-
-if [ -d /run/systemd/system ]; then
-    systemctl daemon-reload || true
-fi
-
-exit 0
-EOF
-chmod 0755 "$stage/DEBIAN/postrm"
-
 mkdir -p "$OUT_DIR"
 out_file="$OUT_DIR/vnc-monitor_${deb_version}_${architecture}.deb"
 
@@ -404,11 +355,9 @@ printf '\nRuntime Depends:\n  %s\n' "$runtime_deps"
 
 printf '\nBuilt package:\n  %s\n' "$out_file"
 printf '\nInstall with:\n  sudo apt install %q\n' "$out_file"
-printf '\nThe agent is globally wanted by graphical-session.target for future logins.\n'
-printf 'For the already-running GNOME session after first install/upgrade, run:\n'
-printf '  systemctl --user daemon-reload\n'
-printf '  systemctl --user restart vnc-monitor.service\n'
-printf '  sudo systemctl restart vnc-monitor-broker.service\n'
+printf '\nThe user agent is globally enabled for future graphical logins.\n'
+printf 'If an eligible local GNOME Wayland session is already active, postinst\n'
+printf 'reloads its user manager and restarts vnc-monitor.service automatically.\n'
 printf '\nIf this machine still has the old ./install.sh source installation, remove\n'
 printf 'its user/system unit overrides first (config and RA2 identity are preserved):\n'
 printf '  make uninstall-service\n'
