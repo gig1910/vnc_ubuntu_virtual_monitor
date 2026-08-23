@@ -12,7 +12,7 @@ if [[ ! -f "$DEB" ]]; then
     exit 1
 fi
 
-for command_name in dpkg-deb grep mktemp find readlink; do
+for command_name in dpkg-deb grep mktemp find; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "Required command not found: $command_name" >&2
         exit 1
@@ -67,7 +67,6 @@ required_paths=(
     usr/libexec/vnc-monitor-broker
     usr/libexec/vnc-monitor-auth-helper
     usr/lib/systemd/user/vnc-monitor.service
-    usr/lib/systemd/user/graphical-session.target.wants/vnc-monitor.service
     usr/lib/systemd/system/vnc-monitor-broker.service
     usr/lib/systemd/system/vnc-monitor-auth.socket
     usr/lib/systemd/system/vnc-monitor-auth@.service
@@ -118,26 +117,28 @@ grep -Fxq '/etc/pam.d/vnc-monitor' "$control/conffiles" || {
 
 # Production user service must be agent-only and have a writable private
 # runtime directory for the broker control socket.
-grep -Fxq 'ExecStart=/usr/bin/vnc-monitor --agent' \
-    "$root/usr/lib/systemd/user/vnc-monitor.service" || {
+user_unit="$root/usr/lib/systemd/user/vnc-monitor.service"
+grep -Fxq 'ExecStart=/usr/bin/vnc-monitor --agent' "$user_unit" || {
     echo "Packaged user service is not in broker-managed agent mode" >&2
     exit 1
 }
-grep -Fxq 'RuntimeDirectory=vnc-monitor' \
-    "$root/usr/lib/systemd/user/vnc-monitor.service" || {
+grep -Fxq 'RuntimeDirectory=vnc-monitor' "$user_unit" || {
     echo "Packaged user service lacks RuntimeDirectory=vnc-monitor" >&2
     exit 1
 }
+grep -Fxq 'WantedBy=graphical-session.target' "$user_unit" || {
+    echo "Packaged user service is not enableable for graphical-session.target" >&2
+    exit 1
+}
 
-agent_wants="$root/usr/lib/systemd/user/graphical-session.target.wants/vnc-monitor.service"
-[[ -L "$agent_wants" ]] || {
-    echo "Global graphical-session.target Wants link is not a symlink" >&2
+# Do not ship a hand-made vendor wants symlink. postinst enables the service
+# globally through systemctl, which creates the effective /etc/systemd/user
+# dependency and makes `systemctl --user is-enabled` report enabled.
+vendor_wants="$root/usr/lib/systemd/user/graphical-session.target.wants/vnc-monitor.service"
+if [[ -e "$vendor_wants" || -L "$vendor_wants" ]]; then
+    echo "Package still ships the obsolete vendor user-service Wants symlink" >&2
     exit 1
-}
-[[ "$(readlink "$agent_wants")" == '../vnc-monitor.service' ]] || {
-    echo "Unexpected user-service Wants target: $(readlink "$agent_wants")" >&2
-    exit 1
-}
+fi
 
 broker_unit="$root/usr/lib/systemd/system/vnc-monitor-broker.service"
 grep -Fxq 'ExecStart=/usr/libexec/vnc-monitor-broker' "$broker_unit" || {
@@ -173,15 +174,42 @@ grep -Fxq 'SocketMode=0666' \
     exit 1
 }
 
-# Maintainer scripts must manage the two system services. The per-user agent
-# is globally wanted for future graphical sessions and is not started from a
-# root package script inside arbitrary user managers.
+for script in postinst prerm postrm; do
+    [[ -x "$control/$script" ]] || {
+        echo "DEBIAN/$script is missing or not executable" >&2
+        exit 1
+    }
+done
+
+# Maintainer scripts must manage system services, globally enable the user
+# agent for future logins, and bridge installation into an already-running
+# eligible local Wayland session without writing into the user's home.
 grep -q 'vnc-monitor-broker.service' "$control/postinst" || {
     echo "postinst does not activate the system broker" >&2
     exit 1
 }
 grep -q 'vnc-monitor-auth.socket' "$control/postinst" || {
     echo "postinst does not activate the PAM socket" >&2
+    exit 1
+}
+grep -Fq 'systemctl --global enable vnc-monitor.service' "$control/postinst" || {
+    echo "postinst does not globally enable the user agent" >&2
+    exit 1
+}
+grep -Fq 'loginctl show-seat seat0 -p ActiveSession --value' "$control/postinst" || {
+    echo "postinst does not resolve seat0.ActiveSession" >&2
+    exit 1
+}
+grep -Fq 'systemctl --user --machine="$user@.host" daemon-reload' "$control/postinst" || {
+    echo "postinst does not reload the active user's systemd manager" >&2
+    exit 1
+}
+grep -Fq 'systemctl --user --machine="$user@.host" restart vnc-monitor.service' "$control/postinst" || {
+    echo "postinst does not start/restart the active Wayland user agent" >&2
+    exit 1
+}
+grep -Fq 'systemctl --global disable vnc-monitor.service' "$control/prerm" || {
+    echo "prerm does not remove the global user-agent enablement" >&2
     exit 1
 }
 
@@ -195,7 +223,8 @@ printf 'Broker:       /usr/libexec/vnc-monitor-broker\n'
 printf 'Broker unit:  /usr/lib/systemd/system/vnc-monitor-broker.service\n'
 printf 'Broker IPC:   /run/user visible read-only; /home and /root inaccessible\n'
 printf 'User agent:   /usr/bin/vnc-monitor --agent\n'
-printf 'Agent wants:  graphical-session.target (global package symlink)\n'
+printf 'Agent enable: systemd --global -> graphical-session.target\n'
+printf 'Active login: postinst reload/restart through user@.host when eligible\n'
 printf 'Auth socket:  /usr/lib/systemd/system/vnc-monitor-auth.socket\n'
 printf 'Private key:  not present in package\n'
 printf 'Result:       OK\n'
