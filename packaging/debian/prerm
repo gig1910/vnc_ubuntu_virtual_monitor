@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl --global disable vnc-monitor.service >/dev/null 2>&1 || true
+            systemctl disable --now vnc-monitor-broker.service >/dev/null 2>&1 || true
+            systemctl disable --now vnc-monitor-auth.socket >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0
