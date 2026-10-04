@@ -10,7 +10,7 @@ The security model is shared by both transports. There is exactly one machine-wi
 2. A connection is bound to the exact logind Session ID + UID selected at session creation time.
 3. GDM/greeter, remote sessions and inactive graphical sessions are never targets.
 4. VNC and WebRTC share one broker-owned client slot. They are mutually exclusive.
-5. Lock, Switch User, logout, broker loss or active-session change revokes the session immediately.
+5. Switch User, logout, broker loss or active-session change revokes the session immediately. Screen-lock policy is tracked separately and is not claimed by this checkpoint.
 6. The display remains view-only. Browser keyboard, pointer, clipboard and file-transfer input are not accepted.
 7. Authentication is PAM-backed and the authenticated Unix username must equal the active session owner.
 
@@ -127,11 +127,11 @@ POST /api/login
     -> credentials are sent only over the local broker-agent channel
     -> agent invokes the existing PAM helper as that Unix user
     -> username must equal the bound active-session owner
-    -> PAM success: broker issues a short-lived random web session token
-    -> state becomes ACTIVE_WEBRTC
+    -> PAM success: state becomes ACTIVE_WEBRTC
+    -> until WSS lands, broker holds a 15-second attach window and then revokes
 ```
 
-The password is never stored and is not placed in URLs, logs, cookies or WebRTC signalling.
+The password is never stored by the application and is not placed in URLs, logs, cookies or WebRTC signalling. The broker forwards it once over the bound local SOCK_SEQPACKET control channel and clears request-side decoded buffers after dispatch.
 
 The login page itself does not reserve the display slot. Only an authentication attempt does.
 
@@ -204,8 +204,8 @@ WebRTC handoff intentionally carries no browser fd because HTTPS/WSS terminates 
 
 1. Transport-aware broker handoff without changing existing VNC behaviour or wire compatibility. **Done.**
 2. Replace broker `active` / `revoked` booleans with one transport-neutral global session state machine. **Done.**
-3. Add broker HTTPS listener, TLS configuration and static login page.
-4. Add broker-agent PAM request/reply messages for web authentication.
+3. Add broker HTTPS listener, TLS configuration and static login page. **Done.**
+4. Add broker-agent PAM request/reply messages and the asynchronous broker-backed web authentication lifecycle. **Done.**
 5. Add authenticated WSS signalling and explicit broker `REVOKE` control message.
 6. Add agent-side `webrtcbin` session skeleton and SDP/ICE exchange.
 7. Feed the existing Mutter/PipeWire virtual monitor into the WebRTC video pipeline.

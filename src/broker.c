@@ -32,6 +32,7 @@
 #define BROKER_DEFAULT_PORT      5901
 #define BROKER_AGENT_DIR         "vnc-monitor"
 #define BROKER_AGENT_SOCKET      "agent.sock"
+#define WEB_ATTACH_TIMEOUT_MS      15000
 
 typedef struct {
     int valid;
@@ -69,6 +70,9 @@ typedef struct {
     int client_fd;
     int control_fd;
     guint control_source;
+    guint web_attach_timeout_source;
+    WebServerAuthComplete web_auth_complete;
+    gpointer web_auth_complete_data;
     uid_t uid;
     char session_id[VNC_BROKER_SESSION_ID_MAX];
     char peer_addr[VNC_BROKER_PEER_ADDR_MAX];
@@ -132,6 +136,19 @@ broker_web_slot_state(gpointer user_data)
 {
     const Broker *broker = user_data;
     return broker ? broker_session_state_name(broker->state) : "unknown";
+}
+
+static void
+broker_complete_web_auth(Broker *broker, WebServerAuthResult result)
+{
+    if (!broker || !broker->web_auth_complete)
+        return;
+
+    WebServerAuthComplete completion = broker->web_auth_complete;
+    gpointer completion_data = broker->web_auth_complete_data;
+    broker->web_auth_complete = NULL;
+    broker->web_auth_complete_data = NULL;
+    completion(result, completion_data);
 }
 
 static int
@@ -439,6 +456,12 @@ clear_session(Broker *broker, int reset)
     if (!broker)
         return;
 
+    if (broker->web_attach_timeout_source) {
+        guint source = broker->web_attach_timeout_source;
+        broker->web_attach_timeout_source = 0;
+        g_source_remove(source);
+    }
+
     if (broker->control_source) {
         guint source = broker->control_source;
         broker->control_source = 0;
@@ -469,6 +492,9 @@ clear_session(Broker *broker, int reset)
     broker->session_id[0] = '\0';
     broker->peer_addr[0] = '\0';
     broker_session_set_state(broker, BROKER_SESSION_IDLE);
+
+    /* A lost control channel during AUTH_WEB must finish the paused HTTP request. */
+    broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
 }
 
 static void
@@ -494,9 +520,14 @@ revoke_session(Broker *broker, const char *reason)
     }
     else if (broker->control_fd >= 0) {
         /*
-         * Future WebRTC path has no browser fd in the agent. Control-channel
-         * loss is therefore the authoritative fail-safe lifetime guard.
+         * WebRTC has no browser fd in the agent. The bound control channel is
+         * its authoritative lifetime guard. REVOKE is best-effort; shutdown()
+         * is the fail-safe even if the peer cannot parse another message.
          */
+        (void)vnc_broker_send_control(broker->control_fd,
+                                      VNC_BROKER_CONTROL_REVOKE,
+                                      NULL,
+                                      0);
         (void)shutdown(broker->control_fd, SHUT_RDWR);
     }
 }
@@ -521,7 +552,7 @@ enforce_session_binding(Broker *broker)
 }
 
 static gboolean
-control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
+vnc_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
 {
     Broker *broker = user_data;
 
@@ -563,6 +594,189 @@ control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
     }
 
     return G_SOURCE_REMOVE;
+}
+
+static gboolean
+web_attach_timeout_cb(gpointer user_data)
+{
+    Broker *broker = user_data;
+    broker->web_attach_timeout_source = 0;
+
+    if (broker->state == BROKER_SESSION_ACTIVE_WEBRTC) {
+        LOG_INFO("Broker WebRTC attach window expired for %s session=%s",
+                 broker->peer_addr,
+                 broker->session_id);
+        if (broker->control_fd >= 0) {
+            (void)vnc_broker_send_control(broker->control_fd,
+                                          VNC_BROKER_CONTROL_REVOKE,
+                                          NULL,
+                                          0);
+            (void)shutdown(broker->control_fd, SHUT_RDWR);
+        }
+        clear_session(broker, 0);
+    }
+
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean
+web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
+{
+    Broker *broker = user_data;
+
+    if (!broker_session_owns_slot(broker) || fd != broker->control_fd)
+        return G_SOURCE_REMOVE;
+
+    if (broker->state == BROKER_SESSION_AUTH_WEB &&
+        (condition & G_IO_IN) != 0) {
+        VncBrokerWebAuthResult auth_result = VNC_BROKER_WEB_AUTH_ERROR;
+
+        if (vnc_broker_recv_web_auth_result(fd, &auth_result) < 0) {
+            LOG_INFO("Broker could not read WebRTC authentication result for session %s",
+                     broker->session_id);
+            broker->control_source = 0;
+            broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
+            clear_session(broker, 1);
+            return G_SOURCE_REMOVE;
+        }
+
+        if ((condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) != 0) {
+            LOG_INFO("Broker lost WebRTC agent channel while authenticating session %s",
+                     broker->session_id);
+            broker->control_source = 0;
+            broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
+            clear_session(broker, 1);
+            return G_SOURCE_REMOVE;
+        }
+
+        if (auth_result == VNC_BROKER_WEB_AUTH_OK) {
+            broker_session_set_state(broker, BROKER_SESSION_ACTIVE_WEBRTC);
+            broker->web_attach_timeout_source =
+                g_timeout_add(WEB_ATTACH_TIMEOUT_MS,
+                              web_attach_timeout_cb,
+                              broker);
+
+            LOG_INFO("Broker authenticated WebRTC peer=%s uid=%lu session=%s; attach window=%dms",
+                     broker->peer_addr,
+                     (unsigned long)broker->uid,
+                     broker->session_id,
+                     WEB_ATTACH_TIMEOUT_MS);
+            broker_complete_web_auth(broker, WEB_SERVER_AUTH_OK);
+            return G_SOURCE_CONTINUE;
+        }
+
+        broker->control_source = 0;
+        if (auth_result == VNC_BROKER_WEB_AUTH_DENIED)
+            broker_complete_web_auth(broker, WEB_SERVER_AUTH_DENIED);
+        else
+            broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
+
+        clear_session(broker, 1);
+        return G_SOURCE_REMOVE;
+    }
+
+    LOG_INFO("Broker lost WebRTC agent control channel for session %s",
+             broker->session_id);
+    broker->control_source = 0;
+    if (broker->state == BROKER_SESSION_AUTH_WEB)
+        broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
+    clear_session(broker, 1);
+    return G_SOURCE_REMOVE;
+}
+
+static WebServerAuthResult
+broker_web_begin_auth(const char *username,
+                      const char *password,
+                      const char *peer_addr,
+                      WebServerAuthComplete completion,
+                      gpointer completion_data,
+                      gpointer user_data)
+{
+    Broker *broker = user_data;
+
+    if (!broker || !username || !password || !completion)
+        return WEB_SERVER_AUTH_ERROR;
+
+    if (broker_session_owns_slot(broker))
+        return WEB_SERVER_AUTH_BUSY;
+
+    ActiveSession active;
+    int active_rc = query_active_session(broker, &active);
+    if (active_rc != 1)
+        return WEB_SERVER_AUTH_UNAVAILABLE;
+
+    const char *active_user = active.user_name;
+    struct passwd *pw = NULL;
+    if (!active_user[0]) {
+        pw = getpwuid(active.uid);
+        active_user = pw && pw->pw_name ? pw->pw_name : "";
+    }
+
+    /*
+     * Do not forward credentials for another account to PAM. Externally this
+     * is the same generic authentication failure as a bad password.
+     */
+    if (!active_user[0] || strcmp(username, active_user) != 0)
+        return WEB_SERVER_AUTH_DENIED;
+
+    broker_session_set_state(broker, BROKER_SESSION_AUTH_WEB);
+
+    int control_fd = connect_agent(&active);
+    if (control_fd < 0) {
+        LOG_INFO("Broker cannot reach WebRTC agent for uid=%lu session=%s: %s",
+                 (unsigned long)active.uid,
+                 active.session_id,
+                 strerror(errno));
+        broker_session_set_state(broker, BROKER_SESSION_IDLE);
+        return WEB_SERVER_AUTH_UNAVAILABLE;
+    }
+
+    broker->client_fd = -1;
+    broker->control_fd = control_fd;
+    broker->uid = active.uid;
+    g_strlcpy(broker->session_id, active.session_id, sizeof(broker->session_id));
+    g_strlcpy(broker->peer_addr,
+              peer_addr && *peer_addr ? peer_addr : "unknown",
+              sizeof(broker->peer_addr));
+    broker->web_auth_complete = completion;
+    broker->web_auth_complete_data = completion_data;
+
+    if (vnc_broker_send_handoff_transport(control_fd,
+                                          VNC_BROKER_TRANSPORT_WEBRTC,
+                                          -1,
+                                          active.uid,
+                                          active.session_id,
+                                          broker->peer_addr) < 0 ||
+        vnc_broker_send_web_auth_request(control_fd, username, password) < 0) {
+        LOG_INFO("Broker could not start WebRTC authentication for %s: %s",
+                 broker->peer_addr,
+                 strerror(errno));
+        broker->web_auth_complete = NULL;
+        broker->web_auth_complete_data = NULL;
+        clear_session(broker, 1);
+        return WEB_SERVER_AUTH_UNAVAILABLE;
+    }
+
+    broker->control_source =
+        g_unix_fd_add(control_fd,
+                      G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+                      web_control_ready_cb,
+                      broker);
+    if (!broker->control_source) {
+        broker->web_auth_complete = NULL;
+        broker->web_auth_complete_data = NULL;
+        clear_session(broker, 1);
+        return WEB_SERVER_AUTH_ERROR;
+    }
+
+    LOG_INFO("Broker started WebRTC authentication for peer=%s uid=%lu session=%s",
+             broker->peer_addr,
+             (unsigned long)broker->uid,
+             broker->session_id);
+
+    /* Close the same seat-switch race as the VNC handoff path. */
+    enforce_session_binding(broker);
+    return WEB_SERVER_AUTH_STARTED;
 }
 
 static int
@@ -653,7 +867,7 @@ route_vnc_client(Broker *broker,
 
     broker->control_source = g_unix_fd_add(control_fd,
                                             G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
-                                            control_ready_cb,
+                                            vnc_control_ready_cb,
                                             broker);
 
     /*
@@ -849,7 +1063,8 @@ main(int argc, char **argv)
 
     WebServerHooks web_hooks = {
         .slot_busy = broker_web_slot_busy,
-        .slot_state = broker_web_slot_state
+        .slot_state = broker_web_slot_state,
+        .begin_auth = broker_web_begin_auth
     };
 
     int web_rc = web_server_start(&broker.web_server,

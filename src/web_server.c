@@ -11,6 +11,7 @@
 #define WEB_DEFAULT_PORT       8443
 #define WEB_DEFAULT_CERT_FILE  "/etc/vnc-monitor/tls/server.crt"
 #define WEB_DEFAULT_KEY_FILE   "/etc/vnc-monitor/tls/server.key"
+#define WEB_LOGIN_BODY_MAX      8192
 
 struct WebServer {
     SoupServer *server;
@@ -43,9 +44,9 @@ static const char login_page[] =
     "    <form method=\"post\" action=\"/api/login\" autocomplete=\"on\">\n"
     "      <label>Username<input name=\"username\" autocomplete=\"username\" required></label>\n"
     "      <label>Password<input type=\"password\" name=\"password\" autocomplete=\"current-password\" required></label>\n"
-    "      <button type=\"submit\" disabled>Connect</button>\n"
+    "      <button type=\"submit\">Connect</button>\n"
     "    </form>\n"
-    "    <p class=\"note\">Web authentication is not enabled in this development checkpoint yet.</p>\n"
+    "    <p class=\"note\">Authentication is bound to the active local GNOME Wayland user.</p>\n"
     "  </main>\n"
     "</body>\n"
     "</html>\n";
@@ -172,6 +173,79 @@ status_handler(SoupServer *server,
     g_free(body);
 }
 
+typedef struct {
+    SoupServerMessage *msg;
+} PendingLogin;
+
+static void
+secure_clear_string(char *value)
+{
+    if (!value)
+        return;
+
+    size_t len = strlen(value);
+#if defined(__GLIBC__)
+    explicit_bzero(value, len);
+#else
+    volatile unsigned char *p = (volatile unsigned char *)value;
+    while (len--)
+        *p++ = 0;
+#endif
+}
+
+static void
+respond_auth_result(SoupServerMessage *msg, WebServerAuthResult result)
+{
+    switch (result) {
+        case WEB_SERVER_AUTH_OK:
+            respond_text(msg,
+                         SOUP_STATUS_OK,
+                         "application/json; charset=utf-8",
+                         "{\"ok\":true,\"state\":\"active-webrtc\","
+                         "\"attach-timeout-ms\":15000}\n");
+            break;
+        case WEB_SERVER_AUTH_DENIED:
+            respond_text(msg,
+                         SOUP_STATUS_UNAUTHORIZED,
+                         "application/json; charset=utf-8",
+                         "{\"error\":\"authentication-failed\"}\n");
+            break;
+        case WEB_SERVER_AUTH_BUSY:
+            respond_text(msg,
+                         SOUP_STATUS_CONFLICT,
+                         "application/json; charset=utf-8",
+                         "{\"error\":\"busy\"}\n");
+            break;
+        case WEB_SERVER_AUTH_UNAVAILABLE:
+            respond_text(msg,
+                         SOUP_STATUS_SERVICE_UNAVAILABLE,
+                         "application/json; charset=utf-8",
+                         "{\"error\":\"unavailable\"}\n");
+            break;
+        case WEB_SERVER_AUTH_ERROR:
+        case WEB_SERVER_AUTH_STARTED:
+        default:
+            respond_text(msg,
+                         SOUP_STATUS_INTERNAL_SERVER_ERROR,
+                         "application/json; charset=utf-8",
+                         "{\"error\":\"authentication-error\"}\n");
+            break;
+    }
+}
+
+static void
+login_auth_complete(WebServerAuthResult result, gpointer completion_data)
+{
+    PendingLogin *pending = completion_data;
+    if (!pending)
+        return;
+
+    respond_auth_result(pending->msg, result);
+    soup_server_message_unpause(pending->msg);
+    g_object_unref(pending->msg);
+    g_free(pending);
+}
+
 static void
 login_handler(SoupServer *server,
               SoupServerMessage *msg,
@@ -190,22 +264,89 @@ login_handler(SoupServer *server,
         return;
     }
 
-    if (slot_busy(web)) {
-        respond_text(msg,
-                     SOUP_STATUS_CONFLICT,
-                     "application/json; charset=utf-8",
-                     "{\"error\":\"busy\"}\n");
+    if (!web->hooks.begin_auth) {
+        respond_auth_result(msg, WEB_SERVER_AUTH_UNAVAILABLE);
         return;
     }
 
-    /*
-     * Deliberately do not parse or log credentials until the PAM message path
-     * exists. This endpoint only establishes routing/slot semantics for now.
-     */
-    respond_text(msg,
-                 SOUP_STATUS_NOT_IMPLEMENTED,
-                 "application/json; charset=utf-8",
-                 "{\"error\":\"web-auth-not-implemented\"}\n");
+    if (slot_busy(web)) {
+        respond_auth_result(msg, WEB_SERVER_AUTH_BUSY);
+        return;
+    }
+
+    SoupMessageHeaders *headers = soup_server_message_get_request_headers(msg);
+    const char *content_type = soup_message_headers_get_content_type(headers, NULL);
+    if (!content_type ||
+        g_ascii_strcasecmp(content_type, "application/x-www-form-urlencoded") != 0) {
+        respond_text(msg,
+                     SOUP_STATUS_UNSUPPORTED_MEDIA_TYPE,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"invalid-request\"}\n");
+        return;
+    }
+
+    SoupMessageBody *request_body = soup_server_message_get_request_body(msg);
+    if (!request_body || !request_body->data ||
+        request_body->length <= 0 ||
+        request_body->length > WEB_LOGIN_BODY_MAX) {
+        respond_text(msg,
+                     SOUP_STATUS_BAD_REQUEST,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"invalid-request\"}\n");
+        return;
+    }
+
+    GHashTable *form = soup_form_decode((const char *)request_body->data);
+    if (!form) {
+        respond_text(msg,
+                     SOUP_STATUS_BAD_REQUEST,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"invalid-request\"}\n");
+        return;
+    }
+
+    char *username = g_hash_table_lookup(form, "username");
+    char *password = g_hash_table_lookup(form, "password");
+    size_t username_len = username ? strlen(username) : 0;
+    size_t password_len = password ? strlen(password) : 0;
+
+    if (!username || !password ||
+        username_len == 0 || password_len == 0 ||
+        username_len > VNC_BROKER_AUTH_USERNAME_MAX ||
+        password_len > VNC_BROKER_AUTH_PASSWORD_MAX) {
+        if (password)
+            secure_clear_string(password);
+        g_hash_table_destroy(form);
+        soup_message_body_truncate(request_body);
+        respond_text(msg,
+                     SOUP_STATUS_BAD_REQUEST,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"invalid-request\"}\n");
+        return;
+    }
+
+    const char *peer_addr = soup_server_message_get_remote_host(msg);
+    if (!peer_addr || !*peer_addr)
+        peer_addr = "unknown";
+
+    PendingLogin *pending = g_new0(PendingLogin, 1);
+    pending->msg = g_object_ref(msg);
+
+    soup_server_message_pause(msg);
+
+    WebServerAuthResult start = web->hooks.begin_auth(username,
+                                                       password,
+                                                       peer_addr,
+                                                       login_auth_complete,
+                                                       pending,
+                                                       web->user_data);
+
+    secure_clear_string(password);
+    g_hash_table_destroy(form);
+    soup_message_body_truncate(request_body);
+
+    if (start != WEB_SERVER_AUTH_STARTED)
+        login_auth_complete(start, pending);
 }
 
 static int
@@ -399,7 +540,7 @@ web_server_start(WebServer **out,
     }
 
     *out = web;
-    LOG_INFO("Broker HTTPS scaffold ready on TCP/%u (IPv4; WebRTC auth not enabled yet)",
+    LOG_INFO("Broker HTTPS authentication ready on TCP/%u (IPv4; WSS/WebRTC signalling not enabled yet)",
              web->port);
     return 1;
 }

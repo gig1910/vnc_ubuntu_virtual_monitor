@@ -560,8 +560,6 @@ claim_web_control_slot(ClientSlot *slot,
 static void
 release_web_control_slot(ClientSlot *slot, int control_fd)
 {
-    shutdown_signal_unregister_fd(control_fd);
-
     pthread_mutex_lock(&slot->mutex);
     if (slot->control_fd == control_fd) {
         slot->client_fd = -1;
@@ -612,8 +610,14 @@ serve_web_control_session(int control_fd,
                                           handoff->session_id,
                                           cfg);
     if (claim_rc != 0) {
-        LOG_INFO("Agent rejected WebRTC handoff for %s: local session already busy",
-                 handoff->peer_addr);
+        if (claim_rc > 0) {
+            LOG_INFO("Agent rejected WebRTC handoff for %s: local session already busy",
+                     handoff->peer_addr);
+        }
+        else {
+            LOG_ERROR("Agent could not register WebRTC control channel for %s",
+                      handoff->peer_addr);
+        }
         (void)vnc_broker_send_web_auth_result(control_fd,
                                               VNC_BROKER_WEB_AUTH_ERROR);
         (void)shutdown(control_fd, SHUT_RDWR);
@@ -689,6 +693,11 @@ respond:
         wait_for_web_control_end(control_fd);
     }
 
+    /*
+     * Unregister before close so a rapidly reused descriptor can never be
+     * mistaken for the old WebRTC lifetime guard by the shutdown supervisor.
+     */
+    shutdown_signal_unregister_fd(control_fd);
     (void)shutdown(control_fd, SHUT_RDWR);
     close(control_fd);
     release_web_control_slot(slot, control_fd);
