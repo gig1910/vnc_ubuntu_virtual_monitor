@@ -167,7 +167,13 @@ static const char client_js[] =
     "      socket = null;\n"
     "      setFormBusy(false);\n"
     "      setConnected(false);\n"
-    "      setStatus('This browser could not open the secure WebSocket.', 'error');\n"
+    "      var detail = '';\n"
+    "      if (e) {\n"
+    "        if (e.name) detail += String(e.name);\n"
+    "        if (e.message) detail += (detail ? ': ' : '') + String(e.message);\n"
+    "        if (e.code != null) detail += (detail ? ' ' : '') + '[code=' + String(e.code) + ']';\n"
+    "      }\n"
+    "      setStatus('WebSocket constructor failed' + (detail ? ': ' + detail : '.'), 'error');\n"
     "      return;\n"
     "    }\n"
     "\n"
@@ -188,7 +194,7 @@ static const char client_js[] =
     "    };\n"
     "\n"
     "    socket.onerror = function () {\n"
-    "      if (!socketOpened) setStatus('Secure WebSocket connection failed.', 'error');\n"
+    "      if (!socketOpened) setStatus('Secure WebSocket network/TLS handshake failed before open.', 'error');\n"
     "    };\n"
     "\n"
     "    socket.onclose = function () {\n"
@@ -1519,7 +1525,23 @@ ws_guard_handler(SoupServer *server,
 
     SoupMessageHeaders *headers = soup_server_message_get_request_headers(msg);
     const char *upgrade = soup_message_headers_get_one(headers, "Upgrade");
+    const char *host = soup_message_headers_get_one(headers, "Host");
+    const char *origin = soup_message_headers_get_one(headers, "Origin");
+    const char *version = soup_message_headers_get_one(headers, "Sec-WebSocket-Version");
+    const char *cookie_header = soup_message_headers_get_one(headers, "Cookie");
+    const char *user_agent = soup_message_headers_get_one(headers, "User-Agent");
+    const char *peer_addr = soup_server_message_get_remote_host(msg);
+
+    LOG_INFO("WebSocket upgrade request peer=%s host=%s origin=%s version=%s cookie=%s ua=%s",
+             peer_addr && *peer_addr ? peer_addr : "unknown",
+             host && *host ? host : "(missing)",
+             origin && *origin ? origin : "(missing)",
+             version && *version ? version : "(missing)",
+             cookie_header && *cookie_header ? "present" : "missing",
+             user_agent && *user_agent ? user_agent : "(missing)");
     if (!upgrade || g_ascii_strcasecmp(upgrade, "websocket") != 0) {
+        LOG_INFO("WebSocket upgrade rejected for peer=%s: missing/invalid Upgrade header",
+                 peer_addr && *peer_addr ? peer_addr : "unknown");
         respond_text(msg,
                      SOUP_STATUS_BAD_REQUEST,
                      "application/json; charset=utf-8",
@@ -1528,6 +1550,10 @@ ws_guard_handler(SoupServer *server,
     }
 
     if (!request_origin_matches(msg, TRUE)) {
+        LOG_INFO("WebSocket upgrade rejected for peer=%s: origin mismatch host=%s origin=%s",
+                 peer_addr && *peer_addr ? peer_addr : "unknown",
+                 host && *host ? host : "(missing)",
+                 origin && *origin ? origin : "(missing)");
         respond_text(msg,
                      SOUP_STATUS_FORBIDDEN,
                      "application/json; charset=utf-8",
@@ -1539,6 +1565,9 @@ ws_guard_handler(SoupServer *server,
     if (!token ||
         !web->hooks.validate_websocket_token ||
         !web->hooks.validate_websocket_token(token, web->user_data)) {
+        LOG_INFO("WebSocket upgrade rejected for peer=%s: authentication cookie %s or token invalid",
+                 peer_addr && *peer_addr ? peer_addr : "unknown",
+                 token ? "present" : "missing");
         g_free(token);
         respond_text(msg,
                      SOUP_STATUS_UNAUTHORIZED,
@@ -1546,6 +1575,9 @@ ws_guard_handler(SoupServer *server,
                      "{\"error\":\"authentication-required\"}\n");
         return;
     }
+
+    LOG_INFO("WebSocket upgrade preflight accepted for peer=%s",
+             peer_addr && *peer_addr ? peer_addr : "unknown");
 
     g_object_set_data_full(G_OBJECT(msg),
                            WEB_WS_TOKEN_DATA_KEY,
@@ -1607,6 +1639,7 @@ websocket_handler(SoupServer *server,
         !token ||
         !web->hooks.bind_websocket ||
         !web->hooks.bind_websocket(token, web->user_data)) {
+        LOG_INFO("WebSocket upgraded but session bind was rejected");
         soup_websocket_connection_close(connection,
                                         SOUP_WEBSOCKET_CLOSE_POLICY_VIOLATION,
                                         "Session is not attachable");

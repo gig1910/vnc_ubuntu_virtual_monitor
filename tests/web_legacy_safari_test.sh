@@ -65,6 +65,8 @@ done
 
 grep -Fq 'XMLHttpRequest' <<<"$client_js"
 grep -Fq 'new WebSocket' <<<"$client_js"
+grep -Fq 'WebSocket constructor failed' <<<"$client_js"
+grep -Fq 'network/TLS handshake failed' <<<"$client_js"
 grep -Fq 'encodeURIComponent' <<<"$client_js"
 grep -Fq 'function (' <<<"$client_js"
 
@@ -123,3 +125,9 @@ grep -Fq 'certificate' <<<"$settings_handler"
 grep -Fq 'privateKey' <<<"$settings_handler"
 
 echo "management status/settings separation: OK"
+
+grep -Fq 'WebSocket upgrade request peer=' "$source_file"
+grep -Fq 'origin mismatch' "$source_file"
+grep -Fq 'authentication cookie %s or token invalid' "$source_file"
+grep -Fq 'WebSocket upgrade preflight accepted' "$source_file"
+echo "legacy WebSocket diagnostics: OK"
