@@ -2,6 +2,7 @@
 #define VNC_MONITOR_WEB_SERVER_H
 
 #include <glib.h>
+#include "broker_protocol.h"
 
 typedef struct WebServer WebServer;
 
@@ -18,6 +19,23 @@ typedef enum {
 typedef void (*WebServerAuthComplete)(WebServerAuthResult result,
                                       const char *session_token,
                                       gpointer completion_data);
+
+typedef struct {
+    gboolean viewer_active;
+    gboolean websocket_attached;
+    char viewer_state[32];
+    char viewer_transport[16];
+    char viewer_peer[VNC_BROKER_PEER_ADDR_MAX];
+    char viewer_user[128];
+    char viewer_session_id[VNC_BROKER_SESSION_ID_MAX];
+
+    gboolean active_user_available;
+    guint active_uid;
+    char active_user[128];
+    char active_session_id[VNC_BROKER_SESSION_ID_MAX];
+
+    int vnc_port;
+} WebServerManagementInfo;
 
 typedef struct {
     gboolean (*slot_busy)(gpointer user_data);
@@ -48,6 +66,23 @@ typedef struct {
 
     /* Called only for the currently bound authenticated WebSocket. */
     void (*websocket_closed)(gpointer user_data);
+
+    /*
+     * Management authentication is independent of the viewer slot. It still
+     * authenticates the exact active seat0 Unix user through the user agent.
+     */
+    WebServerAuthResult (*begin_management_auth)(const char *username,
+                                                 const char *password,
+                                                 const char *peer_addr,
+                                                 WebServerAuthComplete completion,
+                                                 gpointer completion_data,
+                                                 gpointer user_data);
+    gboolean (*validate_management_token)(const char *token,
+                                          gpointer user_data);
+    void (*management_logout)(gpointer user_data);
+    int (*get_management_info)(WebServerManagementInfo *info,
+                               gpointer user_data);
+    gboolean (*disconnect_viewer)(gpointer user_data);
 } WebServerHooks;
 
 /*

@@ -34,8 +34,9 @@
 #define BROKER_AGENT_DIR         "vnc-monitor"
 #define BROKER_AGENT_SOCKET      "agent.sock"
 #define WEB_ATTACH_TIMEOUT_MS      15000
-#define WEB_SESSION_TOKEN_BYTES    32
-#define WEB_SESSION_TOKEN_HEX_LEN  (WEB_SESSION_TOKEN_BYTES * 2)
+#define WEB_SESSION_TOKEN_BYTES        32
+#define WEB_SESSION_TOKEN_HEX_LEN      (WEB_SESSION_TOKEN_BYTES * 2)
+#define MANAGEMENT_SESSION_TIMEOUT_MS  (10 * 60 * 1000)
 
 typedef struct {
     int valid;
@@ -44,6 +45,8 @@ typedef struct {
     char object_path[256];
     char user_name[128];
 } ActiveSession;
+
+typedef struct ManagementAuth ManagementAuth;
 
 typedef enum {
     BROKER_SESSION_IDLE = 0,
@@ -79,10 +82,30 @@ typedef struct {
     gboolean web_token_valid;
     gboolean websocket_attached;
     char web_token[WEB_SESSION_TOKEN_HEX_LEN + 1];
+
+    ManagementAuth *management_auth;
+    gboolean management_token_valid;
+    char management_token[WEB_SESSION_TOKEN_HEX_LEN + 1];
+    gint64 management_token_expires_us;
+    uid_t management_uid;
+    char management_session_id[VNC_BROKER_SESSION_ID_MAX];
+
+    int vnc_port;
     uid_t uid;
     char session_id[VNC_BROKER_SESSION_ID_MAX];
     char peer_addr[VNC_BROKER_PEER_ADDR_MAX];
 } Broker;
+
+struct ManagementAuth {
+    Broker *broker;
+    int control_fd;
+    guint source;
+    uid_t uid;
+    char session_id[VNC_BROKER_SESSION_ID_MAX];
+    char peer_addr[VNC_BROKER_PEER_ADDR_MAX];
+    WebServerAuthComplete completion;
+    gpointer completion_data;
+};
 
 static const char *
 broker_session_state_name(BrokerSessionState state)
@@ -168,8 +191,21 @@ broker_invalidate_web_token(Broker *broker)
     broker->web_token_valid = FALSE;
 }
 
+static void
+broker_invalidate_management_token(Broker *broker)
+{
+    if (!broker)
+        return;
+
+    secure_clear(broker->management_token, sizeof(broker->management_token));
+    broker->management_token_valid = FALSE;
+    broker->management_token_expires_us = 0;
+    broker->management_uid = (uid_t)-1;
+    broker->management_session_id[0] = '\0';
+}
+
 static int
-generate_web_token(Broker *broker)
+generate_random_hex_token(char out[WEB_SESSION_TOKEN_HEX_LEN + 1])
 {
     static const char hex[] = "0123456789abcdef";
     unsigned char random_bytes[WEB_SESSION_TOKEN_BYTES];
@@ -194,30 +230,43 @@ generate_web_token(Broker *broker)
     }
 
     for (size_t i = 0; i < sizeof(random_bytes); i++) {
-        broker->web_token[i * 2] = hex[random_bytes[i] >> 4];
-        broker->web_token[i * 2 + 1] = hex[random_bytes[i] & 0x0f];
+        out[i * 2] = hex[random_bytes[i] >> 4];
+        out[i * 2 + 1] = hex[random_bytes[i] & 0x0f];
     }
-    broker->web_token[WEB_SESSION_TOKEN_HEX_LEN] = '\0';
-    broker->web_token_valid = TRUE;
+    out[WEB_SESSION_TOKEN_HEX_LEN] = '\0';
     secure_clear(random_bytes, sizeof(random_bytes));
     return 0;
+}
+
+static int
+generate_web_token(Broker *broker)
+{
+    if (generate_random_hex_token(broker->web_token) < 0)
+        return -1;
+
+    broker->web_token_valid = TRUE;
+    return 0;
+}
+
+static gboolean
+constant_time_token_equal(const char *expected, const char *candidate)
+{
+    if (!expected || !candidate ||
+        strlen(candidate) != WEB_SESSION_TOKEN_HEX_LEN)
+        return FALSE;
+
+    unsigned int diff = 0;
+    for (size_t i = 0; i < WEB_SESSION_TOKEN_HEX_LEN; i++)
+        diff |= (unsigned char)expected[i] ^ (unsigned char)candidate[i];
+
+    return diff == 0 ? TRUE : FALSE;
 }
 
 static gboolean
 web_token_equal(const Broker *broker, const char *candidate)
 {
-    if (!broker || !broker->web_token_valid || !candidate)
-        return FALSE;
-
-    if (strlen(candidate) != WEB_SESSION_TOKEN_HEX_LEN)
-        return FALSE;
-
-    unsigned int diff = 0;
-    for (size_t i = 0; i < WEB_SESSION_TOKEN_HEX_LEN; i++)
-        diff |= (unsigned char)broker->web_token[i] ^
-                (unsigned char)candidate[i];
-
-    return diff == 0 ? TRUE : FALSE;
+    return broker && broker->web_token_valid &&
+           constant_time_token_equal(broker->web_token, candidate);
 }
 
 static void
@@ -609,7 +658,7 @@ revoke_session(Broker *broker, const char *reason)
             web_server_close_websocket(broker->web_server);
     }
 
-    LOG_INFO("Broker revoking %s session for %s: bound session %s is no longer active (%s)",
+    LOG_INFO("Broker revoking %s session for %s: bound session %s (%s)",
              broker_session_state_name(previous),
              broker->peer_addr[0] ? broker->peer_addr : "client",
              broker->session_id[0] ? broker->session_id : "unbound",
@@ -865,6 +914,273 @@ broker_websocket_closed(gpointer user_data)
     }
 
     clear_session(broker, 0);
+}
+
+static void
+management_auth_finish(ManagementAuth *auth,
+                       WebServerAuthResult result,
+                       const char *token)
+{
+    if (!auth)
+        return;
+
+    Broker *broker = auth->broker;
+    if (auth->source) {
+        guint source = auth->source;
+        auth->source = 0;
+        g_source_remove(source);
+    }
+
+    if (auth->control_fd >= 0) {
+        close(auth->control_fd);
+        auth->control_fd = -1;
+    }
+
+    if (broker && broker->management_auth == auth)
+        broker->management_auth = NULL;
+
+    WebServerAuthComplete completion = auth->completion;
+    gpointer completion_data = auth->completion_data;
+    g_free(auth);
+
+    if (completion)
+        completion(result, token, completion_data);
+}
+
+static gboolean
+management_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
+{
+    ManagementAuth *auth = user_data;
+    Broker *broker = auth ? auth->broker : NULL;
+
+    if (!auth || !broker || fd != auth->control_fd)
+        return G_SOURCE_REMOVE;
+
+    auth->source = 0;
+
+    VncBrokerWebAuthResult auth_result = VNC_BROKER_WEB_AUTH_ERROR;
+    int got_result =
+        (condition & G_IO_IN) != 0 &&
+        vnc_broker_recv_web_auth_result(fd, &auth_result) == 0;
+
+    if (!got_result) {
+        LOG_INFO("Broker lost management authentication channel for session %s",
+                 auth->session_id);
+        management_auth_finish(auth, WEB_SERVER_AUTH_ERROR, NULL);
+        return G_SOURCE_REMOVE;
+    }
+
+    if (auth_result == VNC_BROKER_WEB_AUTH_DENIED) {
+        management_auth_finish(auth, WEB_SERVER_AUTH_DENIED, NULL);
+        return G_SOURCE_REMOVE;
+    }
+
+    if (auth_result != VNC_BROKER_WEB_AUTH_OK) {
+        management_auth_finish(auth, WEB_SERVER_AUTH_ERROR, NULL);
+        return G_SOURCE_REMOVE;
+    }
+
+    ActiveSession active;
+    if (query_active_session(broker, &active) != 1 ||
+        active.uid != auth->uid ||
+        strcmp(active.session_id, auth->session_id) != 0) {
+        LOG_INFO("Broker discarded management authentication because seat0 changed");
+        management_auth_finish(auth, WEB_SERVER_AUTH_UNAVAILABLE, NULL);
+        return G_SOURCE_REMOVE;
+    }
+
+    broker_invalidate_management_token(broker);
+    if (generate_random_hex_token(broker->management_token) < 0) {
+        LOG_ERROR("Broker could not generate management session token: %s",
+                  strerror(errno));
+        management_auth_finish(auth, WEB_SERVER_AUTH_ERROR, NULL);
+        return G_SOURCE_REMOVE;
+    }
+
+    broker->management_token_valid = TRUE;
+    broker->management_token_expires_us =
+        g_get_monotonic_time() + (gint64)MANAGEMENT_SESSION_TIMEOUT_MS * 1000;
+    broker->management_uid = auth->uid;
+    g_strlcpy(broker->management_session_id,
+              auth->session_id,
+              sizeof(broker->management_session_id));
+
+    LOG_INFO("Broker management session authenticated for peer=%s uid=%lu session=%s",
+             auth->peer_addr,
+             (unsigned long)auth->uid,
+             auth->session_id);
+
+    management_auth_finish(auth,
+                           WEB_SERVER_AUTH_OK,
+                           broker->management_token);
+    return G_SOURCE_REMOVE;
+}
+
+static WebServerAuthResult
+broker_management_begin_auth(const char *username,
+                             const char *password,
+                             const char *peer_addr,
+                             WebServerAuthComplete completion,
+                             gpointer completion_data,
+                             gpointer user_data)
+{
+    Broker *broker = user_data;
+    if (!broker || !username || !password || !completion)
+        return WEB_SERVER_AUTH_ERROR;
+
+    if (broker->management_auth)
+        return WEB_SERVER_AUTH_BUSY;
+
+    ActiveSession active;
+    if (query_active_session(broker, &active) != 1)
+        return WEB_SERVER_AUTH_UNAVAILABLE;
+
+    const char *active_user = active.user_name;
+    struct passwd *pw = NULL;
+    if (!active_user[0]) {
+        pw = getpwuid(active.uid);
+        active_user = pw && pw->pw_name ? pw->pw_name : "";
+    }
+
+    if (!active_user[0] || strcmp(username, active_user) != 0)
+        return WEB_SERVER_AUTH_DENIED;
+
+    int control_fd = connect_agent(&active);
+    if (control_fd < 0)
+        return WEB_SERVER_AUTH_UNAVAILABLE;
+
+    ManagementAuth *auth = g_new0(ManagementAuth, 1);
+    auth->broker = broker;
+    auth->control_fd = control_fd;
+    auth->uid = active.uid;
+    auth->completion = completion;
+    auth->completion_data = completion_data;
+    g_strlcpy(auth->session_id, active.session_id, sizeof(auth->session_id));
+    g_strlcpy(auth->peer_addr,
+              peer_addr && *peer_addr ? peer_addr : "unknown",
+              sizeof(auth->peer_addr));
+
+    if (vnc_broker_send_handoff_transport(control_fd,
+                                          VNC_BROKER_TRANSPORT_MANAGEMENT,
+                                          -1,
+                                          active.uid,
+                                          active.session_id,
+                                          auth->peer_addr) < 0 ||
+        vnc_broker_send_web_auth_request(control_fd, username, password) < 0) {
+        close(control_fd);
+        g_free(auth);
+        return WEB_SERVER_AUTH_UNAVAILABLE;
+    }
+
+    broker->management_auth = auth;
+    auth->source = g_unix_fd_add(control_fd,
+                                 G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+                                 management_control_ready_cb,
+                                 auth);
+    if (!auth->source) {
+        broker->management_auth = NULL;
+        close(control_fd);
+        g_free(auth);
+        return WEB_SERVER_AUTH_ERROR;
+    }
+
+    LOG_INFO("Broker started management authentication for peer=%s uid=%lu session=%s",
+             auth->peer_addr,
+             (unsigned long)auth->uid,
+             auth->session_id);
+    return WEB_SERVER_AUTH_STARTED;
+}
+
+static gboolean
+broker_validate_management_token(const char *token, gpointer user_data)
+{
+    Broker *broker = user_data;
+    if (!broker || !broker->management_token_valid || !token)
+        return FALSE;
+
+    if (g_get_monotonic_time() >= broker->management_token_expires_us) {
+        broker_invalidate_management_token(broker);
+        return FALSE;
+    }
+
+    ActiveSession active;
+    if (query_active_session(broker, &active) != 1 ||
+        active.uid != broker->management_uid ||
+        strcmp(active.session_id, broker->management_session_id) != 0) {
+        broker_invalidate_management_token(broker);
+        return FALSE;
+    }
+
+    return constant_time_token_equal(broker->management_token, token);
+}
+
+static void
+broker_management_logout(gpointer user_data)
+{
+    broker_invalidate_management_token((Broker *)user_data);
+}
+
+static int
+broker_get_management_info(WebServerManagementInfo *info, gpointer user_data)
+{
+    Broker *broker = user_data;
+    if (!broker || !info)
+        return -1;
+
+    memset(info, 0, sizeof(*info));
+    info->vnc_port = broker->vnc_port;
+    info->viewer_active = broker_session_owns_slot(broker) ? TRUE : FALSE;
+    info->websocket_attached = broker->websocket_attached;
+    g_strlcpy(info->viewer_state,
+              broker_session_state_name(broker->state),
+              sizeof(info->viewer_state));
+
+    if (broker->state == BROKER_SESSION_ACTIVE_VNC ||
+        broker->state == BROKER_SESSION_AUTH_VNC) {
+        g_strlcpy(info->viewer_transport, "vnc", sizeof(info->viewer_transport));
+    }
+    else if (broker->state == BROKER_SESSION_ACTIVE_WEBRTC ||
+             broker->state == BROKER_SESSION_AUTH_WEB ||
+             broker->state == BROKER_SESSION_REVOKING) {
+        g_strlcpy(info->viewer_transport, "webrtc", sizeof(info->viewer_transport));
+    }
+    else {
+        g_strlcpy(info->viewer_transport, "none", sizeof(info->viewer_transport));
+    }
+
+    g_strlcpy(info->viewer_peer, broker->peer_addr, sizeof(info->viewer_peer));
+    g_strlcpy(info->viewer_session_id,
+              broker->session_id,
+              sizeof(info->viewer_session_id));
+
+    if (broker->uid != (uid_t)-1) {
+        struct passwd *pw = getpwuid(broker->uid);
+        if (pw && pw->pw_name)
+            g_strlcpy(info->viewer_user, pw->pw_name, sizeof(info->viewer_user));
+    }
+
+    ActiveSession active;
+    if (query_active_session(broker, &active) == 1) {
+        info->active_user_available = TRUE;
+        info->active_uid = (guint)active.uid;
+        g_strlcpy(info->active_user, active.user_name, sizeof(info->active_user));
+        g_strlcpy(info->active_session_id,
+                  active.session_id,
+                  sizeof(info->active_session_id));
+    }
+
+    return 0;
+}
+
+static gboolean
+broker_management_disconnect_viewer(gpointer user_data)
+{
+    Broker *broker = user_data;
+    if (!broker || !broker_session_owns_slot(broker))
+        return FALSE;
+
+    revoke_session(broker, "management disconnect request");
+    return TRUE;
 }
 
 static WebServerAuthResult
@@ -1134,6 +1450,21 @@ listener_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
 }
 
 static void
+enforce_management_binding(Broker *broker)
+{
+    if (!broker || !broker->management_token_valid)
+        return;
+
+    ActiveSession active;
+    if (query_active_session(broker, &active) != 1 ||
+        active.uid != broker->management_uid ||
+        strcmp(active.session_id, broker->management_session_id) != 0) {
+        LOG_INFO("Broker invalidated management session because seat0 changed");
+        broker_invalidate_management_token(broker);
+    }
+}
+
+static void
 logind_changed_cb(GDBusConnection *connection,
                   const gchar *sender_name,
                   const gchar *object_path,
@@ -1149,13 +1480,17 @@ logind_changed_cb(GDBusConnection *connection,
     (void)signal_name;
     (void)parameters;
 
-    enforce_session_binding((Broker *)user_data);
+    Broker *broker = user_data;
+    enforce_session_binding(broker);
+    enforce_management_binding(broker);
 }
 
 static gboolean
 periodic_binding_check(gpointer user_data)
 {
-    enforce_session_binding((Broker *)user_data);
+    Broker *broker = user_data;
+    enforce_session_binding(broker);
+    enforce_management_binding(broker);
     return G_SOURCE_CONTINUE;
 }
 
@@ -1220,6 +1555,8 @@ main(int argc, char **argv)
     broker.client_fd = -1;
     broker.control_fd = -1;
     broker.uid = (uid_t)-1;
+    broker.management_uid = (uid_t)-1;
+    broker.vnc_port = port;
 
     GError *error = NULL;
     broker.bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
@@ -1250,7 +1587,12 @@ main(int argc, char **argv)
         .begin_auth = broker_web_begin_auth,
         .validate_websocket_token = broker_web_validate_websocket_token,
         .bind_websocket = broker_web_bind_websocket,
-        .websocket_closed = broker_websocket_closed
+        .websocket_closed = broker_websocket_closed,
+        .begin_management_auth = broker_management_begin_auth,
+        .validate_management_token = broker_validate_management_token,
+        .management_logout = broker_management_logout,
+        .get_management_info = broker_get_management_info,
+        .disconnect_viewer = broker_management_disconnect_viewer
     };
 
     int web_rc = web_server_start(&broker.web_server,
@@ -1321,6 +1663,22 @@ main(int argc, char **argv)
     if (broker.session_removed_subscription)
         g_dbus_connection_signal_unsubscribe(broker.bus,
                                               broker.session_removed_subscription);
+
+    if (broker.management_auth) {
+        ManagementAuth *auth = broker.management_auth;
+        broker.management_auth = NULL;
+        if (auth->source) {
+            guint source = auth->source;
+            auth->source = 0;
+            g_source_remove(source);
+        }
+        if (auth->control_fd >= 0)
+            close(auth->control_fd);
+        if (auth->completion)
+            auth->completion(WEB_SERVER_AUTH_ERROR, NULL, auth->completion_data);
+        g_free(auth);
+    }
+    broker_invalidate_management_token(&broker);
 
     if (broker_session_owns_slot(&broker)) {
         if (broker.client_fd >= 0)
