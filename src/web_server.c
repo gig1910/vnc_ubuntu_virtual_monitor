@@ -471,10 +471,29 @@ static const char management_js[] =
     "  startDashboard();\n"
     "})();\n";
 
+static gboolean
+csp_host_valid(const char *host)
+{
+    if (!host || !*host || strlen(host) > 255)
+        return FALSE;
+
+    for (const unsigned char *p = (const unsigned char *)host; *p; p++) {
+        if (g_ascii_isalnum(*p) ||
+            *p == '.' || *p == '-' || *p == ':' ||
+            *p == '[' || *p == ']')
+            continue;
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 static void
 set_security_headers(SoupServerMessage *msg)
 {
     SoupMessageHeaders *headers = soup_server_message_get_response_headers(msg);
+    SoupMessageHeaders *request_headers = soup_server_message_get_request_headers(msg);
+    const char *host = soup_message_headers_get_one(request_headers, "Host");
 
     soup_message_headers_replace(headers, "Cache-Control", "no-store");
     soup_message_headers_replace(headers, "Pragma", "no-cache");
@@ -483,11 +502,29 @@ set_security_headers(SoupServerMessage *msg)
     soup_message_headers_replace(headers, "X-Frame-Options", "DENY");
     soup_message_headers_replace(headers, "Cross-Origin-Resource-Policy", "same-origin");
     soup_message_headers_replace(headers, "Cross-Origin-Opener-Policy", "same-origin");
-    soup_message_headers_replace(headers,
-                                 "Content-Security-Policy",
-                                 "default-src 'none'; style-src 'unsafe-inline'; "
-                                 "script-src 'self'; connect-src 'self'; "
-                                 "form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+
+    char *csp = NULL;
+    if (csp_host_valid(host)) {
+        /*
+         * Safari/WebKit versions used by legacy iOS do not reliably treat
+         * connect-src 'self' as permitting a same-host WSS endpoint. Keep
+         * 'self' for XHR and explicitly permit only this request Host for WSS.
+         */
+        csp = g_strdup_printf(
+            "default-src 'none'; style-src 'unsafe-inline'; "
+            "script-src 'self'; connect-src 'self' wss://%s; "
+            "form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            host);
+    } else {
+        csp = g_strdup(
+            "default-src 'none'; style-src 'unsafe-inline'; "
+            "script-src 'self'; connect-src 'self'; "
+            "form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+    }
+
+    soup_message_headers_replace(headers, "Content-Security-Policy", csp);
+    g_free(csp);
+
     soup_message_headers_replace(headers,
                                  "Permissions-Policy",
                                  "camera=(), microphone=(), geolocation=(), usb=()");

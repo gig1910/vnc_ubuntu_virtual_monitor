@@ -265,3 +265,12 @@ configuration:
 
 Polling live session state never rewrites the settings form. Unsaved settings
 therefore remain stable while viewer/seat status continues to update.
+
+
+## Legacy Safari WSS Content Security Policy
+
+The HTTPS response policy keeps `connect-src 'self'` for same-origin HTTP
+requests and also emits an explicit `wss://<request-host>` source. Older
+WebKit/Safari releases do not consistently treat `'self'` as matching the
+equivalent WSS endpoint. The Host value is syntax-validated before it is
+included, and the policy does not permit scheme-wide `wss:` access.

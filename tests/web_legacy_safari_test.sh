@@ -131,3 +131,15 @@ grep -Fq 'origin mismatch' "$source_file"
 grep -Fq 'authentication cookie %s or token invalid' "$source_file"
 grep -Fq 'WebSocket upgrade preflight accepted' "$source_file"
 echo "legacy WebSocket diagnostics: OK"
+
+# Legacy WebKit does not consistently treat connect-src 'self' as allowing
+# wss:// on the same host. The response CSP must therefore add only the
+# request Host as an explicit WSS source, not a scheme-wide wildcard.
+grep -Fq "connect-src 'self' wss://%s" "$source_file"
+grep -Fq 'csp_host_valid(host)' "$source_file"
+if grep -Fq "connect-src 'self' wss:;" "$source_file" ||
+   grep -Fq 'connect-src *' "$source_file"; then
+    echo "Legacy Safari CSP regression: WSS source became overly broad" >&2
+    exit 1
+fi
+echo "legacy Safari same-host WSS CSP: OK"
