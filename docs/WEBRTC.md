@@ -224,3 +224,27 @@ WebRTC handoff intentionally carries no browser fd because HTTPS/WSS terminates 
 ## Compatibility rule
 
 Until the WebRTC path reaches the same security and lifecycle validation level as VNC, the existing VNC behaviour remains the reference implementation and must not be weakened to accommodate the browser transport.
+
+
+## Editable browser settings
+
+The authenticated management dashboard edits the browser edge config at:
+
+```text
+/etc/vnc-monitor/web.ini
+```
+
+The page can change the HTTPS port, certificate-chain path and private-key path.
+The VNC/general config at `/etc/vnc-monitor/config.ini` remains outside this
+write path.
+
+On Save, the broker validates the new port, checks that it does not collide
+with the VNC listener, loads the certificate/private-key pair, and then replaces
+`web.ini` using GLib's consistent durable atomic file update. Only after the
+successful HTTP response does the broker exit with status 75; systemd restarts
+it through the existing `Restart=on-failure` policy.
+
+The broker systemd sandbox permits atomic replacement under
+`/etc/vnc-monitor`, while explicitly retaining read-only mounts for
+`/etc/vnc-monitor/config.ini` and the recommended
+`/etc/vnc-monitor/tls` subtree.
