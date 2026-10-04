@@ -58,6 +58,15 @@ jobs:
             -o build/broker_protocol_test
           ./build/broker_protocol_test
 
+      - name: Legacy browser JPEG encoder regression
+        run: |
+          mkdir -p build
+          cc -Iinclude -O2 -Wall -Wextra \
+            tests/web_jpeg_test.c src/web_jpeg.c \
+            -ljpeg \
+            -o build/web_jpeg_test
+          ./build/web_jpeg_test
+
       - name: TLS certificate/private-key regression
         run: |
           mkdir -p build/tls-test

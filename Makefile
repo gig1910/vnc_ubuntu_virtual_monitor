@@ -24,6 +24,7 @@ SOURCES := \
 	src/ra2.c \
 	src/ra2_identity.c \
 	src/frame_bridge.c \
+	src/web_jpeg.c \
 	src/frame_diff.c \
 	src/adaptive_rfb_transport.c \
 	src/pipeline_stats.c \
