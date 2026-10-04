@@ -171,8 +171,12 @@ grep -Fxq 'InaccessiblePaths=/home /root' "$broker_unit" || {
     echo "Packaged broker does not keep /home and /root inaccessible" >&2
     exit 1
 }
-grep -Fxq 'ReadOnlyPaths=/run/user' "$broker_unit" || {
-    echo "Packaged broker cannot safely see /run/user agent sockets" >&2
+grep -Fxq 'ReadWritePaths=/etc/vnc-monitor' "$broker_unit" || {
+    echo "Packaged broker cannot atomically update /etc/vnc-monitor/web.ini" >&2
+    exit 1
+}
+grep -Fxq 'ReadOnlyPaths=/run/user /etc/vnc-monitor/config.ini -/etc/vnc-monitor/tls' "$broker_unit" || {
+    echo "Packaged broker filesystem policy does not protect config.ini/TLS while exposing /run/user" >&2
     exit 1
 }
 

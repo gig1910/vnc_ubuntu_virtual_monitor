@@ -6,8 +6,14 @@
 
 #include <gio/gio.h>
 #include <libsoup/soup.h>
+#include <errno.h>
+#include <limits.h>
+#include <netinet/in.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #define WEB_DEFAULT_PORT       8443
 #define WEB_DEFAULT_CERT_FILE  "/etc/vnc-monitor/tls/server.crt"
@@ -19,12 +25,14 @@
 #define WEB_CONTROL_HEADER          "X-VNC-Monitor-Control"
 #define WEB_WS_TOKEN_DATA_KEY       "vnc-monitor-ws-token"
 #define WEB_MANAGEMENT_MAX_AGE_S    600
+#define WEB_SETTINGS_BODY_MAX       8192
 
 struct WebServer {
     SoupServer *server;
     GTlsCertificate *certificate;
     SoupWebsocketConnection *websocket;
     guint port;
+    char *config_file;
     char *certificate_file;
     char *private_key_file;
     WebServerHooks hooks;
@@ -603,6 +611,72 @@ json_escape(const char *value)
     return g_string_free(out, FALSE);
 }
 
+static gboolean
+settings_path_valid(const char *path)
+{
+    if (!path || !*path || !g_path_is_absolute(path) || strlen(path) >= PATH_MAX)
+        return FALSE;
+
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f)
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+static gboolean
+settings_port_available(guint port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return FALSE;
+
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    gboolean ok = bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    close(fd);
+    return ok;
+}
+
+static gboolean
+save_web_settings(WebServer *web,
+                  guint port,
+                  const char *certificate_file,
+                  const char *private_key_file,
+                  GError **error)
+{
+    char *contents = g_strdup_printf(
+        "# VNC Monitor browser/WebRTC broker configuration\n"
+        "# Managed through /manage or edited manually.\n\n"
+        "[web]\n"
+        "enabled=true\n"
+        "port=%u\n"
+        "certificate=%s\n"
+        "private-key=%s\n",
+        port,
+        certificate_file,
+        private_key_file);
+
+    gboolean ok = g_file_set_contents_full(
+        web->config_file,
+        contents,
+        -1,
+        G_FILE_SET_CONTENTS_CONSISTENT | G_FILE_SET_CONTENTS_DURABLE,
+        0644,
+        error);
+
+    g_free(contents);
+    return ok;
+}
+
 static void
 root_handler(SoupServer *server,
              SoupServerMessage *msg,
@@ -1057,6 +1131,7 @@ management_status_handler(SoupServer *server,
     char *viewer_session = json_escape(info.viewer_session_id);
     char *active_user = json_escape(info.active_user);
     char *active_session = json_escape(info.active_session_id);
+    char *config_file = json_escape(web->config_file);
     char *certificate = json_escape(web->certificate_file);
     char *private_key = json_escape(web->private_key_file);
 
@@ -1064,7 +1139,7 @@ management_status_handler(SoupServer *server,
         "{\"viewer\":{\"active\":%s,\"state\":\"%s\",\"transport\":\"%s\","
         "\"peer\":\"%s\",\"user\":\"%s\",\"session\":\"%s\",\"websocket\":%s},"
         "\"active\":{\"available\":%s,\"uid\":%u,\"user\":\"%s\",\"session\":\"%s\"},"
-        "\"settings\":{\"httpsPort\":%u,\"vncPort\":%d,\"certificate\":\"%s\",\"privateKey\":\"%s\"}}\n",
+        "\"settings\":{\"httpsPort\":%u,\"vncPort\":%d,\"configFile\":\"%s\",\"certificate\":\"%s\",\"privateKey\":\"%s\"}}\n",
         info.viewer_active ? "true" : "false",
         viewer_state,
         viewer_transport,
@@ -1078,6 +1153,7 @@ management_status_handler(SoupServer *server,
         active_session,
         web->port,
         info.vnc_port,
+        config_file,
         certificate,
         private_key);
 
@@ -1085,7 +1161,171 @@ management_status_handler(SoupServer *server,
 
     g_free(body); g_free(viewer_state); g_free(viewer_transport); g_free(viewer_peer);
     g_free(viewer_user); g_free(viewer_session); g_free(active_user); g_free(active_session);
-    g_free(certificate); g_free(private_key);
+    g_free(config_file); g_free(certificate); g_free(private_key);
+}
+
+static void
+management_settings_handler(SoupServer *server,
+                            SoupServerMessage *msg,
+                            const char *path,
+                            GHashTable *query,
+                            gpointer user_data)
+{
+    (void)server; (void)path; (void)query;
+    WebServer *web = user_data;
+
+    if (strcmp(soup_server_message_get_method(msg), "POST") != 0) {
+        respond_method_not_allowed(msg, "POST");
+        return;
+    }
+
+    if (!management_control_request_allowed(msg) ||
+        !management_request_authenticated(web, msg)) {
+        respond_text(msg,
+                     SOUP_STATUS_UNAUTHORIZED,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"authentication-required\"}\n");
+        return;
+    }
+
+    SoupMessageHeaders *headers = soup_server_message_get_request_headers(msg);
+    const char *content_type = soup_message_headers_get_content_type(headers, NULL);
+    SoupMessageBody *request_body = soup_server_message_get_request_body(msg);
+
+    if (!content_type ||
+        g_ascii_strcasecmp(content_type, "application/x-www-form-urlencoded") != 0 ||
+        !request_body || !request_body->data ||
+        request_body->length <= 0 || request_body->length > WEB_SETTINGS_BODY_MAX) {
+        respond_text(msg,
+                     SOUP_STATUS_BAD_REQUEST,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"invalid-request\"}\n");
+        return;
+    }
+
+    GHashTable *form = soup_form_decode((const char *)request_body->data);
+    if (!form) {
+        respond_text(msg,
+                     SOUP_STATUS_BAD_REQUEST,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"invalid-request\"}\n");
+        return;
+    }
+
+    const char *port_text = g_hash_table_lookup(form, "port");
+    const char *certificate_file = g_hash_table_lookup(form, "certificate");
+    const char *private_key_file = g_hash_table_lookup(form, "privateKey");
+
+    char *end = NULL;
+    errno = 0;
+    long parsed_port = port_text ? strtol(port_text, &end, 10) : 0;
+
+    if (!port_text || errno != 0 || !end || *end != '\0' ||
+        parsed_port < 1 || parsed_port > 65535 ||
+        !settings_path_valid(certificate_file) ||
+        !settings_path_valid(private_key_file)) {
+        g_hash_table_destroy(form);
+        soup_message_body_truncate(request_body);
+        respond_text(msg,
+                     SOUP_STATUS_BAD_REQUEST,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"invalid-settings\"}\n");
+        return;
+    }
+
+    WebServerManagementInfo info;
+    if (!web->hooks.get_management_info ||
+        web->hooks.get_management_info(&info, web->user_data) < 0) {
+        g_hash_table_destroy(form);
+        soup_message_body_truncate(request_body);
+        respond_text(msg,
+                     SOUP_STATUS_INTERNAL_SERVER_ERROR,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"status-unavailable\"}\n");
+        return;
+    }
+
+    guint port = (guint)parsed_port;
+
+    if ((int)port == info.vnc_port) {
+        g_hash_table_destroy(form);
+        soup_message_body_truncate(request_body);
+        respond_text(msg,
+                     SOUP_STATUS_CONFLICT,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"port-conflicts-with-vnc\"}\n");
+        return;
+    }
+
+    if (port != web->port && !settings_port_available(port)) {
+        g_hash_table_destroy(form);
+        soup_message_body_truncate(request_body);
+        respond_text(msg,
+                     SOUP_STATUS_CONFLICT,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"https-port-unavailable\"}\n");
+        return;
+    }
+
+    GError *error = NULL;
+    GTlsCertificate *candidate =
+        g_tls_certificate_new_from_files(certificate_file,
+                                         private_key_file,
+                                         &error);
+    if (!candidate) {
+        LOG_INFO("Management rejected TLS settings: %s",
+                 error ? error->message : "certificate/key load failed");
+        g_clear_error(&error);
+        g_hash_table_destroy(form);
+        soup_message_body_truncate(request_body);
+        respond_text(msg,
+                     SOUP_STATUS_BAD_REQUEST,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"certificate-or-key-invalid\"}\n");
+        return;
+    }
+    g_object_unref(candidate);
+
+    error = NULL;
+    if (!save_web_settings(web,
+                           port,
+                           certificate_file,
+                           private_key_file,
+                           &error)) {
+        LOG_ERROR("Management could not save %s: %s",
+                  web->config_file,
+                  error ? error->message : "unknown error");
+        g_clear_error(&error);
+        g_hash_table_destroy(form);
+        soup_message_body_truncate(request_body);
+        respond_text(msg,
+                     SOUP_STATUS_INTERNAL_SERVER_ERROR,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"save-failed\"}\n");
+        return;
+    }
+
+    LOG_INFO("Management atomically updated %s: HTTPS port=%u certificate=%s private-key=%s",
+             web->config_file,
+             port,
+             certificate_file,
+             private_key_file);
+
+    char *response = g_strdup_printf(
+        "{\"ok\":true,\"restart\":true,\"port\":%u}\n",
+        port);
+
+    g_hash_table_destroy(form);
+    soup_message_body_truncate(request_body);
+
+    respond_text(msg,
+                 SOUP_STATUS_OK,
+                 "application/json; charset=utf-8",
+                 response);
+    g_free(response);
+
+    if (web->hooks.request_restart)
+        web->hooks.request_restart(web->user_data);
 }
 
 static void
@@ -1415,6 +1655,7 @@ web_server_start(WebServer **out,
 
     WebServer *web = g_new0(WebServer, 1);
     web->port = port;
+    web->config_file = g_strdup(config_file);
     web->certificate_file = g_strdup(cert_file);
     web->private_key_file = g_strdup(key_file);
     web->user_data = user_data;
@@ -1433,6 +1674,7 @@ web_server_start(WebServer **out,
         g_clear_error(&error);
         g_free(cert_file);
         g_free(key_file);
+        g_free(web->config_file);
         g_free(web->certificate_file);
         g_free(web->private_key_file);
         g_free(web);
@@ -1446,6 +1688,7 @@ web_server_start(WebServer **out,
     if (!web->server) {
         LOG_ERROR("Could not create broker HTTPS server");
         g_object_unref(web->certificate);
+        g_free(web->config_file);
         g_free(web->certificate_file);
         g_free(web->private_key_file);
         g_free(web);
@@ -1457,6 +1700,7 @@ web_server_start(WebServer **out,
     soup_server_add_handler(web->server, "/api/login", login_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/manage/login", management_login_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/manage/status", management_status_handler, web, NULL);
+    soup_server_add_handler(web->server, "/api/manage/settings", management_settings_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/manage/disconnect", management_disconnect_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/manage/logout", management_logout_handler, web, NULL);
     soup_server_add_handler(web->server, "/client.js", client_js_handler, web, NULL);
@@ -1485,6 +1729,7 @@ web_server_start(WebServer **out,
         soup_server_disconnect(web->server);
         g_object_unref(web->server);
         g_object_unref(web->certificate);
+        g_free(web->config_file);
         g_free(web->certificate_file);
         g_free(web->private_key_file);
         g_free(web);
@@ -1534,6 +1779,7 @@ web_server_stop(WebServer *web)
     if (web->certificate)
         g_object_unref(web->certificate);
 
+    g_free(web->config_file);
     g_free(web->certificate_file);
     g_free(web->private_key_file);
     g_free(web);

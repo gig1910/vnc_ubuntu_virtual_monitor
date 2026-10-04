@@ -83,6 +83,7 @@ typedef struct {
     int (*get_management_info)(WebServerManagementInfo *info,
                                gpointer user_data);
     gboolean (*disconnect_viewer)(gpointer user_data);
+    void (*request_restart)(gpointer user_data);
 } WebServerHooks;
 
 /*

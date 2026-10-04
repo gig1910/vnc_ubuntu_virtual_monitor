@@ -69,6 +69,8 @@ typedef struct {
     guint periodic_source;
     guint sigterm_source;
     guint sigint_source;
+    guint restart_source;
+    gboolean restart_requested;
 
     WebServer *web_server;
 
@@ -1495,6 +1497,32 @@ periodic_binding_check(gpointer user_data)
 }
 
 static gboolean
+broker_restart_cb(gpointer user_data)
+{
+    Broker *broker = user_data;
+    broker->restart_source = 0;
+    broker->restart_requested = TRUE;
+
+    LOG_INFO("Broker restart requested after management settings update");
+
+    if (broker_session_owns_slot(broker))
+        revoke_session(broker, "management settings restart");
+
+    g_main_loop_quit(broker->loop);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+broker_request_restart(gpointer user_data)
+{
+    Broker *broker = user_data;
+    if (!broker || broker->restart_source)
+        return;
+
+    broker->restart_source = g_timeout_add(1000, broker_restart_cb, broker);
+}
+
+static gboolean
 shutdown_cb(gpointer user_data)
 {
     Broker *broker = user_data;
@@ -1592,7 +1620,8 @@ main(int argc, char **argv)
         .validate_management_token = broker_validate_management_token,
         .management_logout = broker_management_logout,
         .get_management_info = broker_get_management_info,
-        .disconnect_viewer = broker_management_disconnect_viewer
+        .disconnect_viewer = broker_management_disconnect_viewer,
+        .request_restart = broker_request_restart
     };
 
     int web_rc = web_server_start(&broker.web_server,
@@ -1656,6 +1685,8 @@ main(int argc, char **argv)
         g_source_remove(broker.sigterm_source);
     if (broker.sigint_source)
         g_source_remove(broker.sigint_source);
+    if (broker.restart_source)
+        g_source_remove(broker.restart_source);
 
     if (broker.seat_subscription)
         g_dbus_connection_signal_unsubscribe(broker.bus,
@@ -1698,5 +1729,5 @@ main(int argc, char **argv)
     g_object_unref(broker.bus);
 
     LOG_INFO("VNC Monitor broker stopped");
-    return 0;
+    return broker.restart_requested ? 75 : 0;
 }

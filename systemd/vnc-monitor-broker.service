@@ -28,7 +28,8 @@ ProtectSystem=strict
 # Keep actual home directories inaccessible and expose /run/user read-only.
 ProtectHome=no
 InaccessiblePaths=/home /root
-ReadOnlyPaths=/run/user
+ReadWritePaths=/etc/vnc-monitor
+ReadOnlyPaths=/run/user /etc/vnc-monitor/config.ini -/etc/vnc-monitor/tls
 
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
