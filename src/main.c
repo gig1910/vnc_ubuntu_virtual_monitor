@@ -9,6 +9,7 @@
 #include "runtime_config.h"
 #include "shutdown_signal.h"
 #include "frame_bridge.h"
+#include "web_jpeg.h"
 #include "real_monitor.h"
 #include "monitor_layout_cache.h"
 #include "pipeline_stats.h"
@@ -28,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -55,7 +57,21 @@ typedef struct {
     VncBrokerHandoff handoff;
     const RuntimeConfig *cfg;
     ClientSlot *slot;
+    FrameBridge *frames;
+    PipelineStats *pipeline_stats;
 } WebControlTask;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    int stop;
+    int control_fd;
+    int width;
+    int height;
+    FrameBridge *frames;
+} WebMediaSender;
+
+#define WEB_LEGACY_JPEG_QUALITY 65
+#define WEB_LEGACY_MAX_FPS       8
 
 static int
 create_public_listener(const RuntimeConfig *cfg)
@@ -579,9 +595,162 @@ release_web_control_slot(ClientSlot *slot, int control_fd)
     pthread_mutex_unlock(&slot->mutex);
 }
 
-static void
-wait_for_web_control_end(int control_fd)
+static int
+web_media_sender_should_stop(WebMediaSender *sender)
 {
+    int stop = 1;
+    if (!sender)
+        return stop;
+
+    pthread_mutex_lock(&sender->mutex);
+    stop = sender->stop;
+    pthread_mutex_unlock(&sender->mutex);
+    return stop;
+}
+
+static void
+web_media_sender_stop(WebMediaSender *sender)
+{
+    if (!sender)
+        return;
+
+    pthread_mutex_lock(&sender->mutex);
+    sender->stop = 1;
+    pthread_mutex_unlock(&sender->mutex);
+    frame_bridge_wake_all(sender->frames);
+}
+
+static uint64_t
+web_monotonic_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+
+    return (uint64_t)ts.tv_sec * 1000u +
+           (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void *
+web_media_sender_worker(void *opaque)
+{
+    WebMediaSender *sender = opaque;
+    size_t frame_bytes =
+        (size_t)sender->width * (size_t)sender->height * 4u;
+    uint8_t *pixels = malloc(frame_bytes);
+    if (!pixels) {
+        (void)shutdown(sender->control_fd, SHUT_RDWR);
+        return NULL;
+    }
+
+    uint64_t last_sequence = 0;
+    uint64_t last_sent_ms = 0;
+    uint64_t frames_sent = 0;
+    const uint64_t min_interval_ms = 1000u / WEB_LEGACY_MAX_FPS;
+
+    while (!web_media_sender_should_stop(sender)) {
+        uint64_t current_sequence = 0;
+        int wait_rc = frame_bridge_wait_for_change(sender->frames,
+                                                   last_sequence,
+                                                   100,
+                                                   &current_sequence);
+        if (wait_rc < 0)
+            break;
+        if (wait_rc == 0)
+            continue;
+
+        uint64_t now_ms = web_monotonic_ms();
+        if (last_sent_ms != 0 && now_ms > last_sent_ms &&
+            now_ms - last_sent_ms < min_interval_ms) {
+            uint64_t remaining = min_interval_ms - (now_ms - last_sent_ms);
+            struct timespec delay = {
+                .tv_sec = (time_t)(remaining / 1000u),
+                .tv_nsec = (long)(remaining % 1000u) * 1000000L
+            };
+
+            while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {
+                if (web_media_sender_should_stop(sender))
+                    break;
+            }
+        }
+
+        if (web_media_sender_should_stop(sender))
+            break;
+
+        if (frame_bridge_consume(sender->frames,
+                                 pixels,
+                                 &last_sequence) <= 0)
+            continue;
+
+        uint8_t *jpeg = NULL;
+        size_t jpeg_size = 0;
+        if (web_jpeg_encode_bgrx(pixels,
+                                 sender->width,
+                                 sender->height,
+                                 WEB_LEGACY_JPEG_QUALITY,
+                                 &jpeg,
+                                 &jpeg_size) < 0) {
+            LOG_ERROR("Legacy browser JPEG encode failed");
+            (void)shutdown(sender->control_fd, SHUT_RDWR);
+            break;
+        }
+
+        if (jpeg_size > VNC_BROKER_VIDEO_FRAME_MAX ||
+            vnc_broker_send_video_frame(sender->control_fd,
+                                        (uint32_t)sender->width,
+                                        (uint32_t)sender->height,
+                                        jpeg,
+                                        jpeg_size) < 0) {
+            LOG_INFO("Legacy browser media channel ended while sending frame: %s",
+                     strerror(errno));
+            free(jpeg);
+            (void)shutdown(sender->control_fd, SHUT_RDWR);
+            break;
+        }
+
+        free(jpeg);
+        last_sent_ms = web_monotonic_ms();
+        frames_sent++;
+
+        if (frames_sent == 1) {
+            LOG_INFO("Legacy browser media sent first JPEG frame: %dx%d quality=%d",
+                     sender->width,
+                     sender->height,
+                     WEB_LEGACY_JPEG_QUALITY);
+        }
+    }
+
+    free(pixels);
+    return NULL;
+}
+
+static int
+serve_web_media_lifetime(int control_fd,
+                         const RuntimeConfig *cfg,
+                         FrameBridge *frames,
+                         PipelineStats *pipeline_stats)
+{
+    RealMonitor real;
+    memset(&real, 0, sizeof(real));
+
+    WebMediaSender sender;
+    memset(&sender, 0, sizeof(sender));
+    sender.control_fd = control_fd;
+    sender.width = cfg->width;
+    sender.height = cfg->height;
+    sender.frames = frames;
+
+    int mutex_rc = pthread_mutex_init(&sender.mutex, NULL);
+    if (mutex_rc != 0) {
+        errno = mutex_rc;
+        return -1;
+    }
+
+    pthread_t sender_thread;
+    int sender_started = 0;
+    int media_started = 0;
+    int result = 0;
+
     for (;;) {
         uint8_t payload[VNC_BROKER_CONTROL_PAYLOAD_MAX];
         VncBrokerControlType type;
@@ -591,18 +760,69 @@ wait_for_web_control_end(int control_fd)
                                     &type,
                                     payload,
                                     sizeof(payload),
-                                    &payload_len) < 0) {
-            return;
-        }
+                                    &payload_len) < 0)
+            break;
 
         if (type == VNC_BROKER_CONTROL_REVOKE && payload_len == 0)
-            return;
+            break;
 
-        /* SDP/ICE will be handled here when the WebRTC media backend lands. */
-        LOG_DEBUG("Ignoring unsupported WebRTC control message type=%u payload=%zu",
-                  (unsigned)type,
-                  payload_len);
+        if (type == VNC_BROKER_CONTROL_MEDIA_START && payload_len == 0) {
+            if (media_started) {
+                LOG_ERROR("Duplicate legacy browser media start request");
+                result = -1;
+                break;
+            }
+
+            if (frame_bridge_resize(frames, cfg->width, cfg->height) < 0) {
+                LOG_ERROR("Could not prepare browser FrameBridge at %dx%d",
+                          cfg->width, cfg->height);
+                result = -1;
+                break;
+            }
+
+            frame_bridge_clear(frames);
+
+            if (real_monitor_start(&real, cfg, frames, pipeline_stats) < 0) {
+                LOG_ERROR("Could not start legacy browser virtual monitor/capture");
+                result = -1;
+                break;
+            }
+
+            media_started = 1;
+
+            int rc = pthread_create(&sender_thread, NULL,
+                                    web_media_sender_worker, &sender);
+            if (rc != 0) {
+                LOG_ERROR("Could not start legacy browser media sender: %s",
+                          strerror(rc));
+                result = -1;
+                break;
+            }
+
+            sender_started = 1;
+            LOG_INFO("Legacy browser WSS/JPEG media active: %dx%d max-fps=%d quality=%d",
+                     cfg->width, cfg->height,
+                     WEB_LEGACY_MAX_FPS, WEB_LEGACY_JPEG_QUALITY);
+            continue;
+        }
+
+        /* SDP/ICE will be handled here when the modern WebRTC backend lands. */
+        LOG_DEBUG("Ignoring unsupported browser control message type=%u payload=%zu",
+                  (unsigned)type, payload_len);
     }
+
+    if (sender_started) {
+        web_media_sender_stop(&sender);
+        (void)pthread_join(sender_thread, NULL);
+    }
+
+    if (media_started) {
+        real_monitor_stop(&real);
+        frame_bridge_clear(frames);
+    }
+
+    pthread_mutex_destroy(&sender.mutex);
+    return result;
 }
 
 static VncBrokerWebAuthResult
@@ -664,7 +884,9 @@ static void
 serve_web_control_session(int control_fd,
                           const VncBrokerHandoff *handoff,
                           const RuntimeConfig *cfg,
-                          ClientSlot *slot)
+                          ClientSlot *slot,
+                          FrameBridge *frames,
+                          PipelineStats *pipeline_stats)
 {
     VncBrokerWebAuthResult result =
         authenticate_control_request(control_fd, cfg, "WebRTC");
@@ -682,10 +904,14 @@ serve_web_control_session(int control_fd,
 
         /*
          * Keep the exact broker control channel as the lifetime authority.
-         * Closing/revoking it tears down this local slot immediately. The
-         * future webrtcbin session will live inside this same interval.
+         * Media starts only after the authenticated WSS bind. Closing or
+         * revoking this channel tears down capture and the virtual monitor.
          */
-        wait_for_web_control_end(control_fd);
+        if (serve_web_media_lifetime(control_fd,
+                                     cfg,
+                                     frames,
+                                     pipeline_stats) < 0)
+            LOG_INFO("Legacy browser media session ended with an internal error");
     }
 
     /*
@@ -707,7 +933,9 @@ web_control_worker(void *opaque)
     serve_web_control_session(task->control_fd,
                               &task->handoff,
                               task->cfg,
-                              task->slot);
+                              task->slot,
+                              task->frames,
+                              task->pipeline_stats);
     free(task);
     return NULL;
 }
@@ -716,7 +944,9 @@ static int
 start_web_control_worker(ClientSlot *slot,
                          int control_fd,
                          const VncBrokerHandoff *handoff,
-                         const RuntimeConfig *cfg)
+                         const RuntimeConfig *cfg,
+                         FrameBridge *frames,
+                         PipelineStats *pipeline_stats)
 {
     int claim_rc = claim_web_control_slot(slot,
                                           control_fd,
@@ -738,6 +968,8 @@ start_web_control_worker(ClientSlot *slot,
     task->handoff = *handoff;
     task->cfg = cfg;
     task->slot = slot;
+    task->frames = frames;
+    task->pipeline_stats = pipeline_stats;
 
     pthread_attr_t attr;
     int rc = pthread_attr_init(&attr);
@@ -1034,7 +1266,9 @@ handle_broker_handoff(int control_fd,
         int web_rc = start_web_control_worker(client_slot,
                                               control_fd,
                                               &handoff,
-                                              cfg);
+                                              cfg,
+                                              frames,
+                                              pipeline_stats);
         if (web_rc != 0) {
             if (web_rc > 0)
                 LOG_INFO("Agent rejected WebRTC handoff for %s: local session already busy",

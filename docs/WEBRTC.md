@@ -158,9 +158,32 @@ over the already authenticated/bound Unix control channel:
 
 The broker does not forward media frames.
 
+## Legacy Safari media path
+
+Safari on iOS 9 predates browser WebRTC support, so the browser transport has a
+separate compatibility path. It keeps the authenticated WSS connection and the
+same broker-owned global viewer slot, but carries bounded JPEG video frames.
+
+After the one-time WSS bind succeeds:
+
+1. the broker sends `MEDIA_START` over the bound private
+   `SOCK_SEQPACKET` control channel;
+2. the active user's agent creates the normal Mutter virtual monitor and
+   PipeWire capture;
+3. the agent consumes the existing BGRx `FrameBridge`, encodes JPEG at a
+   conservative legacy-browser rate, and sends each frame as
+   `BEGIN / CHUNK* / END` control records;
+4. the root broker reassembles at most one bounded frame and forwards the
+   complete JPEG as one binary WSS message;
+5. the ES5 client displays it through Blob/ObjectURL.
+
+The control channel remains the authoritative lifetime guard. WSS close, seat
+switch, logout, broker loss, or management disconnect stops capture and removes
+the virtual monitor. Browser input remains disabled.
+
 ## WebRTC media path
 
-The agent builds a GStreamer pipeline around the existing capture source and `webrtcbin`.
+For modern browsers, the agent will build a GStreamer pipeline around the existing capture source and `webrtcbin`.
 
 Initial video target:
 
@@ -216,10 +239,11 @@ WebRTC handoff intentionally carries no browser fd because HTTPS/WSS terminates 
 3. Add broker HTTPS listener, TLS configuration and static login page. **Done.**
 4. Add broker-agent PAM request/reply messages and the asynchronous broker-backed web authentication lifecycle. **Done.**
 5. Add opaque session token, authenticated WSS binding and explicit broker `REVOKE` lifecycle. **Done.**
-6. Add SDP/ICE message forwarding and the agent-side `webrtcbin` session skeleton.
-7. Feed the existing Mutter/PipeWire virtual monitor into the WebRTC video pipeline.
-8. Add browser display sizing/orientation negotiation.
-9. Exercise VNC-vs-WebRTC mutual exclusion and all existing Fast User Switching / GDM revocation scenarios.
+6. Add authenticated legacy Safari WSS/JPEG video on the existing browser slot. **Done.**
+7. Add SDP/ICE message forwarding and the agent-side `webrtcbin` session skeleton for modern browsers.
+8. Feed the existing Mutter/PipeWire virtual monitor into the WebRTC video pipeline.
+9. Add browser display sizing/orientation negotiation.
+10. Exercise VNC-vs-browser mutual exclusion and all existing Fast User Switching / GDM revocation scenarios.
 
 ## Compatibility rule
 

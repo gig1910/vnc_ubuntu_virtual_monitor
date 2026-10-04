@@ -69,6 +69,14 @@ grep -Fq 'WebSocket constructor failed' <<<"$client_js"
 grep -Fq 'network/TLS handshake failed' <<<"$client_js"
 grep -Fq 'encodeURIComponent' <<<"$client_js"
 grep -Fq 'function (' <<<"$client_js"
+grep -Fq "socket.binaryType = 'blob'" <<<"$client_js"
+grep -Fq 'createObjectURL' <<<"$client_js"
+grep -Fq 'video-frame' <<<"$login_page"
+grep -Fq 'Live browser video.' <<<"$client_js"
+if grep -Fq 'WebRTC video is being prepared' <<<"$client_js"; then
+    echo "Legacy Safari regression: browser UI still claims WebRTC media" >&2
+    exit 1
+fi
 
 # Do not rely on layout engines absent from Safari on iOS 9.
 if grep -Eq 'display:[[:space:]]*(grid|flex)|color-scheme|var\(' <<<"$login_page" ||
