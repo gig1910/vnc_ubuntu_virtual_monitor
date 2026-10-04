@@ -85,6 +85,13 @@ typedef struct {
     gboolean websocket_attached;
     char web_token[WEB_SESSION_TOKEN_HEX_LEN + 1];
 
+    GByteArray *web_frame_buffer;
+    guint32 web_frame_expected;
+    guint32 web_frame_width;
+    guint32 web_frame_height;
+    gboolean web_frame_active;
+    guint64 web_frames_forwarded;
+
     ManagementAuth *management_auth;
     gboolean management_token_valid;
     char management_token[WEB_SESSION_TOKEN_HEX_LEN + 1];
@@ -588,6 +595,92 @@ query_active_session(Broker *broker, ActiveSession *out)
 }
 
 static void
+broker_reset_web_frame(Broker *broker)
+{
+    if (!broker)
+        return;
+
+    if (broker->web_frame_buffer) {
+        g_byte_array_unref(broker->web_frame_buffer);
+        broker->web_frame_buffer = NULL;
+    }
+
+    broker->web_frame_expected = 0;
+    broker->web_frame_width = 0;
+    broker->web_frame_height = 0;
+    broker->web_frame_active = FALSE;
+}
+
+static gboolean
+broker_handle_web_media_packet(Broker *broker,
+                               VncBrokerControlType type,
+                               const guint8 *payload,
+                               size_t payload_len)
+{
+    if (!broker)
+        return FALSE;
+
+    if (type == VNC_BROKER_CONTROL_VIDEO_FRAME_BEGIN) {
+        uint32_t width = 0, height = 0, jpeg_size = 0;
+        if (broker->web_frame_active ||
+            vnc_broker_parse_video_frame_begin(payload, payload_len,
+                                               &width, &height,
+                                               &jpeg_size) < 0 ||
+            width > 8192 || height > 8192)
+            return FALSE;
+
+        broker->web_frame_buffer = g_byte_array_sized_new(jpeg_size);
+        broker->web_frame_expected = jpeg_size;
+        broker->web_frame_width = width;
+        broker->web_frame_height = height;
+        broker->web_frame_active = TRUE;
+        return TRUE;
+    }
+
+    if (type == VNC_BROKER_CONTROL_VIDEO_FRAME_CHUNK) {
+        if (!broker->web_frame_active || !broker->web_frame_buffer ||
+            payload_len == 0 ||
+            payload_len > broker->web_frame_expected ||
+            broker->web_frame_buffer->len >
+                broker->web_frame_expected - payload_len)
+            return FALSE;
+
+        g_byte_array_append(broker->web_frame_buffer,
+                            payload, (guint)payload_len);
+        return TRUE;
+    }
+
+    if (type == VNC_BROKER_CONTROL_VIDEO_FRAME_END) {
+        if (!broker->web_frame_active || !broker->web_frame_buffer ||
+            payload_len != 0 ||
+            broker->web_frame_buffer->len != broker->web_frame_expected)
+            return FALSE;
+
+        gboolean sent = broker->websocket_attached &&
+                        broker->web_server &&
+                        web_server_send_binary(
+                            broker->web_server,
+                            broker->web_frame_buffer->data,
+                            broker->web_frame_buffer->len);
+        if (!sent)
+            return FALSE;
+
+        broker->web_frames_forwarded++;
+        if (broker->web_frames_forwarded == 1) {
+            LOG_INFO("Broker forwarded first legacy browser video frame: %ux%u JPEG=%u bytes",
+                     broker->web_frame_width,
+                     broker->web_frame_height,
+                     broker->web_frame_expected);
+        }
+
+        broker_reset_web_frame(broker);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void
 clear_session(Broker *broker, int reset)
 {
     if (!broker)
@@ -600,6 +693,7 @@ clear_session(Broker *broker, int reset)
     }
 
     broker_invalidate_web_token(broker);
+    broker_reset_web_frame(broker);
 
     if (broker->web_attach_timeout_source) {
         guint source = broker->web_attach_timeout_source;
@@ -788,7 +882,7 @@ web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
         VncBrokerWebAuthResult auth_result = VNC_BROKER_WEB_AUTH_ERROR;
 
         if (vnc_broker_recv_web_auth_result(fd, &auth_result) < 0) {
-            LOG_INFO("Broker could not read WebRTC authentication result for session %s",
+            LOG_INFO("Broker could not read browser authentication result for session %s",
                      broker->session_id);
             broker->control_source = 0;
             broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
@@ -797,12 +891,8 @@ web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
         }
 
         if (auth_result == VNC_BROKER_WEB_AUTH_OK) {
-            /*
-             * Successful Web authentication must leave the exact bound agent
-             * control channel alive for the later signalling/media lifetime.
-             */
             if ((condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) != 0) {
-                LOG_INFO("Broker lost WebRTC agent channel after successful authentication for session %s",
+                LOG_INFO("Broker lost browser agent channel after successful authentication for session %s",
                          broker->session_id);
                 broker->control_source = 0;
                 broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
@@ -811,7 +901,7 @@ web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
             }
 
             if (generate_web_token(broker) < 0) {
-                LOG_ERROR("Broker could not generate WebRTC session token: %s",
+                LOG_ERROR("Broker could not generate browser session token: %s",
                           strerror(errno));
                 broker->control_source = 0;
                 broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
@@ -822,14 +912,11 @@ web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
             broker_session_set_state(broker, BROKER_SESSION_ACTIVE_WEBRTC);
             broker->web_attach_timeout_source =
                 g_timeout_add(WEB_ATTACH_TIMEOUT_MS,
-                              web_attach_timeout_cb,
-                              broker);
+                              web_attach_timeout_cb, broker);
 
-            LOG_INFO("Broker authenticated WebRTC peer=%s uid=%lu session=%s; attach window=%dms",
-                     broker->peer_addr,
-                     (unsigned long)broker->uid,
-                     broker->session_id,
-                     WEB_ATTACH_TIMEOUT_MS);
+            LOG_INFO("Broker authenticated browser peer=%s uid=%lu session=%s; attach window=%dms",
+                     broker->peer_addr, (unsigned long)broker->uid,
+                     broker->session_id, WEB_ATTACH_TIMEOUT_MS);
             broker_complete_web_auth(broker, WEB_SERVER_AUTH_OK);
             return G_SOURCE_CONTINUE;
         }
@@ -839,12 +926,30 @@ web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
             broker_complete_web_auth(broker, WEB_SERVER_AUTH_DENIED);
         else
             broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
-
         clear_session(broker, 1);
         return G_SOURCE_REMOVE;
     }
 
-    LOG_INFO("Broker lost WebRTC agent control channel for session %s",
+    if (broker->state == BROKER_SESSION_ACTIVE_WEBRTC &&
+        (condition & G_IO_IN) != 0) {
+        guint8 payload[VNC_BROKER_CONTROL_PAYLOAD_MAX];
+        VncBrokerControlType type;
+        size_t payload_len = 0;
+
+        if (vnc_broker_recv_control(fd, &type, payload,
+                                    sizeof(payload), &payload_len) == 0 &&
+            broker_handle_web_media_packet(broker, type,
+                                           payload, payload_len))
+            return G_SOURCE_CONTINUE;
+
+        LOG_INFO("Broker rejected malformed browser media control packet for session %s",
+                 broker->session_id);
+        broker->control_source = 0;
+        clear_session(broker, 1);
+        return G_SOURCE_REMOVE;
+    }
+
+    LOG_INFO("Broker lost browser agent control channel for session %s",
              broker->session_id);
     broker->control_source = 0;
     if (broker->state == BROKER_SESSION_AUTH_WEB)
@@ -872,8 +977,18 @@ broker_web_bind_websocket(const char *token, gpointer user_data)
     if (!broker_web_validate_websocket_token(token, user_data))
         return FALSE;
 
+    if (broker->control_fd < 0 ||
+        vnc_broker_send_control(broker->control_fd,
+                                VNC_BROKER_CONTROL_MEDIA_START,
+                                NULL, 0) < 0) {
+        LOG_INFO("Broker could not start legacy browser media for session %s: %s",
+                 broker->session_id, strerror(errno));
+        return FALSE;
+    }
+
     broker->websocket_attached = TRUE;
     broker_invalidate_web_token(broker);
+    broker_reset_web_frame(broker);
 
     if (broker->web_attach_timeout_source) {
         guint source = broker->web_attach_timeout_source;

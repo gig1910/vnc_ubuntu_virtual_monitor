@@ -100,6 +100,11 @@ int web_server_start(WebServer **out,
                      const WebServerHooks *hooks,
                      gpointer user_data);
 
+/* Send one complete encoded video frame over the authenticated browser WSS. */
+gboolean web_server_send_binary(WebServer *server,
+                                const guint8 *data,
+                                gsize length);
+
 /* Close the bound browser signalling socket, if one exists. */
 void web_server_close_websocket(WebServer *server);
 

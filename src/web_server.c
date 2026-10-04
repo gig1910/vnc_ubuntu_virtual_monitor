@@ -79,6 +79,8 @@ static const char login_page[] =
     "    .status-ok .status-dot { background: #3a965a; }\n"
     "    .status-error { border-color: #e4c1c1; background: #fff5f5; color: #8a4040; }\n"
     "    .status-error .status-dot { background: #c25757; }\n"
+    "    .viewer { display: none; width: 100%; max-width: 1024px; margin: 18px auto 0; overflow: hidden; border: 1px solid #273542; border-radius: 10px; background: #111820; -webkit-box-shadow: 0 12px 32px rgba(28,45,61,.16); box-shadow: 0 12px 32px rgba(28,45,61,.16); }\n"
+    "    .viewer img { display: block; width: 100%; height: auto; margin: 0; }\n"
     "    .hint { margin: 18px 0 0; color: #84919c; font-size: 12px; line-height: 18px; text-align: center; }\n"
     "    @media only screen and (max-width: 600px) {\n"
     "      .page { padding: 16px 10px; }\n"
@@ -111,6 +113,7 @@ static const char login_page[] =
     "        <p class=\"hint\">Authentication is bound to the currently active local GNOME Wayland user.<br><a href=\"/manage\">Manage sessions and settings</a></p>\n"
     "      </div>\n"
     "    </div>\n"
+    "    <div id=\"viewer\" class=\"viewer\"><img id=\"video-frame\" alt=\"Remote desktop\"></div>\n"
     "  </div>\n"
     "</body>\n"
     "</html>\n";
@@ -125,6 +128,10 @@ static const char client_js[] =
     "  var disconnectButton = document.getElementById('disconnect');\n"
     "  var statusBox = document.getElementById('status');\n"
     "  var statusText = document.getElementById('status-text');\n"
+    "  var viewer = document.getElementById('viewer');\n"
+    "  var videoFrame = document.getElementById('video-frame');\n"
+    "  var objectUrlApi = window.URL || window.webkitURL;\n"
+    "  var frameUrl = null;\n"
     "  var socket = null;\n"
     "  var socketOpened = false;\n"
     "\n"
@@ -154,6 +161,37 @@ static const char client_js[] =
     "    catch (e) { return {}; }\n"
     "  }\n"
     "\n"
+    "  function clearVideoFrame() {\n"
+    "    if (frameUrl && objectUrlApi) {\n"
+    "      try { objectUrlApi.revokeObjectURL(frameUrl); } catch (e) {}\n"
+    "    }\n"
+    "    frameUrl = null;\n"
+    "    videoFrame.removeAttribute('src');\n"
+    "    viewer.style.display = 'none';\n"
+    "  }\n"
+    "\n"
+    "  function renderVideoFrame(data) {\n"
+    "    if (!objectUrlApi || !window.Blob) {\n"
+    "      setStatus('This browser cannot display the binary video stream.', 'error');\n"
+    "      return;\n"
+    "    }\n"
+    "    var blob = data;\n"
+    "    if (!(data instanceof Blob)) {\n"
+    "      try { blob = new Blob([data], { type: 'image/jpeg' }); }\n"
+    "      catch (e) {\n"
+    "        setStatus('Could not decode the browser video frame.', 'error');\n"
+    "        return;\n"
+    "      }\n"
+    "    }\n"
+    "    if (frameUrl) {\n"
+    "      try { objectUrlApi.revokeObjectURL(frameUrl); } catch (e) {}\n"
+    "    }\n"
+    "    frameUrl = objectUrlApi.createObjectURL(blob);\n"
+    "    videoFrame.src = frameUrl;\n"
+    "    viewer.style.display = 'block';\n"
+    "    setStatus('Connected. Live browser video.', 'ok');\n"
+    "  }\n"
+    "\n"
     "  function closeSocket() {\n"
     "    if (!socket) return;\n"
     "    try { socket.close(); } catch (e) {}\n"
@@ -177,6 +215,8 @@ static const char client_js[] =
     "      return;\n"
     "    }\n"
     "\n"
+    "    try { socket.binaryType = 'blob'; } catch (e) {}\n"
+    "\n"
     "    socket.onopen = function () {\n"
     "      socketOpened = true;\n"
     "      setFormBusy(false);\n"
@@ -185,9 +225,13 @@ static const char client_js[] =
     "    };\n"
     "\n"
     "    socket.onmessage = function (event) {\n"
+    "      if (typeof event.data !== 'string') {\n"
+    "        renderVideoFrame(event.data);\n"
+    "        return;\n"
+    "      }\n"
     "      var message = safeJson(event.data);\n"
     "      if (message.type === 'ready') {\n"
-    "        setStatus('Connected. WebRTC video is being prepared.', 'ok');\n"
+    "        setStatus('Connected. Waiting for the first video frame...', 'ok');\n"
     "      } else if (message.error) {\n"
     "        setStatus('Server message: ' + message.error, 'error');\n"
     "      }\n"
@@ -203,6 +247,7 @@ static const char client_js[] =
     "      socketOpened = false;\n"
     "      setFormBusy(false);\n"
     "      setConnected(false);\n"
+    "      clearVideoFrame();\n"
     "      if (wasOpen) setStatus('Disconnected. Ready to connect again.', '');\n"
     "      else if (statusBox.className.indexOf('status-error') < 0) setStatus('Connection closed before it was ready.', 'error');\n"
     "    };\n"
@@ -262,7 +307,7 @@ static const char client_js[] =
     "    closeSocket();\n"
     "  };\n"
     "\n"
-    "  if (!window.WebSocket || !window.XMLHttpRequest || !window.JSON) {\n"
+    "  if (!window.WebSocket || !window.XMLHttpRequest || !window.JSON || !window.Blob || !objectUrlApi) {\n"
     "    connectButton.disabled = true;\n"
     "    setStatus('This browser is too old for the secure browser connection.', 'error');\n"
     "  }\n"
@@ -1693,8 +1738,8 @@ websocket_handler(SoupServer *server,
 
     soup_websocket_connection_send_text(
         connection,
-        "{\"type\":\"ready\",\"state\":\"active-webrtc\","
-        "\"signalling\":\"pending\"}");
+        "{\"type\":\"ready\",\"state\":\"active-browser\","
+        "\"media\":\"wss-jpeg\"}");
 
     LOG_INFO("Broker authenticated WebSocket attached");
 }
@@ -1932,9 +1977,23 @@ web_server_start(WebServer **out,
     }
 
     *out = web;
-    LOG_INFO("Broker HTTPS/WSS authentication ready on TCP/%u (IPv4; SDP/ICE not enabled yet)",
+    LOG_INFO("Broker HTTPS/WSS authentication and legacy JPEG media ready on TCP/%u (IPv4; SDP/ICE not enabled yet)",
              web->port);
     return 1;
+}
+
+gboolean
+web_server_send_binary(WebServer *web,
+                       const guint8 *data,
+                       gsize length)
+{
+    if (!web || !web->websocket || !data || length == 0 ||
+        soup_websocket_connection_get_state(web->websocket) !=
+            SOUP_WEBSOCKET_STATE_OPEN)
+        return FALSE;
+
+    soup_websocket_connection_send_binary(web->websocket, data, length);
+    return TRUE;
 }
 
 void
