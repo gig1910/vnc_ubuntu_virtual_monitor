@@ -20,7 +20,8 @@ typedef enum {
     /* Protocol-v1 handoffs from beta.3 used zero in this former reserved field. */
     VNC_BROKER_TRANSPORT_LEGACY_VNC = 0,
     VNC_BROKER_TRANSPORT_VNC = 1,
-    VNC_BROKER_TRANSPORT_WEBRTC = 2
+    VNC_BROKER_TRANSPORT_WEBRTC = 2,
+    VNC_BROKER_TRANSPORT_MANAGEMENT = 3
 } VncBrokerTransport;
 
 typedef struct {
@@ -77,6 +78,8 @@ int vnc_broker_send_handoff(int control_fd,
  * VNC transports one accepted TCP fd with SCM_RIGHTS.
  * WebRTC is broker-terminated HTTPS/WSS and therefore carries no browser fd;
  * its signalling/control messages use the broker-agent control channel.
+ * Management authentication is a short-lived control-plane handoff with no
+ * browser fd and never claims the machine-wide viewer slot.
  *
  * The current fixed-size protocol remains wire-version 1. The old reserved
  * uint16_t is reused as this discriminator; value 0 remains legacy VNC so

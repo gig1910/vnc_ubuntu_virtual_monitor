@@ -60,6 +60,8 @@ vnc_broker_transport_name(uint16_t transport)
             return "vnc";
         case VNC_BROKER_TRANSPORT_WEBRTC:
             return "webrtc";
+        case VNC_BROKER_TRANSPORT_MANAGEMENT:
+            return "management";
         default:
             return "unknown";
     }
@@ -74,13 +76,15 @@ vnc_broker_send_handoff_transport(int control_fd,
                                   const char *peer_addr)
 {
     if (transport != VNC_BROKER_TRANSPORT_VNC &&
-        transport != VNC_BROKER_TRANSPORT_WEBRTC) {
+        transport != VNC_BROKER_TRANSPORT_WEBRTC &&
+        transport != VNC_BROKER_TRANSPORT_MANAGEMENT) {
         errno = EINVAL;
         return -1;
     }
 
     if ((transport == VNC_BROKER_TRANSPORT_VNC && client_fd < 0) ||
-        (transport == VNC_BROKER_TRANSPORT_WEBRTC && client_fd >= 0)) {
+        ((transport == VNC_BROKER_TRANSPORT_WEBRTC ||
+          transport == VNC_BROKER_TRANSPORT_MANAGEMENT) && client_fd >= 0)) {
         errno = EINVAL;
         return -1;
     }
@@ -204,13 +208,16 @@ vnc_broker_recv_handoff(int control_fd,
         handoff->version != VNC_BROKER_PROTOCOL_VERSION ||
         handoff->session_id[0] == '\0' ||
         (!transport_is_vnc(handoff->transport) &&
-         handoff->transport != VNC_BROKER_TRANSPORT_WEBRTC)) {
+         handoff->transport != VNC_BROKER_TRANSPORT_WEBRTC &&
+         handoff->transport != VNC_BROKER_TRANSPORT_MANAGEMENT)) {
         errno = EPROTO;
         goto fail;
     }
 
     if ((transport_is_vnc(handoff->transport) && received_fd < 0) ||
-        (handoff->transport == VNC_BROKER_TRANSPORT_WEBRTC && received_fd >= 0)) {
+        ((handoff->transport == VNC_BROKER_TRANSPORT_WEBRTC ||
+          handoff->transport == VNC_BROKER_TRANSPORT_MANAGEMENT) &&
+         received_fd >= 0)) {
         errno = EPROTO;
         goto fail;
     }

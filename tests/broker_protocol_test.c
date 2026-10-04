@@ -249,6 +249,30 @@ test_webrtc_handoff_has_no_fd(void)
 }
 
 static void
+test_management_handoff_has_no_fd(void)
+{
+    int control[2] = {-1, -1};
+    CHECK(make_seqpacket_pair(control) == 0);
+
+    CHECK(vnc_broker_send_handoff_transport(control[0],
+                                             VNC_BROKER_TRANSPORT_MANAGEMENT,
+                                             -1,
+                                             1000,
+                                             "c10",
+                                             "203.0.113.31") == 0);
+
+    VncBrokerHandoff handoff;
+    int received_fd = 123;
+    CHECK(vnc_broker_recv_handoff(control[1], &received_fd, &handoff) == 0);
+    CHECK(received_fd == -1);
+    CHECK(handoff.transport == VNC_BROKER_TRANSPORT_MANAGEMENT);
+    CHECK(strcmp(vnc_broker_transport_name(handoff.transport), "management") == 0);
+
+    close(control[0]);
+    close(control[1]);
+}
+
+static void
 test_transport_fd_contract(void)
 {
     int control[2] = {-1, -1};
@@ -268,6 +292,15 @@ test_transport_fd_contract(void)
     errno = 0;
     CHECK(vnc_broker_send_handoff_transport(control[0],
                                              VNC_BROKER_TRANSPORT_WEBRTC,
+                                             data[0],
+                                             1000,
+                                             "c1",
+                                             "peer") < 0);
+    CHECK(errno == EINVAL);
+
+    errno = 0;
+    CHECK(vnc_broker_send_handoff_transport(control[0],
+                                             VNC_BROKER_TRANSPORT_MANAGEMENT,
                                              data[0],
                                              1000,
                                              "c1",
@@ -355,6 +388,7 @@ main(void)
     test_legacy_broker_to_new_agent();
     test_new_broker_to_legacy_agent();
     test_webrtc_handoff_has_no_fd();
+    test_management_handoff_has_no_fd();
     test_transport_fd_contract();
     test_web_auth_control_roundtrip();
     test_web_auth_limits();

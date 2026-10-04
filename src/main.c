@@ -50,6 +50,13 @@ typedef struct {
     int client_fd;
 } ControlGuard;
 
+typedef struct {
+    int control_fd;
+    VncBrokerHandoff handoff;
+    const RuntimeConfig *cfg;
+    ClientSlot *slot;
+} WebControlTask;
+
 static int
 create_public_listener(const RuntimeConfig *cfg)
 {
@@ -598,65 +605,44 @@ wait_for_web_control_end(int control_fd)
     }
 }
 
-static void
-serve_web_control_session(int control_fd,
-                          const VncBrokerHandoff *handoff,
-                          const RuntimeConfig *cfg,
-                          ClientSlot *slot)
+static VncBrokerWebAuthResult
+authenticate_control_request(int control_fd,
+                             const RuntimeConfig *cfg,
+                             const char *purpose)
 {
-    int claim_rc = claim_web_control_slot(slot,
-                                          control_fd,
-                                          handoff->peer_addr,
-                                          handoff->session_id,
-                                          cfg);
-    if (claim_rc != 0) {
-        if (claim_rc > 0) {
-            LOG_INFO("Agent rejected WebRTC handoff for %s: local session already busy",
-                     handoff->peer_addr);
-        }
-        else {
-            LOG_ERROR("Agent could not register WebRTC control channel for %s",
-                      handoff->peer_addr);
-        }
-        (void)vnc_broker_send_web_auth_result(control_fd,
-                                              VNC_BROKER_WEB_AUTH_ERROR);
-        (void)shutdown(control_fd, SHUT_RDWR);
-        close(control_fd);
-        return;
-    }
-
     VncBrokerWebAuthRequest request;
     memset(&request, 0, sizeof(request));
 
     VncBrokerWebAuthResult result = VNC_BROKER_WEB_AUTH_ERROR;
 
     if (vnc_broker_recv_web_auth_request(control_fd, &request) < 0) {
-        LOG_ERROR("Invalid WebRTC authentication request from broker: %s",
+        LOG_ERROR("Invalid %s authentication request from broker: %s",
+                  purpose,
                   strerror(errno));
-        goto respond;
+        goto done;
     }
 
     struct passwd *pw = getpwuid(getuid());
     if (!pw || !pw->pw_name) {
-        LOG_ERROR("Cannot resolve local Unix account for WebRTC authentication");
-        goto respond;
+        LOG_ERROR("Cannot resolve local Unix account for %s authentication",
+                  purpose);
+        goto done;
     }
 
-    /*
-     * Duplicate the auth-helper's SO_PEERCRED account binding at the agent
-     * boundary so a mismatched browser username is rejected before PAM.
-     */
     if (strcmp(request.username, pw->pw_name) != 0) {
-        LOG_INFO("Rejected WebRTC authentication for user '%s': agent belongs to '%s'",
+        LOG_INFO("Rejected %s authentication for user '%s': agent belongs to '%s'",
+                 purpose,
                  request.username,
                  pw->pw_name);
         result = VNC_BROKER_WEB_AUTH_DENIED;
-        goto respond;
+        goto done;
     }
 
     if (io_deadline_set_ms(cfg->client_handshake_timeout_ms) < 0) {
-        LOG_ERROR("Could not start WebRTC PAM deadline: %s", strerror(errno));
-        goto respond;
+        LOG_ERROR("Could not start %s PAM deadline: %s",
+                  purpose,
+                  strerror(errno));
+        goto done;
     }
 
     int auth_rc = auth_client_check(cfg->auth_socket,
@@ -668,17 +654,26 @@ serve_web_control_session(int control_fd,
         result = VNC_BROKER_WEB_AUTH_OK;
     else if (auth_rc == 0)
         result = VNC_BROKER_WEB_AUTH_DENIED;
-    else
-        result = VNC_BROKER_WEB_AUTH_ERROR;
 
-respond:
+done:
+    vnc_broker_web_auth_request_clear(&request);
+    return result;
+}
+
+static void
+serve_web_control_session(int control_fd,
+                          const VncBrokerHandoff *handoff,
+                          const RuntimeConfig *cfg,
+                          ClientSlot *slot)
+{
+    VncBrokerWebAuthResult result =
+        authenticate_control_request(control_fd, cfg, "WebRTC");
+
     if (vnc_broker_send_web_auth_result(control_fd, result) < 0) {
         LOG_DEBUG("Could not return WebRTC authentication result to broker: %s",
                   strerror(errno));
         result = VNC_BROKER_WEB_AUTH_ERROR;
     }
-
-    vnc_broker_web_auth_request_clear(&request);
 
     if (result == VNC_BROKER_WEB_AUTH_OK) {
         LOG_INFO("WebRTC browser authenticated for active user; peer=%s logind-session=%s",
@@ -703,6 +698,98 @@ respond:
     release_web_control_slot(slot, control_fd);
 
     LOG_INFO("WebRTC control session ended: %s", handoff->peer_addr);
+}
+
+static void *
+web_control_worker(void *opaque)
+{
+    WebControlTask *task = opaque;
+    serve_web_control_session(task->control_fd,
+                              &task->handoff,
+                              task->cfg,
+                              task->slot);
+    free(task);
+    return NULL;
+}
+
+static int
+start_web_control_worker(ClientSlot *slot,
+                         int control_fd,
+                         const VncBrokerHandoff *handoff,
+                         const RuntimeConfig *cfg)
+{
+    int claim_rc = claim_web_control_slot(slot,
+                                          control_fd,
+                                          handoff->peer_addr,
+                                          handoff->session_id,
+                                          cfg);
+    if (claim_rc != 0)
+        return claim_rc;
+
+    WebControlTask *task = calloc(1, sizeof(*task));
+    if (!task) {
+        shutdown_signal_unregister_fd(control_fd);
+        release_web_control_slot(slot, control_fd);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    task->control_fd = control_fd;
+    task->handoff = *handoff;
+    task->cfg = cfg;
+    task->slot = slot;
+
+    pthread_attr_t attr;
+    int rc = pthread_attr_init(&attr);
+    if (rc != 0) {
+        free(task);
+        shutdown_signal_unregister_fd(control_fd);
+        release_web_control_slot(slot, control_fd);
+        errno = rc;
+        return -1;
+    }
+
+    rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    if (rc == 0)
+        rc = pthread_create(&thread, &attr, web_control_worker, task);
+    pthread_attr_destroy(&attr);
+
+    if (rc != 0) {
+        free(task);
+        shutdown_signal_unregister_fd(control_fd);
+        release_web_control_slot(slot, control_fd);
+        errno = rc;
+        return -1;
+    }
+
+    return 0;
+}
+
+static void
+serve_management_auth_session(int control_fd,
+                               const VncBrokerHandoff *handoff,
+                               const RuntimeConfig *cfg)
+{
+    if (shutdown_signal_register_fd(control_fd) < 0)
+        LOG_DEBUG("Could not register management control channel for shutdown");
+
+    VncBrokerWebAuthResult result =
+        authenticate_control_request(control_fd, cfg, "management");
+
+    if (vnc_broker_send_web_auth_result(control_fd, result) < 0)
+        LOG_DEBUG("Could not return management authentication result to broker: %s",
+                  strerror(errno));
+
+    if (result == VNC_BROKER_WEB_AUTH_OK) {
+        LOG_INFO("Management browser authenticated for active user; peer=%s logind-session=%s",
+                 handoff->peer_addr,
+                 handoff->session_id);
+    }
+
+    shutdown_signal_unregister_fd(control_fd);
+    (void)shutdown(control_fd, SHUT_RDWR);
+    close(control_fd);
 }
 
 static void
@@ -926,7 +1013,8 @@ handle_broker_handoff(int control_fd,
         LOG_ERROR("Rejected broker handoff for uid=%lu; agent uid=%lu",
                   (unsigned long)handoff.uid,
                   (unsigned long)getuid());
-        if (handoff.transport == VNC_BROKER_TRANSPORT_WEBRTC)
+        if (handoff.transport == VNC_BROKER_TRANSPORT_WEBRTC ||
+            handoff.transport == VNC_BROKER_TRANSPORT_MANAGEMENT)
             (void)vnc_broker_send_web_auth_result(control_fd,
                                                   VNC_BROKER_WEB_AUTH_ERROR);
         else
@@ -943,8 +1031,37 @@ handle_broker_handoff(int control_fd,
             return -1;
         }
 
-        /* This synchronous handler owns/closes control_fd before returning. */
-        serve_web_control_session(control_fd, &handoff, cfg, client_slot);
+        int web_rc = start_web_control_worker(client_slot,
+                                              control_fd,
+                                              &handoff,
+                                              cfg);
+        if (web_rc != 0) {
+            if (web_rc > 0)
+                LOG_INFO("Agent rejected WebRTC handoff for %s: local session already busy",
+                         handoff.peer_addr);
+            else
+                LOG_ERROR("Agent could not start WebRTC control worker for %s: %s",
+                          handoff.peer_addr,
+                          strerror(errno));
+
+            (void)vnc_broker_send_web_auth_result(control_fd,
+                                                  VNC_BROKER_WEB_AUTH_ERROR);
+            return -1;
+        }
+
+        /* Detached WebRTC worker owns control_fd. */
+        return 1;
+    }
+
+    if (handoff.transport == VNC_BROKER_TRANSPORT_MANAGEMENT) {
+        if (client_fd >= 0) {
+            LOG_ERROR("Rejected management handoff carrying an unexpected client fd");
+            close(client_fd);
+            return -1;
+        }
+
+        /* Short-lived PAM control request owns/closes control_fd here. */
+        serve_management_auth_session(control_fd, &handoff, cfg);
         return 2;
     }
 
@@ -1045,7 +1162,7 @@ run_agent_listener(const RuntimeConfig *cfg,
 
         if (handoff_rc <= 0)
             close(control_fd);
-        /* handoff_rc==1: VNC worker owns fd; ==2: Web handler already closed it. */
+        /* handoff_rc==1: VNC/WebRTC worker owns fd; ==2: management handler closed it. */
     }
 
     shutdown_signal_unregister_fd(listen_fd);
