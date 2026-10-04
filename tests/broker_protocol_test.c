@@ -286,7 +286,7 @@ test_web_auth_control_roundtrip(void)
     int control[2] = {-1, -1};
     CHECK(make_seqpacket_pair(control) == 0);
 
-    CHECK(vnc_broker_send_web_auth_request(control[0], "test-user", "s3cret") == 0);
+    CHECK(vnc_broker_send_web_auth_request(control[0], "test-user", "protocol-fixture") == 0);
 
     VncBrokerWebAuthRequest request;
     CHECK(vnc_broker_recv_web_auth_request(control[1], &request) == 0);
@@ -295,9 +295,9 @@ test_web_auth_control_roundtrip(void)
     if (request.username)
         CHECK(strcmp(request.username, "test-user") == 0);
     if (request.password)
-        CHECK(strcmp(request.password, "s3cret") == 0);
+        CHECK(strcmp(request.password, "protocol-fixture") == 0);
     CHECK(request.username_len == strlen("test-user"));
-    CHECK(request.password_len == strlen("s3cret"));
+    CHECK(request.password_len == strlen("protocol-fixture"));
     vnc_broker_web_auth_request_clear(&request);
 
     CHECK(vnc_broker_send_web_auth_result(control[1], VNC_BROKER_WEB_AUTH_OK) == 0);
