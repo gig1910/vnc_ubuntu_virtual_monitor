@@ -151,3 +151,6 @@ if grep -Fq "connect-src 'self' wss:;" "$source_file" ||
     exit 1
 fi
 echo "legacy Safari same-host WSS CSP: OK"
+
+grep -Fq "img-src blob:" "$source_file"
+echo "legacy Safari Blob image CSP: OK"

@@ -557,13 +557,14 @@ set_security_headers(SoupServerMessage *msg)
          */
         csp = g_strdup_printf(
             "default-src 'none'; style-src 'unsafe-inline'; "
-            "script-src 'self'; connect-src 'self' wss://%s; "
+            "script-src 'self'; img-src blob:; "
+            "connect-src 'self' wss://%s; "
             "form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
             host);
     } else {
         csp = g_strdup(
             "default-src 'none'; style-src 'unsafe-inline'; "
-            "script-src 'self'; connect-src 'self'; "
+            "script-src 'self'; img-src blob:; connect-src 'self'; "
             "form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     }
 
