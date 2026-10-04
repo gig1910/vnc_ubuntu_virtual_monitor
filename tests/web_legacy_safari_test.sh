@@ -81,8 +81,11 @@ grep -Fq -- '-webkit-text-size-adjust: 100%' <<<"$login_page"
 grep -Fq 'XMLHttpRequest' <<<"$management_js"
 grep -Fq 'X-VNC-Monitor-Control' <<<"$management_js"
 grep -Fq '/api/manage/settings' <<<"$management_js"
+grep -Fq 'function pollStatus()' <<<"$management_js"
+grep -Fq 'function loadSettings(force)' <<<"$management_js"
+grep -Fq 'function renderStatus(data)' <<<"$management_js"
+grep -Fq 'function renderSettings(data)' <<<"$management_js"
 grep -Fq 'settingsDirty' <<<"$management_js"
-grep -Fq 'if (!settingsDirty)' <<<"$management_js"
 grep -Fq 'Discard unsaved server settings' <<<"$management_js"
 grep -Fq 'settings-port' <<<"$management_page"
 grep -Fq 'settings-cert' <<<"$management_page"
@@ -90,3 +93,33 @@ grep -Fq 'settings-key' <<<"$management_page"
 grep -Fq 'max-width: 760px' <<<"$management_page"
 
 echo "legacy Safari frontend: OK"
+
+status_handler="$(
+    awk '
+        /management_status_handler\(SoupServer \*server,/ { capture = 1 }
+        /management_settings_handler\(SoupServer \*server,/ { exit }
+        capture { print }
+    ' "$source_file"
+)"
+
+settings_handler="$(
+    awk '
+        /management_settings_handler\(SoupServer \*server,/ { capture = 1 }
+        /management_disconnect_handler\(SoupServer \*server,/ { exit }
+        capture { print }
+    ' "$source_file"
+)"
+
+if grep -Fq '"settings"' <<<"$status_handler" ||
+   grep -Fq 'certificate_file' <<<"$status_handler" ||
+   grep -Fq 'private_key_file' <<<"$status_handler"; then
+    echo "Management status endpoint leaked static settings back into polling" >&2
+    exit 1
+fi
+
+grep -Fq 'strcmp(method, "GET") == 0' <<<"$settings_handler"
+grep -Fq 'configFile' <<<"$settings_handler"
+grep -Fq 'certificate' <<<"$settings_handler"
+grep -Fq 'privateKey' <<<"$settings_handler"
+
+echo "management status/settings separation: OK"

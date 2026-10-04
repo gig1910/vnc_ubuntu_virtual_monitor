@@ -248,3 +248,20 @@ The broker systemd sandbox permits atomic replacement under
 `/etc/vnc-monitor`, while explicitly retaining read-only mounts for
 `/etc/vnc-monitor/config.ini` and the recommended
 `/etc/vnc-monitor/tls` subtree.
+
+
+## Management status versus settings lifecycle
+
+The management page intentionally separates live state from persistent
+configuration:
+
+- `GET /api/manage/status` contains only viewer/session and active-desktop
+  state and is polled every two seconds.
+- `GET /api/manage/settings` reads the persistent browser-edge settings only
+  when the dashboard is opened or the operator explicitly chooses
+  **Reload settings**.
+- `POST /api/manage/settings` validates and atomically persists a settings
+  update.
+
+Polling live session state never rewrites the settings form. Unsaved settings
+therefore remain stable while viewer/seat status continues to update.

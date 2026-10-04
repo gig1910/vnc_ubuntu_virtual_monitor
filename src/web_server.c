@@ -351,7 +351,7 @@ static const char management_page[] =
     "          <button id=\"settings-save\" type=\"submit\">Save settings and restart broker</button>\n"
     "        </form>\n"
     "        <div id=\"settings-message\" class=\"notice\">The certificate/key pair and new port are validated before saving. The update is atomic. Restarting the broker disconnects any active viewer session.</div>\n"
-    "        <div class=\"actions\"><button id=\"refresh\" class=\"secondary\" type=\"button\">Refresh</button><button id=\"manage-logout\" class=\"secondary\" type=\"button\">Log out</button></div>\n"
+    "        <div class=\"actions\"><button id=\"reload-settings\" class=\"secondary\" type=\"button\">Reload settings</button><button id=\"manage-logout\" class=\"secondary\" type=\"button\">Log out</button></div>\n"
     "      </div></div>\n"
     "    </div>\n"
     "  </div></div>\n"
@@ -396,24 +396,35 @@ static const char management_js[] =
     "    xhr.onerror = function () { callback(0, {}); };\n"
     "    xhr.send(body || null);\n"
     "  }\n"
-    "  function render(data) {\n"
+    "  function renderStatus(data) {\n"
     "    showDashboard();\n"
     "    text('v-state', data.viewer.state); text('v-transport', data.viewer.transport); text('v-peer', data.viewer.peer); text('v-user', data.viewer.user); text('v-session', data.viewer.session); text('v-ws', data.viewer.websocket ? 'attached' : 'not attached');\n"
     "    text('a-user', data.active.user); text('a-uid', data.active.available ? data.active.uid : '-'); text('a-session', data.active.session);\n"
-    "    text('s-endpoint', window.location.host); text('s-config', data.settings.configFile); text('s-vnc', data.settings.vncPort);\n"
-    "    if (!settingsDirty) {\n"
-    "      settingsPort.value = String(data.settings.httpsPort); settingsCert.value = data.settings.certificate || ''; settingsKey.value = data.settings.privateKey || ''; settingsLoaded = true;\n"
-    "    }\n"
     "    document.getElementById('disconnect-viewer').disabled = !data.viewer.active;\n"
     "  }\n"
-    "  function refresh() {\n"
+    "  function renderSettings(data) {\n"
+    "    text('s-endpoint', window.location.host); text('s-config', data.settings.configFile); text('s-vnc', data.settings.vncPort);\n"
+    "    settingsPort.value = String(data.settings.httpsPort); settingsCert.value = data.settings.certificate || ''; settingsKey.value = data.settings.privateKey || '';\n"
+    "    settingsDirty = false; settingsLoaded = true;\n"
+    "    settingsMessage.className = 'notice'; settingsMessage.innerHTML = 'The certificate/key pair and new port are validated before saving. The update is atomic. Restarting the broker disconnects any active viewer session.';\n"
+    "  }\n"
+    "  function pollStatus() {\n"
     "    stopTimer();\n"
     "    request('GET', '/api/manage/status', null, function (status, data) {\n"
-    "      if (status === 200) { render(data); timer = window.setTimeout(refresh, 2000); }\n"
+    "      if (status === 200) { renderStatus(data); timer = window.setTimeout(pollStatus, 2000); }\n"
     "      else if (status === 401) showLogin('Management session is locked.', false);\n"
     "      else showLogin('Could not read management status.', true);\n"
     "    });\n"
     "  }\n"
+    "  function loadSettings(force) {\n"
+    "    if (settingsDirty && !force) return;\n"
+    "    request('GET', '/api/manage/settings', null, function (status, data) {\n"
+    "      if (status === 200) renderSettings(data);\n"
+    "      else if (status === 401) showLogin('Management session is locked.', false);\n"
+    "      else { settingsMessage.className = 'notice error'; settingsMessage.innerHTML = 'Could not load server settings.'; }\n"
+    "    });\n"
+    "  }\n"
+    "  function startDashboard() { loadSettings(false); pollStatus(); }\n"
     "  form.onsubmit = function (event) {\n"
     "    if (event && event.preventDefault) event.preventDefault();\n"
     "    var u = user.value || ''; var p = password.value || '';\n"
@@ -421,7 +432,7 @@ static const char management_js[] =
     "    unlock.disabled = true; message.className = 'notice'; message.innerHTML = 'Authenticating...';\n"
     "    request('POST', '/api/manage/login', 'username=' + encodeURIComponent(u) + '&password=' + encodeURIComponent(p), function (status) {\n"
     "      password.value = ''; p = ''; unlock.disabled = false;\n"
-    "      if (status === 200) refresh(); else if (status === 401) showLogin('Authentication failed.', true); else if (status === 409) showLogin('Another management login is already being processed.', true); else showLogin('Management login failed.', true);\n"
+    "      if (status === 200) startDashboard(); else if (status === 401) showLogin('Authentication failed.', true); else if (status === 409) showLogin('Another management login is already being processed.', true); else showLogin('Management login failed.', true);\n"
     "    });\n"
     "    return false;\n"
     "  };\n"
@@ -433,25 +444,25 @@ static const char management_js[] =
     "    var port = settingsPort.value || ''; var cert = settingsCert.value || ''; var key = settingsKey.value || '';\n"
     "    if (!port || !cert || !key) { settingsMessage.className = 'notice error'; settingsMessage.innerHTML = 'Fill in HTTPS port, certificate chain and private key.'; return false; }\n"
     "    if (!window.confirm('Save /etc/vnc-monitor/web.ini and restart the broker? Any active viewer session will be disconnected.')) return false;\n"
-    "    stopTimer(); settingsSave.disabled = true; settingsMessage.className = 'notice'; settingsMessage.innerHTML = 'Validating and saving settings...';\n"
+    "    settingsSave.disabled = true; settingsMessage.className = 'notice'; settingsMessage.innerHTML = 'Validating and saving settings...';\n"
     "    request('POST', '/api/manage/settings', 'port=' + encodeURIComponent(port) + '&certificate=' + encodeURIComponent(cert) + '&privateKey=' + encodeURIComponent(key), function (status, data) {\n"
     "      settingsSave.disabled = false;\n"
     "      if (status === 200 && data.ok) {\n"
-    "        settingsDirty = false; settingsLoaded = false;\n"
+    "        stopTimer(); settingsDirty = false; settingsLoaded = false;\n"
     "        settingsMessage.className = 'notice'; settingsMessage.innerHTML = 'Settings saved. Broker is restarting...';\n"
     "        window.setTimeout(function () { var p = String(data.port || port); var suffix = p === '443' ? '' : ':' + p; window.location.href = 'https://' + window.location.hostname + suffix + '/manage'; }, 2500);\n"
     "      } else if (status === 401) { showLogin('Management session expired.', true); }\n"
-    "      else { settingsMessage.className = 'notice error'; settingsMessage.innerHTML = data.error ? 'Settings rejected: ' + data.error : 'Settings could not be saved.'; timer = window.setTimeout(refresh, 2000); }\n"
+    "      else { settingsMessage.className = 'notice error'; settingsMessage.innerHTML = data.error ? 'Settings rejected: ' + data.error : 'Settings could not be saved.'; }\n"
     "    });\n"
     "    return false;\n"
     "  };\n"
-    "  document.getElementById('refresh').onclick = function () {\n"
+    "  document.getElementById('reload-settings').onclick = function () {\n"
     "    if (settingsDirty && !window.confirm('Discard unsaved server settings and reload them from /etc/vnc-monitor/web.ini?')) return;\n"
-    "    settingsDirty = false; settingsLoaded = false; refresh();\n"
+    "    settingsDirty = false; settingsLoaded = false; loadSettings(true);\n"
     "  };\n"
-    "  document.getElementById('disconnect-viewer').onclick = function () { if (!window.confirm('Disconnect the current viewer session?')) return; request('POST', '/api/manage/disconnect', '', function (status) { if (status === 200 || status === 409) refresh(); else if (status === 401) showLogin('Management session expired.', true); }); };\n"
+    "  document.getElementById('disconnect-viewer').onclick = function () { if (!window.confirm('Disconnect the current viewer session?')) return; request('POST', '/api/manage/disconnect', '', function (status) { if (status === 200 || status === 409) pollStatus(); else if (status === 401) showLogin('Management session expired.', true); }); };\n"
     "  document.getElementById('manage-logout').onclick = function () { stopTimer(); settingsDirty = false; settingsLoaded = false; request('POST', '/api/manage/logout', '', function () { showLogin('Management session locked.', false); }); };\n"
-    "  refresh();\n"
+    "  startDashboard();\n"
     "})();\n";
 
 static void
@@ -1158,14 +1169,20 @@ management_status_handler(SoupServer *server,
         return;
     }
     if (!management_request_authenticated(web, msg)) {
-        respond_text(msg, SOUP_STATUS_UNAUTHORIZED, "application/json; charset=utf-8", "{\"error\":\"authentication-required\"}\n");
+        respond_text(msg,
+                     SOUP_STATUS_UNAUTHORIZED,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"authentication-required\"}\n");
         return;
     }
 
     WebServerManagementInfo info;
     if (!web->hooks.get_management_info ||
         web->hooks.get_management_info(&info, web->user_data) < 0) {
-        respond_text(msg, SOUP_STATUS_INTERNAL_SERVER_ERROR, "application/json; charset=utf-8", "{\"error\":\"status-unavailable\"}\n");
+        respond_text(msg,
+                     SOUP_STATUS_INTERNAL_SERVER_ERROR,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"status-unavailable\"}\n");
         return;
     }
 
@@ -1176,15 +1193,11 @@ management_status_handler(SoupServer *server,
     char *viewer_session = json_escape(info.viewer_session_id);
     char *active_user = json_escape(info.active_user);
     char *active_session = json_escape(info.active_session_id);
-    char *config_file = json_escape(web->config_file);
-    char *certificate = json_escape(web->certificate_file);
-    char *private_key = json_escape(web->private_key_file);
 
     char *body = g_strdup_printf(
         "{\"viewer\":{\"active\":%s,\"state\":\"%s\",\"transport\":\"%s\","
         "\"peer\":\"%s\",\"user\":\"%s\",\"session\":\"%s\",\"websocket\":%s},"
-        "\"active\":{\"available\":%s,\"uid\":%u,\"user\":\"%s\",\"session\":\"%s\"},"
-        "\"settings\":{\"httpsPort\":%u,\"vncPort\":%d,\"configFile\":\"%s\",\"certificate\":\"%s\",\"privateKey\":\"%s\"}}\n",
+        "\"active\":{\"available\":%s,\"uid\":%u,\"user\":\"%s\",\"session\":\"%s\"}}\n",
         info.viewer_active ? "true" : "false",
         viewer_state,
         viewer_transport,
@@ -1195,18 +1208,21 @@ management_status_handler(SoupServer *server,
         info.active_user_available ? "true" : "false",
         info.active_uid,
         active_user,
-        active_session,
-        web->port,
-        info.vnc_port,
-        config_file,
-        certificate,
-        private_key);
+        active_session);
 
-    respond_text(msg, SOUP_STATUS_OK, "application/json; charset=utf-8", body);
+    respond_text(msg,
+                 SOUP_STATUS_OK,
+                 "application/json; charset=utf-8",
+                 body);
 
-    g_free(body); g_free(viewer_state); g_free(viewer_transport); g_free(viewer_peer);
-    g_free(viewer_user); g_free(viewer_session); g_free(active_user); g_free(active_session);
-    g_free(config_file); g_free(certificate); g_free(private_key);
+    g_free(body);
+    g_free(viewer_state);
+    g_free(viewer_transport);
+    g_free(viewer_peer);
+    g_free(viewer_user);
+    g_free(viewer_session);
+    g_free(active_user);
+    g_free(active_session);
 }
 
 static void
@@ -1219,8 +1235,55 @@ management_settings_handler(SoupServer *server,
     (void)server; (void)path; (void)query;
     WebServer *web = user_data;
 
-    if (strcmp(soup_server_message_get_method(msg), "POST") != 0) {
-        respond_method_not_allowed(msg, "POST");
+    const char *method = soup_server_message_get_method(msg);
+
+    if (strcmp(method, "GET") == 0) {
+        if (!management_request_authenticated(web, msg)) {
+            respond_text(msg,
+                         SOUP_STATUS_UNAUTHORIZED,
+                         "application/json; charset=utf-8",
+                         "{\"error\":\"authentication-required\"}\n");
+            return;
+        }
+
+        WebServerManagementInfo info;
+        if (!web->hooks.get_management_info ||
+            web->hooks.get_management_info(&info, web->user_data) < 0) {
+            respond_text(msg,
+                         SOUP_STATUS_INTERNAL_SERVER_ERROR,
+                         "application/json; charset=utf-8",
+                         "{\"error\":\"settings-unavailable\"}\n");
+            return;
+        }
+
+        char *config_file = json_escape(web->config_file);
+        char *certificate = json_escape(web->certificate_file);
+        char *private_key = json_escape(web->private_key_file);
+
+        char *body = g_strdup_printf(
+            "{\"settings\":{\"httpsPort\":%u,\"vncPort\":%d,"
+            "\"configFile\":\"%s\",\"certificate\":\"%s\","
+            "\"privateKey\":\"%s\"}}\n",
+            web->port,
+            info.vnc_port,
+            config_file,
+            certificate,
+            private_key);
+
+        respond_text(msg,
+                     SOUP_STATUS_OK,
+                     "application/json; charset=utf-8",
+                     body);
+
+        g_free(body);
+        g_free(config_file);
+        g_free(certificate);
+        g_free(private_key);
+        return;
+    }
+
+    if (strcmp(method, "POST") != 0) {
+        respond_method_not_allowed(msg, "GET, POST");
         return;
     }
 
