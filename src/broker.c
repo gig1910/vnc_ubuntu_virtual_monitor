@@ -3,6 +3,7 @@
 #include "broker_protocol.h"
 #include "config.h"
 #include "log.h"
+#include "web_server.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -27,6 +28,7 @@
 #define LOGIN1_SESSION_IFACE     "org.freedesktop.login1.Session"
 #define DBUS_PROPERTIES_IFACE    "org.freedesktop.DBus.Properties"
 #define SYSTEM_CONFIG_FILE       "/etc/vnc-monitor/config.ini"
+#define WEB_CONFIG_FILE          "/etc/vnc-monitor/web.ini"
 #define BROKER_DEFAULT_PORT      5901
 #define BROKER_AGENT_DIR         "vnc-monitor"
 #define BROKER_AGENT_SOCKET      "agent.sock"
@@ -38,6 +40,15 @@ typedef struct {
     char object_path[256];
     char user_name[128];
 } ActiveSession;
+
+typedef enum {
+    BROKER_SESSION_IDLE = 0,
+    BROKER_SESSION_AUTH_VNC,
+    BROKER_SESSION_AUTH_WEB,
+    BROKER_SESSION_ACTIVE_VNC,
+    BROKER_SESSION_ACTIVE_WEBRTC,
+    BROKER_SESSION_REVOKING
+} BrokerSessionState;
 
 typedef struct {
     GMainLoop *loop;
@@ -52,8 +63,9 @@ typedef struct {
     guint sigterm_source;
     guint sigint_source;
 
-    int active;
-    int revoked;
+    WebServer *web_server;
+
+    BrokerSessionState state;
     int client_fd;
     int control_fd;
     guint control_source;
@@ -61,6 +73,66 @@ typedef struct {
     char session_id[VNC_BROKER_SESSION_ID_MAX];
     char peer_addr[VNC_BROKER_PEER_ADDR_MAX];
 } Broker;
+
+static const char *
+broker_session_state_name(BrokerSessionState state)
+{
+    switch (state) {
+        case BROKER_SESSION_IDLE:
+            return "idle";
+        case BROKER_SESSION_AUTH_VNC:
+            return "auth-vnc";
+        case BROKER_SESSION_AUTH_WEB:
+            return "auth-web";
+        case BROKER_SESSION_ACTIVE_VNC:
+            return "active-vnc";
+        case BROKER_SESSION_ACTIVE_WEBRTC:
+            return "active-webrtc";
+        case BROKER_SESSION_REVOKING:
+            return "revoking";
+        default:
+            return "unknown";
+    }
+}
+
+static int
+broker_session_owns_slot(const Broker *broker)
+{
+    return broker && broker->state != BROKER_SESSION_IDLE;
+}
+
+static int
+broker_session_has_binding(const Broker *broker)
+{
+    return broker_session_owns_slot(broker) &&
+           broker->uid != (uid_t)-1 &&
+           broker->session_id[0] != '\0';
+}
+
+static void
+broker_session_set_state(Broker *broker, BrokerSessionState state)
+{
+    if (!broker || broker->state == state)
+        return;
+
+    LOG_DEBUG("Broker session state: %s -> %s",
+              broker_session_state_name(broker->state),
+              broker_session_state_name(state));
+    broker->state = state;
+}
+
+static gboolean
+broker_web_slot_busy(gpointer user_data)
+{
+    return broker_session_owns_slot((const Broker *)user_data) ? TRUE : FALSE;
+}
+
+static const char *
+broker_web_slot_state(gpointer user_data)
+{
+    const Broker *broker = user_data;
+    return broker ? broker_session_state_name(broker->state) : "unknown";
+}
 
 static int
 load_public_port(void)
@@ -362,9 +434,9 @@ query_active_session(Broker *broker, ActiveSession *out)
 }
 
 static void
-clear_active(Broker *broker, int reset)
+clear_session(Broker *broker, int reset)
 {
-    if (!broker->active)
+    if (!broker)
         return;
 
     if (broker->control_source) {
@@ -391,36 +463,51 @@ clear_active(Broker *broker, int reset)
     if (broker->control_fd >= 0)
         close(broker->control_fd);
 
-    broker->active = 0;
-    broker->revoked = 0;
     broker->client_fd = -1;
     broker->control_fd = -1;
     broker->uid = (uid_t)-1;
     broker->session_id[0] = '\0';
     broker->peer_addr[0] = '\0';
+    broker_session_set_state(broker, BROKER_SESSION_IDLE);
 }
 
 static void
-revoke_active(Broker *broker, const char *reason)
+revoke_session(Broker *broker, const char *reason)
 {
-    if (!broker->active || broker->revoked)
+    if (!broker_session_owns_slot(broker) ||
+        broker->state == BROKER_SESSION_REVOKING) {
         return;
+    }
 
-    broker->revoked = 1;
-    LOG_INFO("Broker disconnecting %s: bound session %s is no longer active (%s)",
+    BrokerSessionState previous = broker->state;
+    broker_session_set_state(broker, BROKER_SESSION_REVOKING);
+
+    LOG_INFO("Broker revoking %s session for %s: bound session %s is no longer active (%s)",
+             broker_session_state_name(previous),
              broker->peer_addr[0] ? broker->peer_addr : "client",
-             broker->session_id,
+             broker->session_id[0] ? broker->session_id : "unbound",
              reason ? reason : "session changed");
 
-    if (broker->client_fd >= 0)
+    if (broker->client_fd >= 0) {
+        /* VNC: broker holds a duplicate of the exact accepted TCP socket. */
         (void)shutdown(broker->client_fd, SHUT_RDWR);
+    }
+    else if (broker->control_fd >= 0) {
+        /*
+         * Future WebRTC path has no browser fd in the agent. Control-channel
+         * loss is therefore the authoritative fail-safe lifetime guard.
+         */
+        (void)shutdown(broker->control_fd, SHUT_RDWR);
+    }
 }
 
 static void
-enforce_active_binding(Broker *broker)
+enforce_session_binding(Broker *broker)
 {
-    if (!broker->active)
+    if (!broker_session_has_binding(broker) ||
+        broker->state == BROKER_SESSION_REVOKING) {
         return;
+    }
 
     ActiveSession active;
     int rc = query_active_session(broker, &active);
@@ -428,8 +515,8 @@ enforce_active_binding(Broker *broker)
     if (rc != 1 ||
         strcmp(active.session_id, broker->session_id) != 0 ||
         active.uid != broker->uid) {
-        revoke_active(broker,
-                      rc == 1 ? "seat0 switched session" : "no active user session");
+        revoke_session(broker,
+                       rc == 1 ? "seat0 switched session" : "no active user session");
     }
 }
 
@@ -438,9 +525,10 @@ control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
 {
     Broker *broker = user_data;
 
-    if (!broker->active || fd != broker->control_fd)
+    if (!broker_session_owns_slot(broker) || fd != broker->control_fd)
         return G_SOURCE_REMOVE;
 
+    /* This callback is terminal for the current v1 status protocol. */
     broker->control_source = 0;
 
     uint8_t status = 0;
@@ -452,25 +540,26 @@ control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
     }
 
     if (got_status && status == VNC_BROKER_STATUS_DONE) {
-        LOG_INFO("Broker session finished: %s session=%s",
+        LOG_INFO("Broker session finished: transport=%s peer=%s session=%s",
+                 broker_session_state_name(broker->state),
                  broker->peer_addr,
                  broker->session_id);
-        clear_active(broker, 0);
+        clear_session(broker, 0);
     }
     else if (got_status && status == VNC_BROKER_STATUS_BUSY) {
         LOG_INFO("Broker handoff rejected: active user agent is busy");
-        clear_active(broker, 1);
+        clear_session(broker, 1);
     }
     else if (got_status && status == VNC_BROKER_STATUS_REJECT) {
         LOG_INFO("Broker handoff rejected by active user agent");
-        clear_active(broker, 1);
+        clear_session(broker, 1);
     }
     else {
         LOG_INFO("Broker lost agent control channel for session %s",
                  broker->session_id);
         if (broker->client_fd >= 0)
             (void)shutdown(broker->client_fd, SHUT_RDWR);
-        clear_active(broker, 1);
+        clear_session(broker, 1);
     }
 
     return G_SOURCE_REMOVE;
@@ -523,17 +612,20 @@ connect_agent(const ActiveSession *session)
 }
 
 static int
-route_client(Broker *broker,
-             int client_fd,
-             const char *peer_addr,
-             const ActiveSession *session)
+route_vnc_client(Broker *broker,
+                 int client_fd,
+                 const char *peer_addr,
+                 const ActiveSession *session)
 {
+    broker_session_set_state(broker, BROKER_SESSION_AUTH_VNC);
+
     int control_fd = connect_agent(session);
     if (control_fd < 0) {
         LOG_INFO("Broker cannot reach agent for uid=%lu session=%s: %s",
                  (unsigned long)session->uid,
                  session->session_id,
                  strerror(errno));
+        broker_session_set_state(broker, BROKER_SESSION_IDLE);
         return -1;
     }
 
@@ -544,12 +636,11 @@ route_client(Broker *broker,
                                 peer_addr) < 0) {
         int saved = errno;
         close(control_fd);
+        broker_session_set_state(broker, BROKER_SESSION_IDLE);
         errno = saved;
         return -1;
     }
 
-    broker->active = 1;
-    broker->revoked = 0;
     broker->client_fd = client_fd;
     broker->control_fd = control_fd;
     broker->uid = session->uid;
@@ -565,14 +656,21 @@ route_client(Broker *broker,
                                             control_ready_cb,
                                             broker);
 
-    LOG_INFO("Broker routed %s to uid=%lu user=%s logind-session=%s",
+    /*
+     * ACTIVE_VNC means the broker-owned global slot has been handed to the
+     * selected user agent. RA2/PAM still occurs inside that unprivileged
+     * agent exactly as in beta.3; the broker does not duplicate that auth.
+     */
+    broker_session_set_state(broker, BROKER_SESSION_ACTIVE_VNC);
+
+    LOG_INFO("Broker routed VNC %s to uid=%lu user=%s logind-session=%s",
              peer_addr,
              (unsigned long)session->uid,
              session->user_name[0] ? session->user_name : "unknown",
              session->session_id);
 
     /* Close a race where seat0 changed between the query and FD handoff. */
-    enforce_active_binding(broker);
+    enforce_session_binding(broker);
     return 0;
 }
 
@@ -610,9 +708,10 @@ listener_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
                         peer_addr,
                         sizeof(peer_addr));
 
-        if (broker->active) {
-            LOG_INFO("Broker rejected additional client %s: strong single-connect policy",
-                     peer_addr);
+        if (broker_session_owns_slot(broker)) {
+            LOG_INFO("Broker rejected additional VNC client %s: strong single-connect policy; state=%s",
+                     peer_addr,
+                     broker_session_state_name(broker->state));
             reset_client(client_fd);
             continue;
         }
@@ -626,7 +725,7 @@ listener_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
             continue;
         }
 
-        if (route_client(broker, client_fd, peer_addr, &active) < 0) {
+        if (route_vnc_client(broker, client_fd, peer_addr, &active) < 0) {
             LOG_INFO("Broker rejected %s: active session agent unavailable (%s)",
                      peer_addr,
                      strerror(errno));
@@ -653,13 +752,13 @@ logind_changed_cb(GDBusConnection *connection,
     (void)signal_name;
     (void)parameters;
 
-    enforce_active_binding((Broker *)user_data);
+    enforce_session_binding((Broker *)user_data);
 }
 
 static gboolean
 periodic_binding_check(gpointer user_data)
 {
-    enforce_active_binding((Broker *)user_data);
+    enforce_session_binding((Broker *)user_data);
     return G_SOURCE_CONTINUE;
 }
 
@@ -667,7 +766,21 @@ static gboolean
 shutdown_cb(gpointer user_data)
 {
     Broker *broker = user_data;
-    revoke_active(broker, "broker shutdown");
+
+    /*
+     * Returning G_SOURCE_REMOVE makes GLib destroy the signal source after
+     * this callback returns. Clear the matching stored id now so normal
+     * shutdown cleanup does not attempt to remove the same source twice.
+     */
+    GSource *current_source = g_main_current_source();
+    guint current_id = current_source ? g_source_get_id(current_source) : 0;
+
+    if (current_id == broker->sigterm_source)
+        broker->sigterm_source = 0;
+    if (current_id == broker->sigint_source)
+        broker->sigint_source = 0;
+
+    revoke_session(broker, "broker shutdown");
     g_main_loop_quit(broker->loop);
     return G_SOURCE_REMOVE;
 }
@@ -684,7 +797,8 @@ main(int argc, char **argv)
         (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         printf("VNC Monitor broker %s\n"
                "Usage: %s [--version]\n"
-               "Public port is read only from /etc/vnc-monitor/config.ini [network] port.\n",
+               "VNC port is read only from /etc/vnc-monitor/config.ini [network] port.\n"
+               "Optional HTTPS settings are read only from /etc/vnc-monitor/web.ini.\n",
                VNC_MONITOR_VERSION,
                argv[0]);
         return 0;
@@ -704,6 +818,7 @@ main(int argc, char **argv)
 
     Broker broker;
     memset(&broker, 0, sizeof(broker));
+    broker.state = BROKER_SESSION_IDLE;
     broker.listener_fd = -1;
     broker.client_fd = -1;
     broker.control_fd = -1;
@@ -731,6 +846,19 @@ main(int argc, char **argv)
     }
 
     broker.loop = g_main_loop_new(NULL, FALSE);
+
+    WebServerHooks web_hooks = {
+        .slot_busy = broker_web_slot_busy,
+        .slot_state = broker_web_slot_state
+    };
+
+    int web_rc = web_server_start(&broker.web_server,
+                                  WEB_CONFIG_FILE,
+                                  &web_hooks,
+                                  &broker);
+    if (web_rc < 0) {
+        LOG_ERROR("Broker HTTPS endpoint is unavailable; continuing with VNC listener only");
+    }
 
     broker.listener_source = g_unix_fd_add(broker.listener_fd,
                                             G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL,
@@ -768,9 +896,10 @@ main(int argc, char **argv)
     broker.sigterm_source = g_unix_signal_add(SIGTERM, shutdown_cb, &broker);
     broker.sigint_source = g_unix_signal_add(SIGINT, shutdown_cb, &broker);
 
-    LOG_INFO("VNC Monitor broker %s ready on TCP/%d; only active seat0 Wayland user sessions are attachable",
+    LOG_INFO("VNC Monitor broker %s ready on TCP/%d; state=%s; only active seat0 Wayland user sessions are attachable",
              VNC_MONITOR_VERSION,
-             port);
+             port,
+             broker_session_state_name(broker.state));
 
     g_main_loop_run(broker.loop);
 
@@ -792,10 +921,15 @@ main(int argc, char **argv)
         g_dbus_connection_signal_unsubscribe(broker.bus,
                                               broker.session_removed_subscription);
 
-    if (broker.active) {
+    if (broker_session_owns_slot(&broker)) {
         if (broker.client_fd >= 0)
             (void)shutdown(broker.client_fd, SHUT_RDWR);
-        clear_active(&broker, 0);
+        clear_session(&broker, 0);
+    }
+
+    if (broker.web_server) {
+        web_server_stop(broker.web_server);
+        broker.web_server = NULL;
     }
 
     if (broker.listener_fd >= 0)

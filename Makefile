@@ -5,10 +5,12 @@ CFLAGS   += -O2 -Wall -Wextra -pthread -MMD -MP
 
 PACKAGES := libvncserver openssl nettle glib-2.0 gio-2.0 \
 	gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 libpipewire-0.3
+BROKER_PACKAGES := glib-2.0 gio-2.0 libsoup-3.0
 
 PKG_CFLAGS := $(shell pkg-config --cflags $(PACKAGES))
 PKG_LIBS   := $(shell pkg-config --libs $(PACKAGES))
-BROKER_LIBS := $(shell pkg-config --libs glib-2.0 gio-2.0)
+BROKER_PKG_CFLAGS := $(shell pkg-config --cflags $(BROKER_PACKAGES))
+BROKER_LIBS := $(shell pkg-config --libs $(BROKER_PACKAGES))
 
 SOURCES := \
 	src/main.c \
@@ -36,7 +38,7 @@ SOURCES := \
 	src/ra2_stream_coalescer.c
 
 OBJECTS := $(SOURCES:.c=.o)
-BROKER_OBJECTS := src/broker.o src/broker_protocol.o src/log.o
+BROKER_OBJECTS := src/broker.o src/broker_protocol.o src/log.o src/web_server.o
 DEPS := $(sort $(OBJECTS:.o=.d) $(BROKER_OBJECTS:.o=.d))
 
 TARGET := vnc-monitor
@@ -48,6 +50,7 @@ PAM_HELPER := auth-helper/vnc-monitor-auth-helper
 PAM_SOCKET_TEMPLATE := auth-helper/vnc-monitor-auth.socket.in
 PAM_SOCKET_GENERATED := $(PAM_BUILD_DIR)/vnc-monitor-auth.socket
 CONFIG_TEMPLATE := config/vnc-monitor.conf
+WEB_CONFIG_TEMPLATE := config/web.conf
 
 USER_BIN_DIR := $(HOME)/.local/bin
 USER_SYSTEMD_DIR := $(HOME)/.config/systemd/user
@@ -61,6 +64,7 @@ LEGACY_RA2_KEY := ./ra2-server-key.pem
 
 SYSTEM_CONFIG_DIR := /etc/vnc-monitor
 SYSTEM_CONFIG_FILE := $(SYSTEM_CONFIG_DIR)/config.ini
+SYSTEM_WEB_CONFIG_FILE := $(SYSTEM_CONFIG_DIR)/web.ini
 BROKER_BIN := /usr/local/libexec/vnc-monitor-broker
 BROKER_SERVICE := /etc/systemd/system/vnc-monitor-broker.service
 
@@ -83,6 +87,14 @@ $(BROKER_TARGET): $(BROKER_OBJECTS)
 # call in the project continues to use libc directly.
 src/main.o: src/main.c include/broker_peercred.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_CFLAGS) -include include/broker_peercred.h -c $< -o $@
+
+# Broker-only objects use libsoup for the optional HTTPS/WebSocket frontend.
+# Keep libsoup out of the unprivileged user-agent link/runtime dependency set.
+src/broker.o: src/broker.c include/web_server.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(BROKER_PKG_CFLAGS) -c $< -o $@
+
+src/web_server.o: src/web_server.c include/web_server.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(BROKER_PKG_CFLAGS) -c $< -o $@
 
 src/%.o: src/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_CFLAGS) -c $< -o $@
@@ -148,6 +160,12 @@ install-broker-service: $(BROKER_TARGET)
 	else \
 		printf '%s\n' 'Preserving existing system config: $(SYSTEM_CONFIG_FILE)'; \
 	fi
+	@if [ ! -e "$(SYSTEM_WEB_CONFIG_FILE)" ]; then \
+		sudo install -Dm0644 "$(WEB_CONFIG_TEMPLATE)" "$(SYSTEM_WEB_CONFIG_FILE)"; \
+		printf '%s\n' 'Created web config: $(SYSTEM_WEB_CONFIG_FILE)'; \
+	else \
+		printf '%s\n' 'Preserving existing web config: $(SYSTEM_WEB_CONFIG_FILE)'; \
+	fi
 	sudo systemctl daemon-reload
 	sudo systemctl enable --now vnc-monitor-broker.service
 	@$(MAKE) --no-print-directory broker-service-status
@@ -162,7 +180,7 @@ uninstall-broker-service:
 	-sudo systemctl disable --now vnc-monitor-broker.service
 	sudo rm -f "$(BROKER_BIN)" "$(BROKER_SERVICE)"
 	sudo systemctl daemon-reload
-	@echo 'System broker removed. /etc/vnc-monitor/config.ini was preserved.'
+	@echo 'System broker removed. /etc/vnc-monitor/config.ini and web.ini were preserved.'
 
 install: all
 	install -Dm0755 "$(TARGET)" "$(USER_BIN_DIR)/vnc-monitor"

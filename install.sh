@@ -15,12 +15,14 @@ Build and install the complete VNC Monitor beta stack:
   - vnc-monitor user-session agent;
   - vnc-monitor-broker system listener/session gate;
   - /etc/vnc-monitor/config.ini system baseline (created once, preserved);
+  - /etc/vnc-monitor/web.ini broker-only HTTPS config (created once, preserved);
   - ~/.config/vnc-monitor/config.ini user override (created once, preserved);
   - vnc-monitor.service (systemd user service, --agent mode);
   - PAM auth helper;
   - vnc-monitor-auth.socket + vnc-monitor-auth@.service (system units).
 
 Before building, the installer verifies all required build tools and libraries.
+The browser HTTPS endpoint is installed disabled by default.
 
 Options:
   --clean       Run make clean before building.
@@ -105,9 +107,12 @@ fi
 required_source_files=(
     Makefile
     config/vnc-monitor.conf
+    config/web.conf
     include/broker_protocol.h
+    include/web_server.h
     src/broker.c
     src/broker_protocol.c
+    src/web_server.c
     systemd/vnc-monitor.service
     systemd/vnc-monitor-broker.service
     auth-helper/vnc-monitor-auth-helper.c
@@ -145,6 +150,7 @@ pkg_modules=(
     nettle
     glib-2.0
     gio-2.0
+    libsoup-3.0
     gstreamer-1.0
     gstreamer-app-1.0
     gstreamer-video-1.0
@@ -228,7 +234,7 @@ if ((${#missing_modules[@]})) || ((jpeg_ok == 0)) || ((pam_ok == 0)); then
 Typical Ubuntu development packages for this project are:
   sudo apt install \
     build-essential pkg-config \
-    libvncserver-dev libssl-dev nettle-dev libglib2.0-dev \
+    libvncserver-dev libssl-dev nettle-dev libglib2.0-dev libsoup-3.0-dev \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
     libpipewire-0.3-dev libjpeg-dev libpam0g-dev
 
@@ -282,10 +288,12 @@ make status-support
 
 printf '\nInstallation complete.\n'
 printf 'System config: %s\n' "/etc/vnc-monitor/config.ini"
+printf 'Web config:    %s (disabled by default)\n' "/etc/vnc-monitor/web.ini"
 printf 'User config:   %s\n' "$HOME/.config/vnc-monitor/config.ini"
 printf 'System broker: vnc-monitor-broker.service\n'
 printf 'User agent:    vnc-monitor.service\n'
 printf 'System auth:   vnc-monitor-auth.socket -> vnc-monitor-auth@.service\n'
-printf 'Viewer port:   [network] port from /etc/vnc-monitor/config.ini\n'
+printf 'VNC port:      [network] port from /etc/vnc-monitor/config.ini\n'
+printf 'HTTPS port:    [web] port from /etc/vnc-monitor/web.ini when enabled\n'
 printf 'Broker log:    journalctl -u vnc-monitor-broker.service -f\n'
 printf 'Agent log:     journalctl --user -u vnc-monitor.service -f\n'

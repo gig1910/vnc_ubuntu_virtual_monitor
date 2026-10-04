@@ -15,8 +15,9 @@ Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s
 
-# The broker owns only the public TCP listener, reads logind state on the
-# system bus, and hands accepted sockets to the active user's agent.
+# The broker owns machine-wide connection policy: the VNC TCP listener and,
+# when explicitly enabled, the HTTPS/WSS browser edge. It reads logind state
+# on the system bus and routes only to the active user's unprivileged agent.
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
