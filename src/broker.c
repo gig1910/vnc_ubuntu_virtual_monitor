@@ -642,16 +642,20 @@ web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
             return G_SOURCE_REMOVE;
         }
 
-        if ((condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) != 0) {
-            LOG_INFO("Broker lost WebRTC agent channel while authenticating session %s",
-                     broker->session_id);
-            broker->control_source = 0;
-            broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
-            clear_session(broker, 1);
-            return G_SOURCE_REMOVE;
-        }
-
         if (auth_result == VNC_BROKER_WEB_AUTH_OK) {
+            /*
+             * Successful Web authentication must leave the exact bound agent
+             * control channel alive for the later signalling/media lifetime.
+             */
+            if ((condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) != 0) {
+                LOG_INFO("Broker lost WebRTC agent channel after successful authentication for session %s",
+                         broker->session_id);
+                broker->control_source = 0;
+                broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
+                clear_session(broker, 1);
+                return G_SOURCE_REMOVE;
+            }
+
             broker_session_set_state(broker, BROKER_SESSION_ACTIVE_WEBRTC);
             broker->web_attach_timeout_source =
                 g_timeout_add(WEB_ATTACH_TIMEOUT_MS,
