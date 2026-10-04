@@ -14,14 +14,19 @@
 #define WEB_DEFAULT_KEY_FILE   "/etc/vnc-monitor/tls/server.key"
 #define WEB_LOGIN_BODY_MAX      8192
 #define WEB_WS_MESSAGE_MAX      8192
-#define WEB_SESSION_COOKIE      "vnc-monitor-session"
-#define WEB_WS_TOKEN_DATA_KEY   "vnc-monitor-ws-token"
+#define WEB_SESSION_COOKIE          "vnc-monitor-session"
+#define WEB_MANAGEMENT_COOKIE       "vnc-monitor-management"
+#define WEB_CONTROL_HEADER          "X-VNC-Monitor-Control"
+#define WEB_WS_TOKEN_DATA_KEY       "vnc-monitor-ws-token"
+#define WEB_MANAGEMENT_MAX_AGE_S    600
 
 struct WebServer {
     SoupServer *server;
     GTlsCertificate *certificate;
     SoupWebsocketConnection *websocket;
     guint port;
+    char *certificate_file;
+    char *private_key_file;
     WebServerHooks hooks;
     gpointer user_data;
 };
@@ -94,7 +99,7 @@ static const char login_page[] =
     "          <button id=\"disconnect\" class=\"secondary\" type=\"button\" style=\"display:none\">Disconnect</button>\n"
     "        </form>\n"
     "        <div id=\"status\" class=\"status\"><span class=\"status-dot\"></span><span id=\"status-text\">Ready to connect.</span></div>\n"
-    "        <p class=\"hint\">Authentication is bound to the currently active local GNOME Wayland user.</p>\n"
+    "        <p class=\"hint\">Authentication is bound to the currently active local GNOME Wayland user.<br><a href=\"/manage\">Manage sessions and settings</a></p>\n"
     "      </div>\n"
     "    </div>\n"
     "  </div>\n"
@@ -248,6 +253,154 @@ static const char client_js[] =
     "  }\n"
     "})();\n";
 
+static const char management_page[] =
+    "<!doctype html>\n"
+    "<html lang=\"en\">\n"
+    "<head>\n"
+    "  <meta charset=\"utf-8\">\n"
+    "  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0,maximum-scale=1.0\">\n"
+    "  <meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n"
+    "  <title>VNC Monitor Management</title>\n"
+    "  <style>\n"
+    "    html { -webkit-text-size-adjust: 100%; background: #eef2f6; }\n"
+    "    body { margin: 0; padding: 0; background: #eef2f6; color: #24313d; font-family: -apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 16px; }\n"
+    "    * { -webkit-box-sizing: border-box; box-sizing: border-box; }\n"
+    "    .page { padding: 32px 14px; }\n"
+    "    .shell { width: 100%; max-width: 760px; margin: 0 auto; }\n"
+    "    .top { margin-bottom: 14px; }\n"
+    "    .top a { color: #1769c2; text-decoration: none; font-size: 14px; }\n"
+    "    .card { margin-bottom: 16px; overflow: hidden; background: #fff; border: 1px solid #d8e0e7; border-radius: 12px; -webkit-box-shadow: 0 8px 24px rgba(28,45,61,.08); box-shadow: 0 8px 24px rgba(28,45,61,.08); }\n"
+    "    .head { padding: 24px 26px 20px; border-bottom: 1px solid #e7ecf0; }\n"
+    "    .body { padding: 22px 26px 26px; }\n"
+    "    h1 { margin: 0 0 5px; color: #17212b; font-size: 28px; line-height: 34px; }\n"
+    "    h2 { margin: 0; color: #17212b; font-size: 20px; line-height: 26px; }\n"
+    "    .sub { margin: 0; color: #6c7a86; font-size: 14px; line-height: 20px; }\n"
+    "    .field { display: block; margin: 0 0 16px; }\n"
+    "    .field span { display: block; margin-bottom: 6px; font-size: 14px; font-weight: 600; }\n"
+    "    input { display: block; width: 100%; height: 48px; padding: 9px 12px; border: 1px solid #b9c5cf; border-radius: 8px; background: #fff; font-size: 17px; -webkit-appearance: none; }\n"
+    "    button { display: inline-block; min-height: 44px; padding: 0 18px; border: 0; border-radius: 8px; background: #1769c2; color: #fff; font-family: inherit; font-size: 15px; font-weight: 600; line-height: 44px; -webkit-appearance: none; }\n"
+    "    button[disabled] { opacity: .55; }\n"
+    "    .danger { background: #b64040; }\n"
+    "    .secondary { border: 1px solid #b9c5cf; background: #fff; color: #344452; }\n"
+    "    .row { padding: 10px 0; border-bottom: 1px solid #edf0f2; }\n"
+    "    .row:last-child { border-bottom: 0; }\n"
+    "    .key { display: inline-block; width: 38%; color: #71808c; vertical-align: top; }\n"
+    "    .value { display: inline-block; width: 60%; color: #26343f; font-weight: 600; word-break: break-all; vertical-align: top; }\n"
+    "    .actions { padding-top: 18px; }\n"
+    "    .actions button { margin: 0 8px 8px 0; }\n"
+    "    .notice { margin-top: 14px; padding: 11px 12px; border: 1px solid #dae3ea; border-radius: 8px; background: #f7f9fb; color: #5d6d79; font-size: 13px; line-height: 19px; }\n"
+    "    .error { border-color: #e5c2c2; background: #fff4f4; color: #8b4040; }\n"
+    "    .hidden { display: none; }\n"
+    "    @media only screen and (max-width: 600px) {\n"
+    "      .page { padding: 12px 8px; }\n"
+    "      .head { padding: 20px; }\n"
+    "      .body { padding: 18px 20px 22px; }\n"
+    "      .key, .value { display: block; width: 100%; }\n"
+    "      .key { margin-bottom: 3px; }\n"
+    "      button { width: 100%; margin-right: 0; }\n"
+    "    }\n"
+    "  </style>\n"
+    "  <script src=\"/manage.js\" defer></script>\n"
+    "</head>\n"
+    "<body>\n"
+    "  <div class=\"page\"><div class=\"shell\">\n"
+    "    <div class=\"top\"><a href=\"/\">&larr; Viewer</a></div>\n"
+    "    <div class=\"card\">\n"
+    "      <div class=\"head\"><h1>VNC Monitor</h1><p class=\"sub\">Session management and server settings</p></div>\n"
+    "      <div id=\"login-panel\" class=\"body\">\n"
+    "        <form id=\"manage-login\" autocomplete=\"on\">\n"
+    "          <label class=\"field\"><span>Username</span><input id=\"manage-user\" type=\"text\" autocomplete=\"username\" autocapitalize=\"off\" autocorrect=\"off\" required></label>\n"
+    "          <label class=\"field\"><span>Password</span><input id=\"manage-password\" type=\"password\" autocomplete=\"current-password\" required></label>\n"
+    "          <button id=\"manage-unlock\" type=\"submit\">Unlock management</button>\n"
+    "        </form>\n"
+    "        <div id=\"manage-message\" class=\"notice\">Authenticate as the currently active local GNOME user. Management does not occupy the viewer slot.</div>\n"
+    "      </div>\n"
+    "    </div>\n"
+    "    <div id=\"dashboard\" class=\"hidden\">\n"
+    "      <div class=\"card\"><div class=\"head\"><h2>Current viewer session</h2></div><div class=\"body\">\n"
+    "        <div class=\"row\"><span class=\"key\">State</span><span id=\"v-state\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">Transport</span><span id=\"v-transport\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">Peer</span><span id=\"v-peer\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">Local user</span><span id=\"v-user\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">logind session</span><span id=\"v-session\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">WebSocket</span><span id=\"v-ws\" class=\"value\">-</span></div>\n"
+    "        <div class=\"actions\"><button id=\"disconnect-viewer\" class=\"danger\" type=\"button\">Disconnect viewer</button></div>\n"
+    "      </div></div>\n"
+    "      <div class=\"card\"><div class=\"head\"><h2>Active desktop</h2></div><div class=\"body\">\n"
+    "        <div class=\"row\"><span class=\"key\">User</span><span id=\"a-user\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">UID</span><span id=\"a-uid\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">logind session</span><span id=\"a-session\" class=\"value\">-</span></div>\n"
+    "      </div></div>\n"
+    "      <div class=\"card\"><div class=\"head\"><h2>Server settings</h2><p class=\"sub\">Machine policy is read-only here in this checkpoint.</p></div><div class=\"body\">\n"
+    "        <div class=\"row\"><span class=\"key\">HTTPS endpoint</span><span id=\"s-endpoint\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">HTTPS port</span><span id=\"s-https\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">VNC port</span><span id=\"s-vnc\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">Certificate</span><span id=\"s-cert\" class=\"value\">-</span></div>\n"
+    "        <div class=\"row\"><span class=\"key\">Private key</span><span id=\"s-key\" class=\"value\">-</span></div>\n"
+    "        <div class=\"notice\">Persistent edits remain in /etc/vnc-monitor/*.ini for now. The management page intentionally cannot rewrite root-owned TLS policy yet.</div>\n"
+    "        <div class=\"actions\"><button id=\"refresh\" class=\"secondary\" type=\"button\">Refresh</button><button id=\"manage-logout\" class=\"secondary\" type=\"button\">Log out</button></div>\n"
+    "      </div></div>\n"
+    "    </div>\n"
+    "  </div></div>\n"
+    "</body>\n"
+    "</html>\n";
+
+static const char management_js[] =
+    "(function () {\n"
+    "  'use strict';\n"
+    "  var loginPanel = document.getElementById('login-panel');\n"
+    "  var dashboard = document.getElementById('dashboard');\n"
+    "  var form = document.getElementById('manage-login');\n"
+    "  var user = document.getElementById('manage-user');\n"
+    "  var password = document.getElementById('manage-password');\n"
+    "  var unlock = document.getElementById('manage-unlock');\n"
+    "  var message = document.getElementById('manage-message');\n"
+    "  var timer = null;\n"
+    "  function text(id, value) { var e = document.getElementById(id); e.innerHTML = ''; e.appendChild(document.createTextNode(value == null || value === '' ? '-' : String(value))); }\n"
+    "  function safeJson(s) { try { return JSON.parse(s || '{}'); } catch (e) { return {}; } }\n"
+    "  function showLogin(msg, error) { dashboard.className = 'hidden'; loginPanel.className = 'body'; if (msg) { message.innerHTML = ''; message.appendChild(document.createTextNode(msg)); message.className = error ? 'notice error' : 'notice'; } }\n"
+    "  function showDashboard() { loginPanel.className = 'body hidden'; dashboard.className = ''; }\n"
+    "  function stopTimer() { if (timer) { window.clearTimeout(timer); timer = null; } }\n"
+    "  function request(method, url, body, callback) {\n"
+    "    var xhr = new XMLHttpRequest();\n"
+    "    xhr.open(method, url, true);\n"
+    "    if (method === 'POST') { xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded'); xhr.setRequestHeader('X-VNC-Monitor-Control', '1'); }\n"
+    "    xhr.onreadystatechange = function () { if (xhr.readyState === 4) callback(xhr.status, safeJson(xhr.responseText)); };\n"
+    "    xhr.onerror = function () { callback(0, {}); };\n"
+    "    xhr.send(body || null);\n"
+    "  }\n"
+    "  function render(data) {\n"
+    "    showDashboard();\n"
+    "    text('v-state', data.viewer.state); text('v-transport', data.viewer.transport); text('v-peer', data.viewer.peer); text('v-user', data.viewer.user); text('v-session', data.viewer.session); text('v-ws', data.viewer.websocket ? 'attached' : 'not attached');\n"
+    "    text('a-user', data.active.user); text('a-uid', data.active.available ? data.active.uid : '-'); text('a-session', data.active.session);\n"
+    "    text('s-endpoint', window.location.host); text('s-https', data.settings.httpsPort); text('s-vnc', data.settings.vncPort); text('s-cert', data.settings.certificate); text('s-key', data.settings.privateKey);\n"
+    "    document.getElementById('disconnect-viewer').disabled = !data.viewer.active;\n"
+    "  }\n"
+    "  function refresh() {\n"
+    "    stopTimer();\n"
+    "    request('GET', '/api/manage/status', null, function (status, data) {\n"
+    "      if (status === 200) { render(data); timer = window.setTimeout(refresh, 2000); }\n"
+    "      else if (status === 401) showLogin('Management session is locked.', false);\n"
+    "      else showLogin('Could not read management status.', true);\n"
+    "    });\n"
+    "  }\n"
+    "  form.onsubmit = function (event) {\n"
+    "    if (event && event.preventDefault) event.preventDefault();\n"
+    "    var u = user.value || ''; var p = password.value || '';\n"
+    "    if (!u || !p) { showLogin('Enter your username and password.', true); return false; }\n"
+    "    unlock.disabled = true; message.className = 'notice'; message.innerHTML = 'Authenticating...';\n"
+    "    request('POST', '/api/manage/login', 'username=' + encodeURIComponent(u) + '&password=' + encodeURIComponent(p), function (status) {\n"
+    "      password.value = ''; p = ''; unlock.disabled = false;\n"
+    "      if (status === 200) refresh(); else if (status === 401) showLogin('Authentication failed.', true); else if (status === 409) showLogin('Another management login is already being processed.', true); else showLogin('Management login failed.', true);\n"
+    "    });\n"
+    "    return false;\n"
+    "  };\n"
+    "  document.getElementById('refresh').onclick = refresh;\n"
+    "  document.getElementById('disconnect-viewer').onclick = function () { if (!window.confirm('Disconnect the current viewer session?')) return; request('POST', '/api/manage/disconnect', '', function (status) { if (status === 200 || status === 409) refresh(); else if (status === 401) showLogin('Management session expired.', true); }); };\n"
+    "  document.getElementById('manage-logout').onclick = function () { stopTimer(); request('POST', '/api/manage/logout', '', function () { showLogin('Management session locked.', false); }); };\n"
+    "  refresh();\n"
+    "})();\n";
+
 static void
 set_security_headers(SoupServerMessage *msg)
 {
@@ -332,19 +485,19 @@ request_origin_matches(SoupServerMessage *msg, gboolean required)
 }
 
 static char *
-extract_session_cookie(SoupServerMessage *msg)
+extract_cookie(SoupServerMessage *msg, const char *name)
 {
     SoupMessageHeaders *headers = soup_server_message_get_request_headers(msg);
     const char *cookie = soup_message_headers_get_one(headers, "Cookie");
-    if (!cookie || !*cookie)
+    if (!cookie || !*cookie || !name || !*name)
         return NULL;
 
+    char *prefix = g_strdup_printf("%s=", name);
     char **parts = g_strsplit(cookie, ";", -1);
     char *found = NULL;
 
     for (char **p = parts; p && *p; p++) {
         char *part = g_strstrip(*p);
-        const char prefix[] = WEB_SESSION_COOKIE "=";
         if (!g_str_has_prefix(part, prefix))
             continue;
 
@@ -353,12 +506,18 @@ extract_session_cookie(SoupServerMessage *msg)
             found = NULL;
             break;
         }
-
-        found = g_strdup(part + sizeof(prefix) - 1);
+        found = g_strdup(part + strlen(prefix));
     }
 
     g_strfreev(parts);
+    g_free(prefix);
     return found;
+}
+
+static char *
+extract_session_cookie(SoupServerMessage *msg)
+{
+    return extract_cookie(msg, WEB_SESSION_COOKIE);
 }
 
 static void
@@ -379,6 +538,69 @@ set_session_cookie(SoupServerMessage *msg, const char *token)
         token);
     soup_message_headers_replace(headers, "Set-Cookie", cookie);
     g_free(cookie);
+}
+
+static void
+set_management_cookie(SoupServerMessage *msg, const char *token)
+{
+    SoupMessageHeaders *headers = soup_server_message_get_response_headers(msg);
+    if (!token || !*token) {
+        soup_message_headers_replace(headers,
+                                     "Set-Cookie",
+                                     WEB_MANAGEMENT_COOKIE "=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0");
+        return;
+    }
+
+    char *cookie = g_strdup_printf(
+        WEB_MANAGEMENT_COOKIE "=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=%d",
+        token,
+        WEB_MANAGEMENT_MAX_AGE_S);
+    soup_message_headers_replace(headers, "Set-Cookie", cookie);
+    g_free(cookie);
+}
+
+static gboolean
+management_request_authenticated(WebServer *web, SoupServerMessage *msg)
+{
+    char *token = extract_cookie(msg, WEB_MANAGEMENT_COOKIE);
+    gboolean ok = token &&
+                  web->hooks.validate_management_token &&
+                  web->hooks.validate_management_token(token, web->user_data);
+    g_free(token);
+    return ok;
+}
+
+static gboolean
+management_control_request_allowed(SoupServerMessage *msg)
+{
+    SoupMessageHeaders *headers = soup_server_message_get_request_headers(msg);
+    const char *control = soup_message_headers_get_one(headers, WEB_CONTROL_HEADER);
+    return control && strcmp(control, "1") == 0 &&
+           request_origin_matches(msg, FALSE);
+}
+
+static char *
+json_escape(const char *value)
+{
+    if (!value)
+        return g_strdup("");
+
+    GString *out = g_string_new(NULL);
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        switch (*p) {
+            case '"': g_string_append(out, "\\\""); break;
+            case '\\': g_string_append(out, "\\\\"); break;
+            case '\n': g_string_append(out, "\\n"); break;
+            case '\r': g_string_append(out, "\\r"); break;
+            case '\t': g_string_append(out, "\\t"); break;
+            default:
+                if (*p < 0x20)
+                    g_string_append_printf(out, "\\u%04x", (unsigned)*p);
+                else
+                    g_string_append_c(out, (char)*p);
+        }
+    }
+    return g_string_free(out, FALSE);
 }
 
 static void
@@ -432,6 +654,36 @@ client_js_handler(SoupServer *server,
                  SOUP_STATUS_OK,
                  "text/javascript; charset=utf-8",
                  client_js);
+}
+
+static void
+management_page_handler(SoupServer *server,
+                        SoupServerMessage *msg,
+                        const char *path,
+                        GHashTable *query,
+                        gpointer user_data)
+{
+    (void)server; (void)path; (void)query; (void)user_data;
+    if (strcmp(soup_server_message_get_method(msg), "GET") != 0) {
+        respond_method_not_allowed(msg, "GET");
+        return;
+    }
+    respond_text(msg, SOUP_STATUS_OK, "text/html; charset=utf-8", management_page);
+}
+
+static void
+management_js_handler(SoupServer *server,
+                      SoupServerMessage *msg,
+                      const char *path,
+                      GHashTable *query,
+                      gpointer user_data)
+{
+    (void)server; (void)path; (void)query; (void)user_data;
+    if (strcmp(soup_server_message_get_method(msg), "GET") != 0) {
+        respond_method_not_allowed(msg, "GET");
+        return;
+    }
+    respond_text(msg, SOUP_STATUS_OK, "text/javascript; charset=utf-8", management_js);
 }
 
 static void
@@ -662,6 +914,231 @@ login_handler(SoupServer *server,
 
     if (start != WEB_SERVER_AUTH_STARTED)
         login_auth_complete(start, NULL, pending);
+}
+
+static void
+management_auth_complete(WebServerAuthResult result,
+                         const char *session_token,
+                         gpointer completion_data)
+{
+    PendingLogin *pending = completion_data;
+    if (!pending)
+        return;
+
+    if (result == WEB_SERVER_AUTH_OK && session_token && *session_token) {
+        set_management_cookie(pending->msg, session_token);
+        respond_text(pending->msg, SOUP_STATUS_OK, "application/json; charset=utf-8", "{\"ok\":true}\n");
+    }
+    else if (result == WEB_SERVER_AUTH_DENIED) {
+        set_management_cookie(pending->msg, NULL);
+        respond_text(pending->msg, SOUP_STATUS_UNAUTHORIZED, "application/json; charset=utf-8", "{\"error\":\"authentication-failed\"}\n");
+    }
+    else if (result == WEB_SERVER_AUTH_BUSY) {
+        respond_text(pending->msg, SOUP_STATUS_CONFLICT, "application/json; charset=utf-8", "{\"error\":\"busy\"}\n");
+    }
+    else if (result == WEB_SERVER_AUTH_UNAVAILABLE) {
+        respond_text(pending->msg, SOUP_STATUS_SERVICE_UNAVAILABLE, "application/json; charset=utf-8", "{\"error\":\"unavailable\"}\n");
+    }
+    else {
+        respond_text(pending->msg, SOUP_STATUS_INTERNAL_SERVER_ERROR, "application/json; charset=utf-8", "{\"error\":\"authentication-error\"}\n");
+    }
+
+    soup_server_message_unpause(pending->msg);
+    g_object_unref(pending->msg);
+    g_free(pending);
+}
+
+static void
+management_login_handler(SoupServer *server,
+                         SoupServerMessage *msg,
+                         const char *path,
+                         GHashTable *query,
+                         gpointer user_data)
+{
+    (void)server; (void)path; (void)query;
+    WebServer *web = user_data;
+
+    if (strcmp(soup_server_message_get_method(msg), "POST") != 0) {
+        respond_method_not_allowed(msg, "POST");
+        return;
+    }
+    if (!management_control_request_allowed(msg) || !web->hooks.begin_management_auth) {
+        respond_text(msg, SOUP_STATUS_FORBIDDEN, "application/json; charset=utf-8", "{\"error\":\"request-rejected\"}\n");
+        return;
+    }
+
+    SoupMessageHeaders *headers = soup_server_message_get_request_headers(msg);
+    const char *content_type = soup_message_headers_get_content_type(headers, NULL);
+    SoupMessageBody *request_body = soup_server_message_get_request_body(msg);
+    if (!content_type ||
+        g_ascii_strcasecmp(content_type, "application/x-www-form-urlencoded") != 0 ||
+        !request_body || !request_body->data ||
+        request_body->length <= 0 || request_body->length > WEB_LOGIN_BODY_MAX) {
+        respond_text(msg, SOUP_STATUS_BAD_REQUEST, "application/json; charset=utf-8", "{\"error\":\"invalid-request\"}\n");
+        return;
+    }
+
+    GHashTable *form = soup_form_decode((const char *)request_body->data);
+    if (!form) {
+        respond_text(msg, SOUP_STATUS_BAD_REQUEST, "application/json; charset=utf-8", "{\"error\":\"invalid-request\"}\n");
+        return;
+    }
+
+    char *username = g_hash_table_lookup(form, "username");
+    char *password = g_hash_table_lookup(form, "password");
+    size_t username_len = username ? strlen(username) : 0;
+    size_t password_len = password ? strlen(password) : 0;
+    if (!username || !password ||
+        username_len == 0 || password_len == 0 ||
+        username_len > VNC_BROKER_AUTH_USERNAME_MAX ||
+        password_len > VNC_BROKER_AUTH_PASSWORD_MAX) {
+        if (password)
+            secure_clear_string(password);
+        g_hash_table_destroy(form);
+        soup_message_body_truncate(request_body);
+        respond_text(msg, SOUP_STATUS_BAD_REQUEST, "application/json; charset=utf-8", "{\"error\":\"invalid-request\"}\n");
+        return;
+    }
+
+    const char *peer_addr = soup_server_message_get_remote_host(msg);
+    if (!peer_addr || !*peer_addr)
+        peer_addr = "unknown";
+
+    PendingLogin *pending = g_new0(PendingLogin, 1);
+    pending->msg = g_object_ref(msg);
+    soup_server_message_pause(msg);
+
+    WebServerAuthResult start =
+        web->hooks.begin_management_auth(username,
+                                         password,
+                                         peer_addr,
+                                         management_auth_complete,
+                                         pending,
+                                         web->user_data);
+
+    secure_clear_string(password);
+    g_hash_table_destroy(form);
+    soup_message_body_truncate(request_body);
+
+    if (start != WEB_SERVER_AUTH_STARTED)
+        management_auth_complete(start, NULL, pending);
+}
+
+static void
+management_status_handler(SoupServer *server,
+                          SoupServerMessage *msg,
+                          const char *path,
+                          GHashTable *query,
+                          gpointer user_data)
+{
+    (void)server; (void)path; (void)query;
+    WebServer *web = user_data;
+
+    if (strcmp(soup_server_message_get_method(msg), "GET") != 0) {
+        respond_method_not_allowed(msg, "GET");
+        return;
+    }
+    if (!management_request_authenticated(web, msg)) {
+        respond_text(msg, SOUP_STATUS_UNAUTHORIZED, "application/json; charset=utf-8", "{\"error\":\"authentication-required\"}\n");
+        return;
+    }
+
+    WebServerManagementInfo info;
+    if (!web->hooks.get_management_info ||
+        web->hooks.get_management_info(&info, web->user_data) < 0) {
+        respond_text(msg, SOUP_STATUS_INTERNAL_SERVER_ERROR, "application/json; charset=utf-8", "{\"error\":\"status-unavailable\"}\n");
+        return;
+    }
+
+    char *viewer_state = json_escape(info.viewer_state);
+    char *viewer_transport = json_escape(info.viewer_transport);
+    char *viewer_peer = json_escape(info.viewer_peer);
+    char *viewer_user = json_escape(info.viewer_user);
+    char *viewer_session = json_escape(info.viewer_session_id);
+    char *active_user = json_escape(info.active_user);
+    char *active_session = json_escape(info.active_session_id);
+    char *certificate = json_escape(web->certificate_file);
+    char *private_key = json_escape(web->private_key_file);
+
+    char *body = g_strdup_printf(
+        "{\"viewer\":{\"active\":%s,\"state\":\"%s\",\"transport\":\"%s\","
+        "\"peer\":\"%s\",\"user\":\"%s\",\"session\":\"%s\",\"websocket\":%s},"
+        "\"active\":{\"available\":%s,\"uid\":%u,\"user\":\"%s\",\"session\":\"%s\"},"
+        "\"settings\":{\"httpsPort\":%u,\"vncPort\":%d,\"certificate\":\"%s\",\"privateKey\":\"%s\"}}\n",
+        info.viewer_active ? "true" : "false",
+        viewer_state,
+        viewer_transport,
+        viewer_peer,
+        viewer_user,
+        viewer_session,
+        info.websocket_attached ? "true" : "false",
+        info.active_user_available ? "true" : "false",
+        info.active_uid,
+        active_user,
+        active_session,
+        web->port,
+        info.vnc_port,
+        certificate,
+        private_key);
+
+    respond_text(msg, SOUP_STATUS_OK, "application/json; charset=utf-8", body);
+
+    g_free(body); g_free(viewer_state); g_free(viewer_transport); g_free(viewer_peer);
+    g_free(viewer_user); g_free(viewer_session); g_free(active_user); g_free(active_session);
+    g_free(certificate); g_free(private_key);
+}
+
+static void
+management_disconnect_handler(SoupServer *server,
+                              SoupServerMessage *msg,
+                              const char *path,
+                              GHashTable *query,
+                              gpointer user_data)
+{
+    (void)server; (void)path; (void)query;
+    WebServer *web = user_data;
+
+    if (strcmp(soup_server_message_get_method(msg), "POST") != 0) {
+        respond_method_not_allowed(msg, "POST");
+        return;
+    }
+    if (!management_control_request_allowed(msg) ||
+        !management_request_authenticated(web, msg)) {
+        respond_text(msg, SOUP_STATUS_UNAUTHORIZED, "application/json; charset=utf-8", "{\"error\":\"authentication-required\"}\n");
+        return;
+    }
+
+    if (!web->hooks.disconnect_viewer ||
+        !web->hooks.disconnect_viewer(web->user_data)) {
+        respond_text(msg, SOUP_STATUS_CONFLICT, "application/json; charset=utf-8", "{\"error\":\"no-active-viewer\"}\n");
+        return;
+    }
+    respond_text(msg, SOUP_STATUS_OK, "application/json; charset=utf-8", "{\"ok\":true}\n");
+}
+
+static void
+management_logout_handler(SoupServer *server,
+                          SoupServerMessage *msg,
+                          const char *path,
+                          GHashTable *query,
+                          gpointer user_data)
+{
+    (void)server; (void)path; (void)query;
+    WebServer *web = user_data;
+
+    if (strcmp(soup_server_message_get_method(msg), "POST") != 0) {
+        respond_method_not_allowed(msg, "POST");
+        return;
+    }
+    if (!management_control_request_allowed(msg)) {
+        respond_text(msg, SOUP_STATUS_FORBIDDEN, "application/json; charset=utf-8", "{\"error\":\"request-rejected\"}\n");
+        return;
+    }
+
+    if (web->hooks.management_logout)
+        web->hooks.management_logout(web->user_data);
+    set_management_cookie(msg, NULL);
+    respond_text(msg, SOUP_STATUS_OK, "application/json; charset=utf-8", "{\"ok\":true}\n");
 }
 
 static void
@@ -938,6 +1415,8 @@ web_server_start(WebServer **out,
 
     WebServer *web = g_new0(WebServer, 1);
     web->port = port;
+    web->certificate_file = g_strdup(cert_file);
+    web->private_key_file = g_strdup(key_file);
     web->user_data = user_data;
     if (hooks)
         web->hooks = *hooks;
@@ -954,6 +1433,8 @@ web_server_start(WebServer **out,
         g_clear_error(&error);
         g_free(cert_file);
         g_free(key_file);
+        g_free(web->certificate_file);
+        g_free(web->private_key_file);
         g_free(web);
         return -1;
     }
@@ -965,6 +1446,8 @@ web_server_start(WebServer **out,
     if (!web->server) {
         LOG_ERROR("Could not create broker HTTPS server");
         g_object_unref(web->certificate);
+        g_free(web->certificate_file);
+        g_free(web->private_key_file);
         g_free(web);
         return -1;
     }
@@ -972,7 +1455,13 @@ web_server_start(WebServer **out,
     soup_server_set_tls_certificate(web->server, web->certificate);
     soup_server_add_handler(web->server, "/api/status", status_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/login", login_handler, web, NULL);
+    soup_server_add_handler(web->server, "/api/manage/login", management_login_handler, web, NULL);
+    soup_server_add_handler(web->server, "/api/manage/status", management_status_handler, web, NULL);
+    soup_server_add_handler(web->server, "/api/manage/disconnect", management_disconnect_handler, web, NULL);
+    soup_server_add_handler(web->server, "/api/manage/logout", management_logout_handler, web, NULL);
     soup_server_add_handler(web->server, "/client.js", client_js_handler, web, NULL);
+    soup_server_add_handler(web->server, "/manage.js", management_js_handler, web, NULL);
+    soup_server_add_handler(web->server, "/manage", management_page_handler, web, NULL);
     soup_server_add_handler(web->server, "/ws", ws_guard_handler, web, NULL);
     soup_server_add_websocket_handler(web->server,
                                       "/ws",
@@ -996,6 +1485,8 @@ web_server_start(WebServer **out,
         soup_server_disconnect(web->server);
         g_object_unref(web->server);
         g_object_unref(web->certificate);
+        g_free(web->certificate_file);
+        g_free(web->private_key_file);
         g_free(web);
         return -1;
     }
@@ -1043,5 +1534,7 @@ web_server_stop(WebServer *web)
     if (web->certificate)
         g_object_unref(web->certificate);
 
+    g_free(web->certificate_file);
+    g_free(web->private_key_file);
     g_free(web);
 }
