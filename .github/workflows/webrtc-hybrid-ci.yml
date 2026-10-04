@@ -58,6 +58,28 @@ jobs:
             -o build/broker_protocol_test
           ./build/broker_protocol_test
 
+      - name: TLS certificate/private-key regression
+        run: |
+          mkdir -p build/tls-test
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
+            -subj '/CN=pair-one' \
+            -keyout build/tls-test/key-one.pem \
+            -out build/tls-test/cert-one.pem >/dev/null 2>&1
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
+            -subj '/CN=pair-two' \
+            -keyout build/tls-test/key-two.pem \
+            -out build/tls-test/cert-two.pem >/dev/null 2>&1
+          cc -Iinclude -O2 -Wall -Wextra \
+            tests/tls_pair_test.c src/tls_pair.c \
+            $(pkg-config --cflags --libs openssl) \
+            -o build/tls_pair_test
+          ./build/tls_pair_test \
+            build/tls-test/cert-one.pem \
+            build/tls-test/key-one.pem ok
+          ./build/tls_pair_test \
+            build/tls-test/cert-one.pem \
+            build/tls-test/key-two.pem fail
+
       - name: Legacy Safari web frontend regression
         run: |
           bash tests/web_legacy_safari_test.sh

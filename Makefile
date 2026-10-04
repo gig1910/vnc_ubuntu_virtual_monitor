@@ -5,7 +5,7 @@ CFLAGS   += -O2 -Wall -Wextra -pthread -MMD -MP
 
 PACKAGES := libvncserver openssl nettle glib-2.0 gio-2.0 \
 	gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 libpipewire-0.3
-BROKER_PACKAGES := glib-2.0 gio-2.0 libsoup-3.0
+BROKER_PACKAGES := glib-2.0 gio-2.0 libsoup-3.0 openssl
 
 PKG_CFLAGS := $(shell pkg-config --cflags $(PACKAGES))
 PKG_LIBS   := $(shell pkg-config --libs $(PACKAGES))
@@ -38,7 +38,7 @@ SOURCES := \
 	src/ra2_stream_coalescer.c
 
 OBJECTS := $(SOURCES:.c=.o)
-BROKER_OBJECTS := src/broker.o src/broker_protocol.o src/log.o src/web_server.o
+BROKER_OBJECTS := src/broker.o src/broker_protocol.o src/log.o src/web_server.o src/tls_pair.o
 DEPS := $(sort $(OBJECTS:.o=.d) $(BROKER_OBJECTS:.o=.d))
 
 TARGET := vnc-monitor
@@ -93,7 +93,10 @@ src/main.o: src/main.c include/broker_peercred.h
 src/broker.o: src/broker.c include/web_server.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(BROKER_PKG_CFLAGS) -c $< -o $@
 
-src/web_server.o: src/web_server.c include/web_server.h
+src/web_server.o: src/web_server.c include/web_server.h include/tls_pair.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(BROKER_PKG_CFLAGS) -c $< -o $@
+
+src/tls_pair.o: src/tls_pair.c include/tls_pair.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(BROKER_PKG_CFLAGS) -c $< -o $@
 
 src/%.o: src/%.c

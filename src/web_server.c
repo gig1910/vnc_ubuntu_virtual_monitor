@@ -3,6 +3,7 @@
 #include "web_server.h"
 #include "broker_protocol.h"
 #include "log.h"
+#include "tls_pair.h"
 
 #include <gio/gio.h>
 #include <libsoup/soup.h>
@@ -1294,26 +1295,29 @@ management_settings_handler(SoupServer *server,
         return;
     }
 
-    GError *error = NULL;
-    GTlsCertificate *candidate =
-        g_tls_certificate_new_from_files(certificate_file,
-                                         private_key_file,
-                                         &error);
-    if (!candidate) {
+    char tls_reason[64] = {0};
+    if (tls_pair_validate(certificate_file,
+                          private_key_file,
+                          tls_reason,
+                          sizeof(tls_reason)) < 0) {
         LOG_INFO("Management rejected TLS settings: %s",
-                 error ? error->message : "certificate/key load failed");
-        g_clear_error(&error);
+                 tls_reason[0] ? tls_reason : "certificate-or-key-invalid");
+
+        char *body = g_strdup_printf(
+            "{\"error\":\"%s\"}\n",
+            tls_reason[0] ? tls_reason : "certificate-or-key-invalid");
+
         g_hash_table_destroy(form);
         soup_message_body_truncate(request_body);
         respond_text(msg,
                      SOUP_STATUS_BAD_REQUEST,
                      "application/json; charset=utf-8",
-                     "{\"error\":\"certificate-or-key-invalid\"}\n");
+                     body);
+        g_free(body);
         return;
     }
-    g_object_unref(candidate);
 
-    error = NULL;
+    GError *error = NULL;
     if (!save_web_settings(web,
                            port,
                            certificate_file,
@@ -1675,6 +1679,20 @@ web_server_start(WebServer **out,
     g_key_file_unref(keyfile);
 
     if (!cert_file || !key_file) {
+        g_free(cert_file);
+        g_free(key_file);
+        return -1;
+    }
+
+    char tls_reason[64] = {0};
+    if (tls_pair_validate(cert_file,
+                          key_file,
+                          tls_reason,
+                          sizeof(tls_reason)) < 0) {
+        LOG_ERROR("Web HTTPS certificate/private-key validation failed (%s, %s): %s",
+                  cert_file,
+                  key_file,
+                  tls_reason[0] ? tls_reason : "invalid TLS identity");
         g_free(cert_file);
         g_free(key_file);
         return -1;
