@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "web_server.h"
+#include "broker_protocol.h"
 #include "log.h"
 
 #include <gio/gio.h>

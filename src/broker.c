@@ -596,6 +596,8 @@ vnc_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
     return G_SOURCE_REMOVE;
 }
 
+static int connect_agent(const ActiveSession *session);
+
 static gboolean
 web_attach_timeout_cb(gpointer user_data)
 {
