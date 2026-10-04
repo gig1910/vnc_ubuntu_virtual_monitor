@@ -382,6 +382,64 @@ test_web_auth_limits(void)
     close(control[1]);
 }
 
+static void
+test_video_frame_chunk_roundtrip(void)
+{
+    int control[2] = {-1, -1};
+    CHECK(make_seqpacket_pair(control) == 0);
+
+    size_t jpeg_size = VNC_BROKER_CONTROL_PAYLOAD_MAX * 2u + 17u;
+    uint8_t *jpeg = malloc(jpeg_size);
+    CHECK(jpeg != NULL);
+    if (!jpeg) {
+        close(control[0]);
+        close(control[1]);
+        return;
+    }
+
+    for (size_t i = 0; i < jpeg_size; i++)
+        jpeg[i] = (uint8_t)(i & 0xffu);
+
+    CHECK(vnc_broker_send_video_frame(control[0], 1024, 768,
+                                      jpeg, jpeg_size) == 0);
+
+    uint8_t payload[VNC_BROKER_CONTROL_PAYLOAD_MAX];
+    VncBrokerControlType type;
+    size_t payload_len = 0;
+
+    CHECK(vnc_broker_recv_control(control[1], &type, payload,
+                                  sizeof(payload), &payload_len) == 0);
+    CHECK(type == VNC_BROKER_CONTROL_VIDEO_FRAME_BEGIN);
+
+    uint32_t width = 0, height = 0, announced = 0;
+    CHECK(vnc_broker_parse_video_frame_begin(payload, payload_len,
+                                             &width, &height, &announced) == 0);
+    CHECK(width == 1024);
+    CHECK(height == 768);
+    CHECK(announced == jpeg_size);
+
+    size_t received = 0;
+    while (received < jpeg_size) {
+        CHECK(vnc_broker_recv_control(control[1], &type, payload,
+                                      sizeof(payload), &payload_len) == 0);
+        CHECK(type == VNC_BROKER_CONTROL_VIDEO_FRAME_CHUNK);
+        CHECK(payload_len > 0);
+        CHECK(received + payload_len <= jpeg_size);
+        if (received + payload_len <= jpeg_size)
+            CHECK(memcmp(payload, jpeg + received, payload_len) == 0);
+        received += payload_len;
+    }
+
+    CHECK(vnc_broker_recv_control(control[1], &type, payload,
+                                  sizeof(payload), &payload_len) == 0);
+    CHECK(type == VNC_BROKER_CONTROL_VIDEO_FRAME_END);
+    CHECK(payload_len == 0);
+
+    free(jpeg);
+    close(control[0]);
+    close(control[1]);
+}
+
 int
 main(void)
 {
@@ -392,6 +450,7 @@ main(void)
     test_transport_fd_contract();
     test_web_auth_control_roundtrip();
     test_web_auth_limits();
+    test_video_frame_chunk_roundtrip();
 
     if (failures != 0) {
         fprintf(stderr, "broker_protocol_test: %d failure(s)\n", failures);

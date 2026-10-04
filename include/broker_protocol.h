@@ -15,6 +15,7 @@
 #define VNC_BROKER_AUTH_USERNAME_MAX    255u
 #define VNC_BROKER_AUTH_PASSWORD_MAX    4096u
 #define VNC_BROKER_CONTROL_PAYLOAD_MAX  8192u
+#define VNC_BROKER_VIDEO_FRAME_MAX      (4u * 1024u * 1024u)
 
 typedef enum {
     /* Protocol-v1 handoffs from beta.3 used zero in this former reserved field. */
@@ -46,7 +47,12 @@ typedef enum {
     VNC_BROKER_CONTROL_SDP_OFFER = 10,
     VNC_BROKER_CONTROL_SDP_ANSWER = 11,
     VNC_BROKER_CONTROL_ICE_CANDIDATE = 12,
-    VNC_BROKER_CONTROL_DISPLAY_SIZE = 13
+    VNC_BROKER_CONTROL_DISPLAY_SIZE = 13,
+
+    VNC_BROKER_CONTROL_MEDIA_START = 20,
+    VNC_BROKER_CONTROL_VIDEO_FRAME_BEGIN = 30,
+    VNC_BROKER_CONTROL_VIDEO_FRAME_CHUNK = 31,
+    VNC_BROKER_CONTROL_VIDEO_FRAME_END = 32
 } VncBrokerControlType;
 
 typedef enum {
@@ -131,5 +137,20 @@ int vnc_broker_send_web_auth_result(int control_fd,
 
 int vnc_broker_recv_web_auth_result(int control_fd,
                                     VncBrokerWebAuthResult *result);
+
+int vnc_broker_send_video_frame_begin(int control_fd,
+                                      uint32_t width,
+                                      uint32_t height,
+                                      uint32_t jpeg_size);
+int vnc_broker_parse_video_frame_begin(const void *payload,
+                                       size_t payload_len,
+                                       uint32_t *width,
+                                       uint32_t *height,
+                                       uint32_t *jpeg_size);
+int vnc_broker_send_video_frame(int control_fd,
+                                uint32_t width,
+                                uint32_t height,
+                                const void *jpeg,
+                                size_t jpeg_size);
 
 #endif

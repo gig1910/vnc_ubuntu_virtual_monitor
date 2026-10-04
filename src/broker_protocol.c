@@ -44,6 +44,24 @@ put_u16_be(uint8_t *p, uint16_t value)
     p[1] = (uint8_t)value;
 }
 
+static uint32_t
+get_u32_be(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+static void
+put_u32_be(uint8_t *p, uint32_t value)
+{
+    p[0] = (uint8_t)(value >> 24);
+    p[1] = (uint8_t)(value >> 16);
+    p[2] = (uint8_t)(value >> 8);
+    p[3] = (uint8_t)value;
+}
+
 static int
 transport_is_vnc(uint16_t transport)
 {
@@ -539,4 +557,93 @@ vnc_broker_recv_web_auth_result(int control_fd,
 
     *result = (VncBrokerWebAuthResult)payload;
     return 0;
+}
+
+
+int
+vnc_broker_send_video_frame_begin(int control_fd,
+                                  uint32_t width,
+                                  uint32_t height,
+                                  uint32_t jpeg_size)
+{
+    if (width == 0 || height == 0 ||
+        jpeg_size == 0 || jpeg_size > VNC_BROKER_VIDEO_FRAME_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint8_t payload[12];
+    put_u32_be(payload, width);
+    put_u32_be(payload + 4, height);
+    put_u32_be(payload + 8, jpeg_size);
+
+    return vnc_broker_send_control(control_fd,
+                                   VNC_BROKER_CONTROL_VIDEO_FRAME_BEGIN,
+                                   payload,
+                                   sizeof(payload));
+}
+
+int
+vnc_broker_parse_video_frame_begin(const void *payload,
+                                   size_t payload_len,
+                                   uint32_t *width,
+                                   uint32_t *height,
+                                   uint32_t *jpeg_size)
+{
+    if (!payload || payload_len != 12 || !width || !height || !jpeg_size) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const uint8_t *bytes = payload;
+    uint32_t parsed_width = get_u32_be(bytes);
+    uint32_t parsed_height = get_u32_be(bytes + 4);
+    uint32_t parsed_size = get_u32_be(bytes + 8);
+
+    if (parsed_width == 0 || parsed_height == 0 ||
+        parsed_size == 0 || parsed_size > VNC_BROKER_VIDEO_FRAME_MAX) {
+        errno = EPROTO;
+        return -1;
+    }
+
+    *width = parsed_width;
+    *height = parsed_height;
+    *jpeg_size = parsed_size;
+    return 0;
+}
+
+int
+vnc_broker_send_video_frame(int control_fd,
+                            uint32_t width,
+                            uint32_t height,
+                            const void *jpeg,
+                            size_t jpeg_size)
+{
+    if (!jpeg || jpeg_size == 0 ||
+        jpeg_size > VNC_BROKER_VIDEO_FRAME_MAX ||
+        jpeg_size > UINT32_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (vnc_broker_send_video_frame_begin(control_fd, width, height,
+                                          (uint32_t)jpeg_size) < 0)
+        return -1;
+
+    const uint8_t *bytes = jpeg;
+    size_t offset = 0;
+    while (offset < jpeg_size) {
+        size_t chunk = jpeg_size - offset;
+        if (chunk > VNC_BROKER_CONTROL_PAYLOAD_MAX)
+            chunk = VNC_BROKER_CONTROL_PAYLOAD_MAX;
+        if (vnc_broker_send_control(control_fd,
+                                    VNC_BROKER_CONTROL_VIDEO_FRAME_CHUNK,
+                                    bytes + offset, chunk) < 0)
+            return -1;
+        offset += chunk;
+    }
+
+    return vnc_broker_send_control(control_fd,
+                                   VNC_BROKER_CONTROL_VIDEO_FRAME_END,
+                                   NULL, 0);
 }
