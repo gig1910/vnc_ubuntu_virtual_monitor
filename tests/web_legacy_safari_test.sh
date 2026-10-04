@@ -6,6 +6,7 @@ source_file="src/web_server.c"
 client_js="$(
     awk '
         /static const char client_js\[\] =/ { capture = 1; next }
+        capture && /static const char management_page\[\] =/ { exit }
         capture && /^static void$/ { exit }
         capture { print }
     ' "$source_file"
