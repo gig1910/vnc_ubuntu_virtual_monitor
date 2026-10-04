@@ -730,6 +730,17 @@ serve_web_media_lifetime(int control_fd,
                          FrameBridge *frames,
                          PipelineStats *pipeline_stats)
 {
+    if (cfg->width <= 0 || cfg->height <= 0 ||
+        (uint32_t)cfg->width > VNC_BROKER_VIDEO_DIMENSION_MAX ||
+        (uint32_t)cfg->height > VNC_BROKER_VIDEO_DIMENSION_MAX) {
+        LOG_ERROR("Legacy browser media size %dx%d exceeds safe limit %u",
+                  cfg->width,
+                  cfg->height,
+                  VNC_BROKER_VIDEO_DIMENSION_MAX);
+        errno = EINVAL;
+        return -1;
+    }
+
     RealMonitor real;
     memset(&real, 0, sizeof(real));
 

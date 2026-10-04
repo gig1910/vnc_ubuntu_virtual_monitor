@@ -16,6 +16,7 @@
 #define VNC_BROKER_AUTH_PASSWORD_MAX    4096u
 #define VNC_BROKER_CONTROL_PAYLOAD_MAX  8192u
 #define VNC_BROKER_VIDEO_FRAME_MAX      (4u * 1024u * 1024u)
+#define VNC_BROKER_VIDEO_DIMENSION_MAX  4096u
 
 typedef enum {
     /* Protocol-v1 handoffs from beta.3 used zero in this former reserved field. */

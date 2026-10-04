@@ -626,7 +626,8 @@ broker_handle_web_media_packet(Broker *broker,
             vnc_broker_parse_video_frame_begin(payload, payload_len,
                                                &width, &height,
                                                &jpeg_size) < 0 ||
-            width > 8192 || height > 8192)
+            width > VNC_BROKER_VIDEO_DIMENSION_MAX ||
+            height > VNC_BROKER_VIDEO_DIMENSION_MAX)
             return FALSE;
 
         broker->web_frame_buffer = g_byte_array_sized_new(jpeg_size);
@@ -694,6 +695,7 @@ clear_session(Broker *broker, int reset)
 
     broker_invalidate_web_token(broker);
     broker_reset_web_frame(broker);
+    broker->web_frames_forwarded = 0;
 
     if (broker->web_attach_timeout_source) {
         guint source = broker->web_attach_timeout_source;
