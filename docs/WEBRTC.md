@@ -127,8 +127,11 @@ POST /api/login
     -> credentials are sent only over the local broker-agent channel
     -> agent invokes the existing PAM helper as that Unix user
     -> username must equal the bound active-session owner
-    -> PAM success: state becomes ACTIVE_WEBRTC
-    -> until WSS lands, broker holds a 15-second attach window and then revokes
+    -> PAM success: broker creates a 256-bit opaque one-time attach token
+    -> token is returned only as Secure + HttpOnly + SameSite=Strict cookie
+    -> state becomes ACTIVE_WEBRTC
+    -> browser has 15 seconds to attach authenticated WSS /ws
+    -> successful WSS bind consumes the token and cancels the attach timeout
 ```
 
 The password is never stored by the application and is not placed in URLs, logs, cookies or WebRTC signalling. The broker forwards it once over the bound local SOCK_SEQPACKET control channel and clears request-side decoded buffers after dispatch.
@@ -137,9 +140,15 @@ The login page itself does not reserve the display slot. Only an authentication 
 
 ## Signalling
 
-After authentication the browser opens a WSS endpoint using the authenticated web session.
+After authentication the browser opens `/ws` on the same HTTPS origin. The
+broker validates the one-time HttpOnly cookie during the WebSocket handshake,
+then consumes the token on the first successful bind. A second socket cannot
+reuse it. Closing the authenticated WebSocket immediately revokes the bound
+agent control session and releases the global slot.
 
-The broker forwards signalling messages over the already authenticated/bound Unix control channel:
+The WSS transport is now authenticated and lifetime-bound; SDP/ICE forwarding
+is the next checkpoint. Once enabled, the broker forwards signalling messages
+over the already authenticated/bound Unix control channel:
 
 - SDP offer;
 - SDP answer;
@@ -206,8 +215,8 @@ WebRTC handoff intentionally carries no browser fd because HTTPS/WSS terminates 
 2. Replace broker `active` / `revoked` booleans with one transport-neutral global session state machine. **Done.**
 3. Add broker HTTPS listener, TLS configuration and static login page. **Done.**
 4. Add broker-agent PAM request/reply messages and the asynchronous broker-backed web authentication lifecycle. **Done.**
-5. Add authenticated WSS signalling and explicit broker `REVOKE` control message.
-6. Add agent-side `webrtcbin` session skeleton and SDP/ICE exchange.
+5. Add opaque session token, authenticated WSS binding and explicit broker `REVOKE` lifecycle. **Done.**
+6. Add SDP/ICE message forwarding and the agent-side `webrtcbin` session skeleton.
 7. Feed the existing Mutter/PipeWire virtual monitor into the WebRTC video pipeline.
 8. Add browser display sizing/orientation negotiation.
 9. Exercise VNC-vs-WebRTC mutual exclusion and all existing Fast User Switching / GDM revocation scenarios.

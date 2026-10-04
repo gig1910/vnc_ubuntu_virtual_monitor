@@ -16,6 +16,7 @@ typedef enum {
 } WebServerAuthResult;
 
 typedef void (*WebServerAuthComplete)(WebServerAuthResult result,
+                                      const char *session_token,
                                       gpointer completion_data);
 
 typedef struct {
@@ -28,6 +29,9 @@ typedef struct {
      *
      * Return WEB_SERVER_AUTH_STARTED when completion will be called later.
      * Any other result is an immediate terminal result.
+     *
+     * A successful asynchronous completion carries a short-lived opaque token
+     * that web_server exposes only as an HttpOnly cookie.
      */
     WebServerAuthResult (*begin_auth)(const char *username,
                                       const char *password,
@@ -35,6 +39,15 @@ typedef struct {
                                       WebServerAuthComplete completion,
                                       gpointer completion_data,
                                       gpointer user_data);
+
+    /* Validate and then atomically consume the one-time WSS attach token. */
+    gboolean (*validate_websocket_token)(const char *token,
+                                         gpointer user_data);
+    gboolean (*bind_websocket)(const char *token,
+                               gpointer user_data);
+
+    /* Called only for the currently bound authenticated WebSocket. */
+    void (*websocket_closed)(gpointer user_data);
 } WebServerHooks;
 
 /*
@@ -50,6 +63,9 @@ int web_server_start(WebServer **out,
                      const char *config_file,
                      const WebServerHooks *hooks,
                      gpointer user_data);
+
+/* Close the bound browser signalling socket, if one exists. */
+void web_server_close_websocket(WebServer *server);
 
 void web_server_stop(WebServer *server);
 

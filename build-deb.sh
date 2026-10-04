@@ -342,8 +342,8 @@ Description: GNOME Wayland virtual monitor over VNC
  Wayland login session through a view-only RA2r VNC server. A root system broker
  owns the public listener and routes each new connection only to the currently
  active seat0 user's unprivileged session agent. The broker also contains an
- optional HTTPS scaffold for browser/WebRTC transport, disabled by default.
- Switch-user/logoff revokes the bound connection instead of moving it to
+ optional PAM-authenticated HTTPS/WSS control path for browser/WebRTC transport,
+ disabled by default. Switch-user/logoff revokes the bound connection instead of moving it to
  another login session.
 EOF
 

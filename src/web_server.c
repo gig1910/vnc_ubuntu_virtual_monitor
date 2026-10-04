@@ -13,10 +13,14 @@
 #define WEB_DEFAULT_CERT_FILE  "/etc/vnc-monitor/tls/server.crt"
 #define WEB_DEFAULT_KEY_FILE   "/etc/vnc-monitor/tls/server.key"
 #define WEB_LOGIN_BODY_MAX      8192
+#define WEB_WS_MESSAGE_MAX      8192
+#define WEB_SESSION_COOKIE      "vnc-monitor-session"
+#define WEB_WS_TOKEN_DATA_KEY   "vnc-monitor-ws-token"
 
 struct WebServer {
     SoupServer *server;
     GTlsCertificate *certificate;
+    SoupWebsocketConnection *websocket;
     guint port;
     WebServerHooks hooks;
     gpointer user_data;
@@ -36,21 +40,57 @@ static const char login_page[] =
     "    label { display: grid; gap: .25rem; }\n"
     "    input, button { font: inherit; padding: .6rem; }\n"
     "    .note { opacity: .75; }\n"
+    "    #status { white-space: pre-wrap; min-height: 2.5rem; }\n"
     "  </style>\n"
+    "  <script src=\"/client.js\" defer></script>\n"
     "</head>\n"
     "<body>\n"
     "  <main>\n"
     "    <h1>VNC Monitor</h1>\n"
     "    <p>Browser WebRTC client</p>\n"
-    "    <form method=\"post\" action=\"/api/login\" autocomplete=\"on\">\n"
+    "    <form id=\"login\" method=\"post\" action=\"/api/login\" autocomplete=\"on\">\n"
     "      <label>Username<input name=\"username\" autocomplete=\"username\" required></label>\n"
     "      <label>Password<input type=\"password\" name=\"password\" autocomplete=\"current-password\" required></label>\n"
     "      <button type=\"submit\">Connect</button>\n"
     "    </form>\n"
-    "    <p class=\"note\">Authentication is bound to the active local GNOME Wayland user.</p>\n"
+    "    <p id=\"status\" class=\"note\">Authentication is bound to the active local GNOME Wayland user.</p>\n"
     "  </main>\n"
     "</body>\n"
     "</html>\n";
+
+static const char client_js[] =
+    "(() => {\n"
+    "  const form = document.getElementById('login');\n"
+    "  const status = document.getElementById('status');\n"
+    "  let socket = null;\n"
+    "  const show = (text) => { status.textContent = text; };\n"
+    "  form.addEventListener('submit', async (event) => {\n"
+    "    event.preventDefault();\n"
+    "    if (socket) { try { socket.close(); } catch (_) {} socket = null; }\n"
+    "    show('Authenticating…');\n"
+    "    const body = new URLSearchParams(new FormData(form));\n"
+    "    try {\n"
+    "      const response = await fetch('/api/login', {\n"
+    "        method: 'POST',\n"
+    "        headers: {'Content-Type': 'application/x-www-form-urlencoded'},\n"
+    "        body,\n"
+    "        credentials: 'same-origin'\n"
+    "      });\n"
+    "      form.elements.password.value = '';\n"
+    "      const result = await response.json();\n"
+    "      if (!response.ok) { show(result.error || 'Authentication failed'); return; }\n"
+    "      show('Authenticated; attaching signalling socket…');\n"
+    "      socket = new WebSocket('wss://' + location.host + '/ws');\n"
+    "      socket.addEventListener('open', () => show('Authenticated WebSocket connected. WebRTC media is not enabled yet.'));\n"
+    "      socket.addEventListener('message', (e) => show(String(e.data)));\n"
+    "      socket.addEventListener('close', () => { socket = null; show('WebSocket closed.'); });\n"
+    "      socket.addEventListener('error', () => show('WebSocket error.'));\n"
+    "    } catch (_) {\n"
+    "      form.elements.password.value = '';\n"
+    "      show('Connection failed.');\n"
+    "    }\n"
+    "  });\n"
+    "})();\n";
 
 static void
 set_security_headers(SoupServerMessage *msg)
@@ -62,9 +102,12 @@ set_security_headers(SoupServerMessage *msg)
     soup_message_headers_replace(headers, "X-Content-Type-Options", "nosniff");
     soup_message_headers_replace(headers, "Referrer-Policy", "no-referrer");
     soup_message_headers_replace(headers, "X-Frame-Options", "DENY");
+    soup_message_headers_replace(headers, "Cross-Origin-Resource-Policy", "same-origin");
+    soup_message_headers_replace(headers, "Cross-Origin-Opener-Policy", "same-origin");
     soup_message_headers_replace(headers,
                                  "Content-Security-Policy",
                                  "default-src 'none'; style-src 'unsafe-inline'; "
+                                 "script-src 'self'; connect-src 'self'; "
                                  "form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     soup_message_headers_replace(headers,
                                  "Permissions-Policy",
@@ -114,6 +157,74 @@ slot_state(WebServer *web)
     return state && *state ? state : "unknown";
 }
 
+static gboolean
+request_origin_matches(SoupServerMessage *msg, gboolean required)
+{
+    SoupMessageHeaders *headers = soup_server_message_get_request_headers(msg);
+    const char *origin = soup_message_headers_get_one(headers, "Origin");
+    if (!origin || !*origin)
+        return required ? FALSE : TRUE;
+
+    const char *host = soup_message_headers_get_one(headers, "Host");
+    if (!host || !*host)
+        return FALSE;
+
+    char *expected = g_strdup_printf("https://%s", host);
+    gboolean match = g_ascii_strcasecmp(origin, expected) == 0;
+    g_free(expected);
+    return match;
+}
+
+static char *
+extract_session_cookie(SoupServerMessage *msg)
+{
+    SoupMessageHeaders *headers = soup_server_message_get_request_headers(msg);
+    const char *cookie = soup_message_headers_get_one(headers, "Cookie");
+    if (!cookie || !*cookie)
+        return NULL;
+
+    char **parts = g_strsplit(cookie, ";", -1);
+    char *found = NULL;
+
+    for (char **p = parts; p && *p; p++) {
+        char *part = g_strstrip(*p);
+        const char prefix[] = WEB_SESSION_COOKIE "=";
+        if (!g_str_has_prefix(part, prefix))
+            continue;
+
+        if (found) {
+            g_free(found);
+            found = NULL;
+            break;
+        }
+
+        found = g_strdup(part + sizeof(prefix) - 1);
+    }
+
+    g_strfreev(parts);
+    return found;
+}
+
+static void
+set_session_cookie(SoupServerMessage *msg, const char *token)
+{
+    SoupMessageHeaders *headers = soup_server_message_get_response_headers(msg);
+
+    if (!token || !*token) {
+        soup_message_headers_replace(
+            headers,
+            "Set-Cookie",
+            WEB_SESSION_COOKIE "=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0");
+        return;
+    }
+
+    char *cookie = g_strdup_printf(
+        WEB_SESSION_COOKIE "=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=30",
+        token);
+    soup_message_headers_replace(headers, "Set-Cookie", cookie);
+    g_free(cookie);
+}
+
 static void
 root_handler(SoupServer *server,
              SoupServerMessage *msg,
@@ -145,6 +256,29 @@ root_handler(SoupServer *server,
 }
 
 static void
+client_js_handler(SoupServer *server,
+                  SoupServerMessage *msg,
+                  const char *path,
+                  GHashTable *query,
+                  gpointer user_data)
+{
+    (void)server;
+    (void)path;
+    (void)query;
+    (void)user_data;
+
+    if (strcmp(soup_server_message_get_method(msg), "GET") != 0) {
+        respond_method_not_allowed(msg, "GET");
+        return;
+    }
+
+    respond_text(msg,
+                 SOUP_STATUS_OK,
+                 "text/javascript; charset=utf-8",
+                 client_js);
+}
+
+static void
 status_handler(SoupServer *server,
                SoupServerMessage *msg,
                const char *path,
@@ -163,7 +297,7 @@ status_handler(SoupServer *server,
     }
 
     char *body = g_strdup_printf(
-        "{\"web\":\"scaffold\",\"busy\":%s,\"slot\":\"%s\"}\n",
+        "{\"web\":\"ready\",\"busy\":%s,\"slot\":\"%s\"}\n",
         slot_busy(web) ? "true" : "false",
         slot_state(web));
 
@@ -195,10 +329,21 @@ secure_clear_string(char *value)
 }
 
 static void
-respond_auth_result(SoupServerMessage *msg, WebServerAuthResult result)
+respond_auth_result(SoupServerMessage *msg,
+                    WebServerAuthResult result,
+                    const char *session_token)
 {
     switch (result) {
         case WEB_SERVER_AUTH_OK:
+            if (!session_token || !*session_token) {
+                set_session_cookie(msg, NULL);
+                respond_text(msg,
+                             SOUP_STATUS_INTERNAL_SERVER_ERROR,
+                             "application/json; charset=utf-8",
+                             "{\"error\":\"authentication-error\"}\n");
+                break;
+            }
+            set_session_cookie(msg, session_token);
             respond_text(msg,
                          SOUP_STATUS_OK,
                          "application/json; charset=utf-8",
@@ -206,6 +351,7 @@ respond_auth_result(SoupServerMessage *msg, WebServerAuthResult result)
                          "\"attach-timeout-ms\":15000}\n");
             break;
         case WEB_SERVER_AUTH_DENIED:
+            set_session_cookie(msg, NULL);
             respond_text(msg,
                          SOUP_STATUS_UNAUTHORIZED,
                          "application/json; charset=utf-8",
@@ -218,6 +364,7 @@ respond_auth_result(SoupServerMessage *msg, WebServerAuthResult result)
                          "{\"error\":\"busy\"}\n");
             break;
         case WEB_SERVER_AUTH_UNAVAILABLE:
+            set_session_cookie(msg, NULL);
             respond_text(msg,
                          SOUP_STATUS_SERVICE_UNAVAILABLE,
                          "application/json; charset=utf-8",
@@ -226,6 +373,7 @@ respond_auth_result(SoupServerMessage *msg, WebServerAuthResult result)
         case WEB_SERVER_AUTH_ERROR:
         case WEB_SERVER_AUTH_STARTED:
         default:
+            set_session_cookie(msg, NULL);
             respond_text(msg,
                          SOUP_STATUS_INTERNAL_SERVER_ERROR,
                          "application/json; charset=utf-8",
@@ -235,13 +383,15 @@ respond_auth_result(SoupServerMessage *msg, WebServerAuthResult result)
 }
 
 static void
-login_auth_complete(WebServerAuthResult result, gpointer completion_data)
+login_auth_complete(WebServerAuthResult result,
+                    const char *session_token,
+                    gpointer completion_data)
 {
     PendingLogin *pending = completion_data;
     if (!pending)
         return;
 
-    respond_auth_result(pending->msg, result);
+    respond_auth_result(pending->msg, result, session_token);
     soup_server_message_unpause(pending->msg);
     g_object_unref(pending->msg);
     g_free(pending);
@@ -265,13 +415,21 @@ login_handler(SoupServer *server,
         return;
     }
 
+    if (!request_origin_matches(msg, FALSE)) {
+        respond_text(msg,
+                     SOUP_STATUS_FORBIDDEN,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"origin-rejected\"}\n");
+        return;
+    }
+
     if (!web->hooks.begin_auth) {
-        respond_auth_result(msg, WEB_SERVER_AUTH_UNAVAILABLE);
+        respond_auth_result(msg, WEB_SERVER_AUTH_UNAVAILABLE, NULL);
         return;
     }
 
     if (slot_busy(web)) {
-        respond_auth_result(msg, WEB_SERVER_AUTH_BUSY);
+        respond_auth_result(msg, WEB_SERVER_AUTH_BUSY, NULL);
         return;
     }
 
@@ -347,7 +505,144 @@ login_handler(SoupServer *server,
     soup_message_body_truncate(request_body);
 
     if (start != WEB_SERVER_AUTH_STARTED)
-        login_auth_complete(start, pending);
+        login_auth_complete(start, NULL, pending);
+}
+
+static void
+ws_guard_handler(SoupServer *server,
+                 SoupServerMessage *msg,
+                 const char *path,
+                 GHashTable *query,
+                 gpointer user_data)
+{
+    (void)server;
+    (void)query;
+
+    WebServer *web = user_data;
+
+    if (strcmp(path, "/ws") != 0) {
+        respond_text(msg,
+                     SOUP_STATUS_NOT_FOUND,
+                     "text/plain; charset=utf-8",
+                     "Not Found\n");
+        return;
+    }
+
+    if (strcmp(soup_server_message_get_method(msg), "GET") != 0) {
+        respond_method_not_allowed(msg, "GET");
+        return;
+    }
+
+    SoupMessageHeaders *headers = soup_server_message_get_request_headers(msg);
+    const char *upgrade = soup_message_headers_get_one(headers, "Upgrade");
+    if (!upgrade || g_ascii_strcasecmp(upgrade, "websocket") != 0) {
+        respond_text(msg,
+                     SOUP_STATUS_BAD_REQUEST,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"websocket-required\"}\n");
+        return;
+    }
+
+    if (!request_origin_matches(msg, TRUE)) {
+        respond_text(msg,
+                     SOUP_STATUS_FORBIDDEN,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"origin-rejected\"}\n");
+        return;
+    }
+
+    char *token = extract_session_cookie(msg);
+    if (!token ||
+        !web->hooks.validate_websocket_token ||
+        !web->hooks.validate_websocket_token(token, web->user_data)) {
+        g_free(token);
+        respond_text(msg,
+                     SOUP_STATUS_UNAUTHORIZED,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"authentication-required\"}\n");
+        return;
+    }
+
+    g_object_set_data_full(G_OBJECT(msg),
+                           WEB_WS_TOKEN_DATA_KEY,
+                           token,
+                           g_free);
+}
+
+static void
+websocket_message_cb(SoupWebsocketConnection *connection,
+                     SoupWebsocketDataType type,
+                     GBytes *message,
+                     gpointer user_data)
+{
+    (void)message;
+    (void)user_data;
+
+    if (type != SOUP_WEBSOCKET_DATA_TEXT) {
+        soup_websocket_connection_close(connection,
+                                        SOUP_WEBSOCKET_CLOSE_UNSUPPORTED_DATA,
+                                        "Text signalling only");
+        return;
+    }
+
+    soup_websocket_connection_send_text(
+        connection,
+        "{\"type\":\"error\",\"error\":\"signalling-not-implemented\"}");
+}
+
+static void
+websocket_closed_cb(SoupWebsocketConnection *connection, gpointer user_data)
+{
+    WebServer *web = user_data;
+
+    if (!web || web->websocket != connection)
+        return;
+
+    web->websocket = NULL;
+
+    if (web->hooks.websocket_closed)
+        web->hooks.websocket_closed(web->user_data);
+
+    g_object_unref(connection);
+}
+
+static void
+websocket_handler(SoupServer *server,
+                  SoupServerMessage *msg,
+                  const char *path,
+                  SoupWebsocketConnection *connection,
+                  gpointer user_data)
+{
+    (void)server;
+    (void)path;
+
+    WebServer *web = user_data;
+    const char *token = g_object_get_data(G_OBJECT(msg), WEB_WS_TOKEN_DATA_KEY);
+
+    if (web->websocket ||
+        !token ||
+        !web->hooks.bind_websocket ||
+        !web->hooks.bind_websocket(token, web->user_data)) {
+        soup_websocket_connection_close(connection,
+                                        SOUP_WEBSOCKET_CLOSE_POLICY_VIOLATION,
+                                        "Session is not attachable");
+        return;
+    }
+
+    web->websocket = g_object_ref(connection);
+    soup_websocket_connection_set_max_incoming_payload_size(connection,
+                                                            WEB_WS_MESSAGE_MAX);
+    g_signal_connect(connection, "message",
+                     G_CALLBACK(websocket_message_cb), web);
+    g_signal_connect(connection, "closed",
+                     G_CALLBACK(websocket_closed_cb), web);
+
+    soup_websocket_connection_send_text(
+        connection,
+        "{\"type\":\"ready\",\"state\":\"active-webrtc\","
+        "\"signalling\":\"pending\"}");
+
+    LOG_INFO("Broker authenticated WebSocket attached");
 }
 
 static int
@@ -521,6 +816,15 @@ web_server_start(WebServer **out,
     soup_server_set_tls_certificate(web->server, web->certificate);
     soup_server_add_handler(web->server, "/api/status", status_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/login", login_handler, web, NULL);
+    soup_server_add_handler(web->server, "/client.js", client_js_handler, web, NULL);
+    soup_server_add_handler(web->server, "/ws", ws_guard_handler, web, NULL);
+    soup_server_add_websocket_handler(web->server,
+                                      "/ws",
+                                      NULL,
+                                      NULL,
+                                      websocket_handler,
+                                      web,
+                                      NULL);
     soup_server_add_handler(web->server, "/", root_handler, web, NULL);
 
     error = NULL;
@@ -541,9 +845,23 @@ web_server_start(WebServer **out,
     }
 
     *out = web;
-    LOG_INFO("Broker HTTPS authentication ready on TCP/%u (IPv4; WSS/WebRTC signalling not enabled yet)",
+    LOG_INFO("Broker HTTPS/WSS authentication ready on TCP/%u (IPv4; SDP/ICE not enabled yet)",
              web->port);
     return 1;
+}
+
+void
+web_server_close_websocket(WebServer *web)
+{
+    if (!web || !web->websocket)
+        return;
+
+    if (soup_websocket_connection_get_state(web->websocket) ==
+        SOUP_WEBSOCKET_STATE_OPEN) {
+        soup_websocket_connection_close(web->websocket,
+                                        SOUP_WEBSOCKET_CLOSE_GOING_AWAY,
+                                        "Session revoked");
+    }
 }
 
 void
@@ -551,6 +869,15 @@ web_server_stop(WebServer *web)
 {
     if (!web)
         return;
+
+    if (web->websocket) {
+        g_signal_handlers_disconnect_by_data(web->websocket, web);
+        soup_websocket_connection_close(web->websocket,
+                                        SOUP_WEBSOCKET_CLOSE_GOING_AWAY,
+                                        "Server stopping");
+        g_object_unref(web->websocket);
+        web->websocket = NULL;
+    }
 
     if (web->server) {
         soup_server_disconnect(web->server);

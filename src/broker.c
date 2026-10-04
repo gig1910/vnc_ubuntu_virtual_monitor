@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -33,6 +34,8 @@
 #define BROKER_AGENT_DIR         "vnc-monitor"
 #define BROKER_AGENT_SOCKET      "agent.sock"
 #define WEB_ATTACH_TIMEOUT_MS      15000
+#define WEB_SESSION_TOKEN_BYTES    32
+#define WEB_SESSION_TOKEN_HEX_LEN  (WEB_SESSION_TOKEN_BYTES * 2)
 
 typedef struct {
     int valid;
@@ -73,6 +76,9 @@ typedef struct {
     guint web_attach_timeout_source;
     WebServerAuthComplete web_auth_complete;
     gpointer web_auth_complete_data;
+    gboolean web_token_valid;
+    gboolean websocket_attached;
+    char web_token[WEB_SESSION_TOKEN_HEX_LEN + 1];
     uid_t uid;
     char session_id[VNC_BROKER_SESSION_ID_MAX];
     char peer_addr[VNC_BROKER_PEER_ADDR_MAX];
@@ -139,6 +145,82 @@ broker_web_slot_state(gpointer user_data)
 }
 
 static void
+secure_clear(void *buf, size_t len)
+{
+    if (!buf || len == 0)
+        return;
+#if defined(__GLIBC__)
+    explicit_bzero(buf, len);
+#else
+    volatile unsigned char *p = buf;
+    while (len--)
+        *p++ = 0;
+#endif
+}
+
+static void
+broker_invalidate_web_token(Broker *broker)
+{
+    if (!broker)
+        return;
+
+    secure_clear(broker->web_token, sizeof(broker->web_token));
+    broker->web_token_valid = FALSE;
+}
+
+static int
+generate_web_token(Broker *broker)
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned char random_bytes[WEB_SESSION_TOKEN_BYTES];
+    size_t offset = 0;
+
+    while (offset < sizeof(random_bytes)) {
+        ssize_t n = getrandom(random_bytes + offset,
+                              sizeof(random_bytes) - offset,
+                              0);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            secure_clear(random_bytes, sizeof(random_bytes));
+            return -1;
+        }
+        if (n == 0) {
+            secure_clear(random_bytes, sizeof(random_bytes));
+            errno = EIO;
+            return -1;
+        }
+        offset += (size_t)n;
+    }
+
+    for (size_t i = 0; i < sizeof(random_bytes); i++) {
+        broker->web_token[i * 2] = hex[random_bytes[i] >> 4];
+        broker->web_token[i * 2 + 1] = hex[random_bytes[i] & 0x0f];
+    }
+    broker->web_token[WEB_SESSION_TOKEN_HEX_LEN] = '\0';
+    broker->web_token_valid = TRUE;
+    secure_clear(random_bytes, sizeof(random_bytes));
+    return 0;
+}
+
+static gboolean
+web_token_equal(const Broker *broker, const char *candidate)
+{
+    if (!broker || !broker->web_token_valid || !candidate)
+        return FALSE;
+
+    if (strlen(candidate) != WEB_SESSION_TOKEN_HEX_LEN)
+        return FALSE;
+
+    unsigned int diff = 0;
+    for (size_t i = 0; i < WEB_SESSION_TOKEN_HEX_LEN; i++)
+        diff |= (unsigned char)broker->web_token[i] ^
+                (unsigned char)candidate[i];
+
+    return diff == 0 ? TRUE : FALSE;
+}
+
+static void
 broker_complete_web_auth(Broker *broker, WebServerAuthResult result)
 {
     if (!broker || !broker->web_auth_complete)
@@ -146,9 +228,13 @@ broker_complete_web_auth(Broker *broker, WebServerAuthResult result)
 
     WebServerAuthComplete completion = broker->web_auth_complete;
     gpointer completion_data = broker->web_auth_complete_data;
+    const char *token =
+        result == WEB_SERVER_AUTH_OK && broker->web_token_valid ?
+        broker->web_token : NULL;
+
     broker->web_auth_complete = NULL;
     broker->web_auth_complete_data = NULL;
-    completion(result, completion_data);
+    completion(result, token, completion_data);
 }
 
 static int
@@ -456,6 +542,14 @@ clear_session(Broker *broker, int reset)
     if (!broker)
         return;
 
+    if (broker->websocket_attached) {
+        broker->websocket_attached = FALSE;
+        if (broker->web_server)
+            web_server_close_websocket(broker->web_server);
+    }
+
+    broker_invalidate_web_token(broker);
+
     if (broker->web_attach_timeout_source) {
         guint source = broker->web_attach_timeout_source;
         broker->web_attach_timeout_source = 0;
@@ -507,6 +601,13 @@ revoke_session(Broker *broker, const char *reason)
 
     BrokerSessionState previous = broker->state;
     broker_session_set_state(broker, BROKER_SESSION_REVOKING);
+    broker_invalidate_web_token(broker);
+
+    if (broker->websocket_attached) {
+        broker->websocket_attached = FALSE;
+        if (broker->web_server)
+            web_server_close_websocket(broker->web_server);
+    }
 
     LOG_INFO("Broker revoking %s session for %s: bound session %s is no longer active (%s)",
              broker_session_state_name(previous),
@@ -604,7 +705,9 @@ web_attach_timeout_cb(gpointer user_data)
     Broker *broker = user_data;
     broker->web_attach_timeout_source = 0;
 
-    if (broker->state == BROKER_SESSION_ACTIVE_WEBRTC) {
+    if (broker->state == BROKER_SESSION_ACTIVE_WEBRTC &&
+        !broker->websocket_attached) {
+        broker_invalidate_web_token(broker);
         LOG_INFO("Broker WebRTC attach window expired for %s session=%s",
                  broker->peer_addr,
                  broker->session_id);
@@ -656,6 +759,15 @@ web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
                 return G_SOURCE_REMOVE;
             }
 
+            if (generate_web_token(broker) < 0) {
+                LOG_ERROR("Broker could not generate WebRTC session token: %s",
+                          strerror(errno));
+                broker->control_source = 0;
+                broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
+                clear_session(broker, 1);
+                return G_SOURCE_REMOVE;
+            }
+
             broker_session_set_state(broker, BROKER_SESSION_ACTIVE_WEBRTC);
             broker->web_attach_timeout_source =
                 g_timeout_add(WEB_ATTACH_TIMEOUT_MS,
@@ -688,6 +800,71 @@ web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
         broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
     clear_session(broker, 1);
     return G_SOURCE_REMOVE;
+}
+
+static gboolean
+broker_web_validate_websocket_token(const char *token, gpointer user_data)
+{
+    Broker *broker = user_data;
+
+    return broker &&
+           broker->state == BROKER_SESSION_ACTIVE_WEBRTC &&
+           !broker->websocket_attached &&
+           web_token_equal(broker, token);
+}
+
+static gboolean
+broker_web_bind_websocket(const char *token, gpointer user_data)
+{
+    Broker *broker = user_data;
+
+    if (!broker_web_validate_websocket_token(token, user_data))
+        return FALSE;
+
+    broker->websocket_attached = TRUE;
+    broker_invalidate_web_token(broker);
+
+    if (broker->web_attach_timeout_source) {
+        guint source = broker->web_attach_timeout_source;
+        broker->web_attach_timeout_source = 0;
+        g_source_remove(source);
+    }
+
+    LOG_INFO("Broker bound authenticated WebSocket to peer=%s uid=%lu session=%s",
+             broker->peer_addr,
+             (unsigned long)broker->uid,
+             broker->session_id);
+    return TRUE;
+}
+
+static void
+broker_websocket_closed(gpointer user_data)
+{
+    Broker *broker = user_data;
+
+    if (!broker ||
+        broker->state != BROKER_SESSION_ACTIVE_WEBRTC ||
+        !broker->websocket_attached) {
+        return;
+    }
+
+    broker->websocket_attached = FALSE;
+    broker_invalidate_web_token(broker);
+    broker_session_set_state(broker, BROKER_SESSION_REVOKING);
+
+    LOG_INFO("Broker authenticated WebSocket closed for peer=%s session=%s",
+             broker->peer_addr,
+             broker->session_id);
+
+    if (broker->control_fd >= 0) {
+        (void)vnc_broker_send_control(broker->control_fd,
+                                      VNC_BROKER_CONTROL_REVOKE,
+                                      NULL,
+                                      0);
+        (void)shutdown(broker->control_fd, SHUT_RDWR);
+    }
+
+    clear_session(broker, 0);
 }
 
 static WebServerAuthResult
@@ -1070,7 +1247,10 @@ main(int argc, char **argv)
     WebServerHooks web_hooks = {
         .slot_busy = broker_web_slot_busy,
         .slot_state = broker_web_slot_state,
-        .begin_auth = broker_web_begin_auth
+        .begin_auth = broker_web_begin_auth,
+        .validate_websocket_token = broker_web_validate_websocket_token,
+        .bind_websocket = broker_web_bind_websocket,
+        .websocket_closed = broker_websocket_closed
     };
 
     int web_rc = web_server_start(&broker.web_server,
