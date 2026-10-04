@@ -58,6 +58,10 @@ jobs:
             -o build/broker_protocol_test
           ./build/broker_protocol_test
 
+      - name: Legacy Safari web frontend regression
+        run: |
+          bash tests/web_legacy_safari_test.sh
+
       - name: Build and verify Debian package
         run: |
           # build-deb.sh intentionally refuses root. GitHub container jobs run
