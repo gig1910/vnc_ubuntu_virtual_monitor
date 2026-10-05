@@ -289,7 +289,7 @@ grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              9u' include/web_server.h
 grep -Fq 'VNC_WEB_PROTOCOL_VERSION' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_parse_ping' src/web_server.c
-grep -Fq '\\"type\\":\\"pong\\"' src/web_server.c
+grep -Fq '\"type\":\"pong\"' src/web_server.c
 grep -Fq 'function startPing()' <<<"$protocol_worker_js"
 grep -Fq "message.type === 'pong'" <<<"$protocol_worker_js"
 grep -Fq "message.type === 'network-sample'" <<<"$client_js"
