@@ -203,7 +203,7 @@ if grep -Fq "connect-src 'self' wss:;" "$source_file" ||
 fi
 echo "legacy Safari same-host WSS CSP: OK"
 
-grep -Fq "img-src blob:" "$source_file"
+grep -Fq "img-src blob: data:" "$source_file"
 grep -Fq "media-src 'self'" "$source_file"
 echo "legacy Safari Blob/HLS media CSP: OK"
 
@@ -224,7 +224,13 @@ grep -Fq "sendDiagnostic('telemetry'" <<<"$protocol_worker_js"
 grep -Fq "sendDiagnostic('log'" <<<"$protocol_worker_js"
 grep -Fq 'worker-jpeg-envelope-ok' <<<"$protocol_worker_js"
 grep -Fq 'main-blob-integrity' <<<"$client_js"
-grep -Fq 'img-decode-error' <<<"$client_js"
+grep -Fq 'img-blob-decode-error' <<<"$client_js"
+grep -Fq 'img-data-url-decode-ok' <<<"$client_js"
+grep -Fq 'img-data-url-decode-error' <<<"$client_js"
+grep -Fq 'img-data-url-read-failed' <<<"$client_js"
+grep -Fq 'readAsDataURL(blob)' <<<"$client_js"
+grep -Fq "reader.result.indexOf('data:image/jpeg')" <<<"$client_js"
+grep -Fq "mode=' + decodeMode" <<<"$client_js"
 grep -Fq 'readAsBinaryString' <<<"$client_js"
 grep -Fq 'Broker browser client diagnostic:' src/broker.c
 grep -Fq '"frame-forwarded"' src/broker.c
