@@ -1457,7 +1457,7 @@ authenticate_or_reuse_web_control_request(int control_fd,
     }
 
     if (type != VNC_BROKER_CONTROL_WEB_AUTH_REQUEST) {
-        secure_clear(payload, payload_len);
+        explicit_bzero(payload, sizeof(payload));
         errno = EPROTO;
         return VNC_BROKER_WEB_AUTH_ERROR;
     }
@@ -1466,7 +1466,7 @@ authenticate_or_reuse_web_control_request(int control_fd,
     memset(&request, 0, sizeof(request));
     int parse_rc =
         vnc_broker_parse_web_auth_request(payload, payload_len, &request);
-    secure_clear(payload, payload_len);
+    explicit_bzero(payload, sizeof(payload));
     if (parse_rc < 0) {
         LOG_ERROR("Invalid WebRTC authentication request payload");
         return VNC_BROKER_WEB_AUTH_ERROR;
