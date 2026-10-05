@@ -47,6 +47,7 @@ struct WebServer {
     guint websocket_diagnostic_count;
     gint64 websocket_display_last_us;
     guint32 websocket_display_generation;
+    gint64 started_us;
     guint port;
     char *config_file;
     char *certificate_file;
@@ -112,7 +113,8 @@ static const char login_page[] =
     "    body.streaming .status-dot { width: 7px; height: 7px; margin-right: 6px; }\n"
     "    .hint { margin: 18px 0 0; color: #84919c; font-size: 12px; line-height: 18px; text-align: center; }\n"
     "    .protocol { margin: 10px 0 0; color: #84919c; font-size: 11px; line-height: 16px; text-align: center; }\n"
-    "    body.streaming .protocol { display: none; }\n"
+    "    .service-info { margin: 8px 0 0; color: #677783; font-size: 11px; line-height: 16px; text-align: center; }\n"
+    "    body.streaming .protocol, body.streaming .service-info { display: none; }\n"
     "    @media only screen and (max-width: 600px) {\n"
     "      .page { padding: 16px 10px; }\n"
     "      .card { border-radius: 10px; }\n"
@@ -143,6 +145,7 @@ static const char login_page[] =
     "        <div id=\"status\" class=\"status\"><span class=\"status-dot\"></span><span id=\"status-text\">Ready to connect.</span></div>\n"
     "        <p class=\"hint\">Authentication is bound to the currently active local GNOME Wayland user.<br><a href=\"/manage\">Manage sessions and settings</a></p>\n"
     "        <p id=\"protocol-info\" class=\"protocol\">Protocol client/server: <span id=\"protocol-client\">-</span> / <span id=\"protocol-server\">-</span><br>Build client/server: <span id=\"build-client\">-</span> / <span id=\"build-server\">-</span></p>\n"
+    "        <p class=\"service-info\">Backend: <span id=\"service-health\">checking...</span><br><span id=\"service-telemetry\">telemetry unavailable</span></p>\n"
     "      </div>\n"
     "    </div>\n"
     "    <div id=\"viewer\" class=\"viewer\"><img id=\"video-frame-a\" class=\"jpeg-frame jpeg-frame-active\" alt=\"Remote desktop\"><img id=\"video-frame-b\" class=\"jpeg-frame\" alt=\"Remote desktop\"><video id=\"hls-video\" controls preload=\"auto\" webkit-playsinline></video></div>\n"
@@ -340,6 +343,9 @@ static const char client_js[] =
     "  var protocolServer = document.getElementById('protocol-server');\n"
     "  var buildClient = document.getElementById('build-client');\n"
     "  var buildServer = document.getElementById('build-server');\n"
+    "  var serviceHealth = document.getElementById('service-health');\n"
+    "  var serviceTelemetry = document.getElementById('service-telemetry');\n"
+    "  var publicStatusTimer = null;\n"
     "  var CLIENT_PROTOCOL_VERSION = " VNC_WEB_PROTOCOL_VERSION_TEXT ";\n"
     "  var CLIENT_BUILD = '" VNC_MONITOR_VERSION "';\n"
     "  var viewer = document.getElementById('viewer');\n"
@@ -405,6 +411,32 @@ static const char client_js[] =
     "    if (!node) return;\n"
     "    node.innerHTML = '';\n"
     "    node.appendChild(document.createTextNode(String(value)));\n"
+    "  }\n"
+    "\n"
+    "  function schedulePublicStatus(delay) {\n"
+    "    if (publicStatusTimer) window.clearTimeout(publicStatusTimer);\n"
+    "    publicStatusTimer = window.setTimeout(loadPublicStatus, delay);\n"
+    "  }\n"
+    "  function loadPublicStatus() {\n"
+    "    publicStatusTimer = null;\n"
+    "    var xhr;\n"
+    "    try { xhr = new XMLHttpRequest(); } catch (e) { schedulePublicStatus(5000); return; }\n"
+    "    xhr.onreadystatechange = function () {\n"
+    "      if (xhr.readyState !== 4) return;\n"
+    "      if (xhr.status === 200) {\n"
+    "        var publicStatus = safeJson(xhr.responseText);\n"
+    "        setNodeText(serviceHealth, publicStatus.service === 'ready' ? 'online' : 'unknown');\n"
+    "        if (publicStatus.protocol) setNodeText(protocolServer, publicStatus.protocol);\n"
+    "        if (publicStatus.build) setNodeText(buildServer, publicStatus.build);\n"
+    "        var telemetry = publicStatus.telemetry || {};\n"
+    "        var viewerStatus = publicStatus.viewer || {};\n"
+    "        var seconds = Math.floor((publicStatus.uptimeMs || 0) / 1000);\n"
+    "        setNodeText(serviceTelemetry, 'state=' + String(publicStatus.slot || 'unknown') + ' transport=' + String(viewerStatus.transport || 'none') + ' uptime=' + String(seconds) + 's frames=' + String(telemetry.framesForwarded || 0) + '/' + String(telemetry.framesAcked || 0) + '/' + String(telemetry.framesNacked || 0));\n"
+    "      } else { setNodeText(serviceHealth, 'offline/unreachable'); }\n"
+    "      schedulePublicStatus(5000);\n"
+    "    };\n"
+    "    try { xhr.open('GET', '/api/status?ts=' + String(new Date().getTime()), true); xhr.send(null); }\n"
+    "    catch (e) { setNodeText(serviceHealth, 'offline/unreachable'); schedulePublicStatus(5000); }\n"
     "  }\n"
     "\n"
     "  function updateProtocolInfo(serverVersion, serverBuild) {\n"
@@ -802,6 +834,7 @@ static const char client_js[] =
     "    document.addEventListener('webkitfullscreenchange', scheduleDisplayState, false);\n"
     "  }\n"
     "\n"
+    "  loadPublicStatus();\n"
     "  form.onsubmit = login;\n"
     "  disconnectButton.onclick = function () {\n"
     "    setStatus('Disconnecting...', 'working');\n"
@@ -1749,16 +1782,50 @@ status_handler(SoupServer *server,
         return;
     }
 
+    WebServerManagementInfo info;
+    memset(&info, 0, sizeof(info));
+    g_strlcpy(info.viewer_state, slot_state(web), sizeof(info.viewer_state));
+    g_strlcpy(info.viewer_transport, "none", sizeof(info.viewer_transport));
+    if (web->hooks.get_management_info)
+        (void)web->hooks.get_management_info(&info, web->user_data);
+
+    gint64 uptime_us = g_get_monotonic_time() - web->started_us;
+    if (uptime_us < 0)
+        uptime_us = 0;
+
+    char *state = json_escape(info.viewer_state);
+    char *transport = json_escape(info.viewer_transport);
     char *body = g_strdup_printf(
-        "{\"web\":\"ready\",\"busy\":%s,\"slot\":\"%s\"}\n",
+        "{\"service\":\"ready\",\"build\":\"%s\",\"protocol\":%u,"
+        "\"uptimeMs\":%" G_GINT64_FORMAT ",\"busy\":%s,\"slot\":\"%s\","
+        "\"viewer\":{\"websocket\":%s,\"protocolReady\":%s,"
+        "\"frameInFlight\":%s,\"transport\":\"%s\"},"
+        "\"telemetry\":{\"framesForwarded\":%" G_GUINT64_FORMAT ","
+        "\"framesAcked\":%" G_GUINT64_FORMAT ","
+        "\"framesNacked\":%" G_GUINT64_FORMAT "}}\n",
+        VNC_MONITOR_VERSION,
+        VNC_WEB_PROTOCOL_VERSION,
+        uptime_us / 1000,
         slot_busy(web) ? "true" : "false",
-        slot_state(web));
+        state,
+        info.websocket_attached ? "true" : "false",
+        info.web_protocol_ready ? "true" : "false",
+        info.web_frame_in_flight ? "true" : "false",
+        transport,
+        info.web_frames_forwarded,
+        info.web_frames_acked,
+        info.web_frames_nacked);
+
+    SoupMessageHeaders *response_headers = soup_server_message_get_response_headers(msg);
+    soup_message_headers_replace(response_headers, "Cache-Control", "no-store, max-age=0");
 
     respond_text(msg,
                  SOUP_STATUS_OK,
                  "application/json; charset=utf-8",
                  body);
     g_free(body);
+    g_free(state);
+    g_free(transport);
 }
 
 typedef struct {
@@ -2978,6 +3045,7 @@ web_server_start(WebServer **out,
 
     WebServer *web = g_new0(WebServer, 1);
     web->port = port;
+    web->started_us = g_get_monotonic_time();
     web->config_file = g_strdup(config_file);
     web->certificate_file = g_strdup(cert_file);
     web->private_key_file = g_strdup(key_file);

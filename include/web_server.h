@@ -4,8 +4,8 @@
 #include <glib.h>
 #include "broker_protocol.h"
 
-#define VNC_WEB_PROTOCOL_VERSION              5u
-#define VNC_WEB_PROTOCOL_VERSION_TEXT         "5"
+#define VNC_WEB_PROTOCOL_VERSION              6u
+#define VNC_WEB_PROTOCOL_VERSION_TEXT         "6"
 #define VNC_WEB_JPEG_DECODE_FAILURE_LIMIT     3u
 
 typedef struct WebServer WebServer;
@@ -27,6 +27,11 @@ typedef void (*WebServerAuthComplete)(WebServerAuthResult result,
 typedef struct {
     gboolean viewer_active;
     gboolean websocket_attached;
+    gboolean web_protocol_ready;
+    gboolean web_frame_in_flight;
+    guint64 web_frames_forwarded;
+    guint64 web_frames_acked;
+    guint64 web_frames_nacked;
     char viewer_state[32];
     char viewer_transport[16];
     char viewer_peer[VNC_BROKER_PEER_ADDR_MAX];
