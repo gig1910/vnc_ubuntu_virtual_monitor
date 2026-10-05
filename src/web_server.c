@@ -919,6 +919,67 @@ media_request_authenticated(WebServer *web, SoupServerMessage *msg)
     return ok;
 }
 
+static gboolean
+parse_single_byte_range(const char *header,
+                        gsize total,
+                        gsize *start_out,
+                        gsize *end_out)
+{
+    if (!header || !*header || !start_out || !end_out || total == 0)
+        return FALSE;
+    if (!g_str_has_prefix(header, "bytes=") || strchr(header, ','))
+        return FALSE;
+
+    char *spec = g_strdup(header + 6);
+    char *dash = strchr(spec, '-');
+    if (!dash || strchr(dash + 1, '-')) {
+        g_free(spec);
+        return FALSE;
+    }
+
+    *dash = '\0';
+    char *left = spec;
+    char *right = dash + 1;
+    guint64 start = 0, end = 0;
+    gboolean ok = FALSE;
+
+    if (!*left) {
+        char *tail = NULL;
+        errno = 0;
+        guint64 suffix = g_ascii_strtoull(right, &tail, 10);
+        if (errno == 0 && tail && *tail == '\0' && suffix > 0) {
+            start = suffix >= total ? 0 : (guint64)total - suffix;
+            end = (guint64)total - 1;
+            ok = TRUE;
+        }
+    } else {
+        char *tail = NULL;
+        errno = 0;
+        start = g_ascii_strtoull(left, &tail, 10);
+        if (errno == 0 && tail && *tail == '\0' && start < total) {
+            if (!*right) {
+                end = (guint64)total - 1;
+                ok = TRUE;
+            } else {
+                errno = 0;
+                end = g_ascii_strtoull(right, &tail, 10);
+                if (errno == 0 && tail && *tail == '\0' && end >= start) {
+                    if (end >= total)
+                        end = (guint64)total - 1;
+                    ok = TRUE;
+                }
+            }
+        }
+    }
+
+    if (ok) {
+        *start_out = (gsize)start;
+        *end_out = (gsize)end;
+    }
+    g_free(spec);
+    return ok;
+}
+
 static void
 hls_handler(SoupServer *server,
             SoupServerMessage *msg,
@@ -929,15 +990,16 @@ hls_handler(SoupServer *server,
     (void)server;
     (void)query;
     WebServer *web = user_data;
+    const char *method = soup_server_message_get_method(msg);
+    gboolean head = strcmp(method, "HEAD") == 0;
 
-    if (strcmp(soup_server_message_get_method(msg), "GET") != 0) {
-        respond_method_not_allowed(msg, "GET");
+    if (strcmp(method, "GET") != 0 && !head) {
+        respond_method_not_allowed(msg, "GET, HEAD");
         return;
     }
 
     if (!media_request_authenticated(web, msg)) {
-        LOG_INFO("HLS request rejected: viewer cookie missing/invalid path=%s",
-                 path ? path : "(null)");
+        LOG_INFO("HLS %s path=%s status=401", method, path ? path : "(null)");
         respond_text(msg, SOUP_STATUS_UNAUTHORIZED,
                      "text/plain; charset=utf-8",
                      "Authentication required\n");
@@ -959,14 +1021,12 @@ hls_handler(SoupServer *server,
         name = "index.m3u8";
         content_type = "application/vnd.apple.mpegurl";
         max_size = WEB_HLS_PLAYLIST_MAX;
-    }
-    else if (g_str_has_prefix(path, "/live/") &&
-             hls_segment_name_valid(path + strlen("/live/"))) {
+    } else if (g_str_has_prefix(path, "/live/") &&
+               hls_segment_name_valid(path + strlen("/live/"))) {
         name = path + strlen("/live/");
         content_type = "video/mp2t";
         max_size = WEB_HLS_SEGMENT_MAX;
-    }
-    else {
+    } else {
         respond_text(msg, SOUP_STATUS_NOT_FOUND,
                      "text/plain; charset=utf-8",
                      "Not Found\n");
@@ -975,7 +1035,7 @@ hls_handler(SoupServer *server,
 
     char *file_path = g_build_filename(web->hls_root, name, NULL);
     GStatBuf st;
-    if (g_stat(file_path, &st) < 0 || st.st_size < 0 ||
+    if (g_stat(file_path, &st) < 0 || st.st_size <= 0 ||
         (guint64)st.st_size > max_size) {
         g_free(file_path);
         respond_text(msg, SOUP_STATUS_NOT_FOUND,
@@ -984,14 +1044,63 @@ hls_handler(SoupServer *server,
         return;
     }
 
+    gsize total = (gsize)st.st_size;
+    SoupMessageHeaders *request_headers =
+        soup_server_message_get_request_headers(msg);
+    SoupMessageHeaders *response_headers =
+        soup_server_message_get_response_headers(msg);
+    const char *range_header =
+        soup_message_headers_get_one(request_headers, "Range");
+
+    gsize range_start = 0, range_end = total - 1;
+    gboolean ranged = range_header && *range_header;
+    if (ranged && !parse_single_byte_range(range_header, total,
+                                            &range_start, &range_end)) {
+        char *value = g_strdup_printf("bytes */%zu", total);
+        soup_message_headers_replace(response_headers, "Accept-Ranges", "bytes");
+        soup_message_headers_replace(response_headers, "Content-Range", value);
+        g_free(value);
+        LOG_INFO("HLS %s path=%s range=invalid status=416 bytes=0",
+                 method, path);
+        respond_text(msg, 416, "text/plain; charset=utf-8",
+                     "Range Not Satisfiable\n");
+        g_free(file_path);
+        return;
+    }
+
+    gsize send_len = range_end - range_start + 1;
+    guint status = ranged ? 206 : SOUP_STATUS_OK;
+
+    set_security_headers(msg);
+    soup_message_headers_replace(response_headers, "Accept-Ranges", "bytes");
+    soup_message_headers_replace(response_headers, "Content-Type", content_type);
+
+    if (ranged) {
+        char *value = g_strdup_printf("bytes %zu-%zu/%zu",
+                                      range_start, range_end, total);
+        soup_message_headers_replace(response_headers, "Content-Range", value);
+        g_free(value);
+    }
+
+    if (head) {
+        char *length_value = g_strdup_printf("%zu", send_len);
+        soup_message_headers_replace(response_headers, "Content-Length", length_value);
+        g_free(length_value);
+        soup_server_message_set_status(msg, status, NULL);
+        LOG_INFO("HLS HEAD path=%s range=%s status=%u bytes=%zu",
+                 path, ranged ? "partial" : "full", status, send_len);
+        g_free(file_path);
+        return;
+    }
+
     gchar *contents = NULL;
     gsize length = 0;
     GError *error = NULL;
     if (!g_file_get_contents(file_path, &contents, &length, &error) ||
-        length > max_size) {
+        length != total || length > max_size) {
         LOG_DEBUG("Could not read HLS media file %s: %s",
                   file_path,
-                  error ? error->message : "unknown error");
+                  error ? error->message : "size changed");
         g_clear_error(&error);
         g_free(contents);
         g_free(file_path);
@@ -1000,17 +1109,29 @@ hls_handler(SoupServer *server,
                      "Not Found\n");
         return;
     }
-
     g_free(file_path);
-    set_security_headers(msg);
-    soup_server_message_set_status(msg, SOUP_STATUS_OK, NULL);
-    soup_server_message_set_response(msg,
-                                     content_type,
-                                     SOUP_MEMORY_TAKE,
-                                     contents,
-                                     length);
-}
 
+    if (!ranged) {
+        soup_server_message_set_status(msg, status, NULL);
+        soup_server_message_set_response(msg, content_type,
+                                         SOUP_MEMORY_TAKE,
+                                         contents, length);
+        LOG_INFO("HLS GET path=%s range=full status=%u bytes=%zu",
+                 path, status, length);
+        return;
+    }
+
+    guint8 *partial = g_malloc(send_len);
+    memcpy(partial, (guint8 *)contents + range_start, send_len);
+    g_free(contents);
+
+    soup_server_message_set_status(msg, status, NULL);
+    soup_server_message_set_response(msg, content_type,
+                                     SOUP_MEMORY_TAKE,
+                                     partial, send_len);
+    LOG_INFO("HLS GET path=%s range=%zu-%zu status=%u bytes=%zu",
+             path, range_start, range_end, status, send_len);
+}
 static void
 root_handler(SoupServer *server,
              SoupServerMessage *msg,
