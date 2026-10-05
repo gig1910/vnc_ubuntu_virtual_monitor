@@ -173,6 +173,25 @@ grep -Fq 'max-width: 760px' <<<"$management_page"
 
 echo "legacy Safari frontend: OK"
 
+grep -Fq 'control-card' <<<"$login_page"
+grep -Fq 'control-toggle' <<<"$login_page"
+grep -Fq 'fullscreen' <<<"$login_page"
+for anchor in tl tc tr ml mr bl bc br; do
+    grep -Fq "data-anchor=\\\"$anchor\\\"" <<<"$login_page"
+    grep -Fq "control-anchor-$anchor" <<<"$login_page"
+done
+grep -Fq "CONTROL_STATE_KEY = 'vnc-monitor-control-v1'" <<<"$client_js"
+grep -Fq 'window.localStorage.setItem' <<<"$client_js"
+grep -Fq 'window.localStorage.getItem' <<<"$client_js"
+grep -Fq 'function toggleControls()' <<<"$client_js"
+grep -Fq 'function toggleFullscreen()' <<<"$client_js"
+grep -Fq 'viewer.webkitRequestFullscreen' <<<"$client_js"
+grep -Fq 'hlsVideo.webkitEnterFullscreen' <<<"$client_js"
+grep -Fq 'Add to Home Screen' <<<"$client_js"
+grep -Fq 'control-collapsed' <<<"$login_page"
+echo "collapsible anchored viewer controls and fullscreen fallback: OK"
+
+
 grep -Fq 'SPA_FORMAT_VIDEO_framerate' src/pipewire_capture.c
 grep -Fq 'SPA_FRACTION((uint32_t)fps, 1)' src/pipewire_capture.c
 grep -Fq 'RecordVirtual derives its output cadence' src/pipewire_capture.c
@@ -260,7 +279,7 @@ grep -Fq 'validate_media_token' "$source_file"
 grep -Fq 'hls_segment_name_valid' "$source_file"
 echo "authenticated HLS serving: OK"
 
-grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              6u' include/web_server.h
+grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              7u' include/web_server.h
 grep -Fq 'VNC_WEB_PROTOCOL_VERSION' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c
