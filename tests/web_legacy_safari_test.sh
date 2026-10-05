@@ -84,15 +84,19 @@ grep -Fq 'WebSocket constructor failed' <<<"$protocol_worker_js"
 grep -Fq 'network/TLS handshake failed' <<<"$protocol_worker_js"
 grep -Fq 'encodeURIComponent' <<<"$client_js"
 grep -Fq 'function (' <<<"$client_js"
-grep -Fq "socket.binaryType = 'arraybuffer'" <<<"$protocol_worker_js"
-grep -Fq "new Blob([data], { type: 'image/jpeg' })" <<<"$client_js"
+grep -Fq "socket.binaryType = 'blob'" <<<"$protocol_worker_js"
+grep -Fq "objectUrlApi.createObjectURL(blob)" <<<"$client_js"
 grep -Fq "type: 'frame-result'" <<<"$client_js"
 grep -Fq 'socket.send' <<<"$protocol_worker_js"
 grep -Fq 'frame-ack' <<<"$protocol_worker_js"
 grep -Fq 'frame-nack' <<<"$protocol_worker_js"
-grep -Fq 'new Uint8Array(data)' <<<"$protocol_worker_js"
+grep -Fq 'new FileReaderSync().readAsArrayBuffer(data)' <<<"$protocol_worker_js"
+grep -Fq 'new Uint8Array(buffer)' <<<"$protocol_worker_js"
+grep -Fq "data.slice(0, length, 'image/jpeg')" <<<"$protocol_worker_js"
 if grep -Fq 'new WebSocket' <<<"$client_js" ||
-   grep -Fq 'new Uint8Array(data)' <<<"$client_js"; then
+   grep -Fq 'new Uint8Array' <<<"$client_js" ||
+   grep -Fq 'FileReaderSync' <<<"$client_js" ||
+   grep -Fq 'new Blob([data]' <<<"$client_js"; then
     echo "Legacy Safari regression: WSS/protocol parsing leaked back to the UI thread" >&2
     exit 1
 fi
