@@ -1087,7 +1087,7 @@ hls_handler(SoupServer *server,
         soup_message_headers_replace(response_headers, "Content-Length", length_value);
         g_free(length_value);
         soup_server_message_set_status(msg, status, NULL);
-        LOG_INFO("HLS HEAD path=%s range=%s status=%u bytes=%zu",
+        LOG_DEBUG("HLS HEAD path=%s range=%s status=%u bytes=%zu",
                  path, ranged ? "partial" : "full", status, send_len);
         g_free(file_path);
         return;
@@ -1116,7 +1116,7 @@ hls_handler(SoupServer *server,
         soup_server_message_set_response(msg, content_type,
                                          SOUP_MEMORY_TAKE,
                                          contents, length);
-        LOG_INFO("HLS GET path=%s range=full status=%u bytes=%zu",
+        LOG_DEBUG("HLS GET path=%s range=full status=%u bytes=%zu",
                  path, status, length);
         return;
     }
@@ -1129,7 +1129,7 @@ hls_handler(SoupServer *server,
     soup_server_message_set_response(msg, content_type,
                                      SOUP_MEMORY_TAKE,
                                      partial, send_len);
-    LOG_INFO("HLS GET path=%s range=%zu-%zu status=%u bytes=%zu",
+    LOG_DEBUG("HLS GET path=%s range=%zu-%zu status=%u bytes=%zu",
              path, range_start, range_end, status, send_len);
 }
 static void
