@@ -383,6 +383,33 @@ test_web_auth_limits(void)
 }
 
 static void
+test_hls_ready_control_roundtrip(void)
+{
+    int control[2] = {-1, -1};
+    CHECK(make_seqpacket_pair(control) == 0);
+
+    CHECK(vnc_broker_send_control(control[0],
+                                  VNC_BROKER_CONTROL_HLS_READY,
+                                  NULL,
+                                  0) == 0);
+
+    uint8_t payload[1] = {0};
+    VncBrokerControlType type = 0;
+    size_t payload_len = 1;
+
+    CHECK(vnc_broker_recv_control(control[1],
+                                  &type,
+                                  payload,
+                                  sizeof(payload),
+                                  &payload_len) == 0);
+    CHECK(type == VNC_BROKER_CONTROL_HLS_READY);
+    CHECK(payload_len == 0);
+
+    close(control[0]);
+    close(control[1]);
+}
+
+static void
 test_video_frame_chunk_roundtrip(void)
 {
     int control[2] = {-1, -1};
@@ -450,6 +477,7 @@ main(void)
     test_transport_fd_contract();
     test_web_auth_control_roundtrip();
     test_web_auth_limits();
+    test_hls_ready_control_roundtrip();
     test_video_frame_chunk_roundtrip();
 
     if (failures != 0) {

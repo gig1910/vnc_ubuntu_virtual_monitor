@@ -954,13 +954,35 @@ web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
         VncBrokerControlType type;
         size_t payload_len = 0;
 
-        if (vnc_broker_recv_control(fd, &type, payload,
-                                    sizeof(payload), &payload_len) == 0 &&
-            broker_handle_web_media_packet(broker, type,
+        int recv_rc =
+            vnc_broker_recv_control(fd, &type, payload,
+                                    sizeof(payload), &payload_len);
+
+        if (recv_rc < 0) {
+            int saved_errno = errno;
+            if ((condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) != 0 ||
+                saved_errno == ECONNRESET) {
+                LOG_INFO("Broker lost browser agent media channel for session %s",
+                         broker->session_id);
+            }
+            else {
+                LOG_INFO("Broker could not read browser media control packet for session %s: %s",
+                         broker->session_id,
+                         strerror(saved_errno));
+            }
+
+            broker->control_source = 0;
+            clear_session(broker, 1);
+            return G_SOURCE_REMOVE;
+        }
+
+        if (broker_handle_web_media_packet(broker, type,
                                            payload, payload_len))
             return G_SOURCE_CONTINUE;
 
-        LOG_INFO("Broker rejected malformed browser media control packet for session %s",
+        LOG_INFO("Broker rejected malformed browser media control packet type=%u payload=%zu for session %s",
+                 (unsigned)type,
+                 payload_len,
                  broker->session_id);
         broker->control_source = 0;
         clear_session(broker, 1);

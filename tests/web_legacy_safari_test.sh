@@ -176,3 +176,23 @@ echo "authenticated HLS serving: OK"
 
 grep -Fq 'soup_websocket_connection_get_state(web->websocket) ==' "$source_file"
 echo "WebSocket shutdown state guard: OK"
+
+
+hls_source="src/web_hls.c"
+
+if grep -Fq 'g_shell_quote' "$hls_source"; then
+    echo "HLS regression: shell quoting must never be used for GStreamer file properties" >&2
+    exit 1
+fi
+
+grep -Fq 'g_strescape(segment_path, NULL)' "$hls_source"
+grep -Fq 'playlist-location=\"%s\"' "$hls_source"
+echo "HLS GStreamer path quoting: OK"
+
+grep -Fq 'gst_element_set_state(stream->pipeline, GST_STATE_NULL)' "$hls_source"
+grep -Fq 'gst_element_get_state(stream->pipeline' "$hls_source"
+if grep -Fq 'gst_app_src_end_of_stream(GST_APP_SRC(stream->appsrc))' "$hls_source"; then
+    echo "HLS regression: teardown must not send EOS before the pipeline reaches NULL" >&2
+    exit 1
+fi
+echo "HLS teardown ordering: OK"

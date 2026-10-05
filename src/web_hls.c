@@ -338,8 +338,14 @@ web_hls_start(WebHlsStream *stream,
 
     char *segment_path =
         g_strdup_printf("%s/segment%%05d.ts", stream->directory);
-    char *quoted_segment = g_shell_quote(segment_path);
-    char *quoted_playlist = g_shell_quote(stream->playlist);
+
+    /*
+     * gst_parse_launch() has its own quoting grammar. g_shell_quote() is
+     * shell syntax and its single quotes become literal path bytes in
+     * hlssink2. Escape for a double-quoted GStreamer property instead.
+     */
+    char *escaped_segment = g_strescape(segment_path, NULL);
+    char *escaped_playlist = g_strescape(stream->playlist, NULL);
 
     char *pipeline_text = g_strdup_printf(
         "appsrc name=src is-live=true block=false format=time emit-signals=false "
@@ -352,18 +358,18 @@ web_hls_start(WebHlsStream *stream,
         "! h264parse config-interval=-1 "
         "! hlssink2 name=hls max-files=%d playlist-length=%d "
         "target-duration=%d send-keyframe-requests=true playlist-root=/live "
-        "location=%s playlist-location=%s",
+        "location=\"%s\" playlist-location=\"%s\"",
         WEB_HLS_BITRATE_KBIT,
         fps,
         WEB_HLS_PLAYLIST_FILES,
         WEB_HLS_PLAYLIST_LENGTH,
         WEB_HLS_TARGET_DURATION,
-        quoted_segment,
-        quoted_playlist);
+        escaped_segment,
+        escaped_playlist);
 
     g_free(segment_path);
-    g_free(quoted_segment);
-    g_free(quoted_playlist);
+    g_free(escaped_segment);
+    g_free(escaped_playlist);
 
     GError *error = NULL;
     stream->pipeline = gst_parse_launch(pipeline_text, &error);
@@ -433,14 +439,34 @@ web_hls_stop(WebHlsStream *stream)
         stream->thread_started = 0;
     }
 
+    /*
+     * Stop the bin before dropping child references. Sending EOS and then
+     * releasing appsrc while the bin is still PLAYING can race GStreamer
+     * error delivery and dispose x264enc before it reaches NULL.
+     */
+    if (stream->pipeline) {
+        GstStateChangeReturn state =
+            gst_element_set_state(stream->pipeline, GST_STATE_NULL);
+
+        if (state == GST_STATE_CHANGE_ASYNC) {
+            GstState current = GST_STATE_VOID_PENDING;
+            GstState pending = GST_STATE_VOID_PENDING;
+            GstStateChangeReturn waited =
+                gst_element_get_state(stream->pipeline,
+                                      &current,
+                                      &pending,
+                                      2 * GST_SECOND);
+            if (waited == GST_STATE_CHANGE_FAILURE)
+                LOG_INFO("Legacy browser HLS pipeline did not settle cleanly to NULL");
+        }
+    }
+
     if (stream->appsrc) {
-        (void)gst_app_src_end_of_stream(GST_APP_SRC(stream->appsrc));
         gst_object_unref(stream->appsrc);
         stream->appsrc = NULL;
     }
 
     if (stream->pipeline) {
-        (void)gst_element_set_state(stream->pipeline, GST_STATE_NULL);
         gst_object_unref(stream->pipeline);
         stream->pipeline = NULL;
     }
