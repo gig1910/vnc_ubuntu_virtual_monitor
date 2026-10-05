@@ -620,6 +620,20 @@ broker_handle_web_media_packet(Broker *broker,
     if (!broker)
         return FALSE;
 
+    if (type == VNC_BROKER_CONTROL_HLS_READY) {
+        if (payload_len != 0 ||
+            !broker->websocket_attached ||
+            !broker->web_server)
+            return FALSE;
+
+        LOG_INFO("Broker received legacy HLS ready signal for session %s",
+                 broker->session_id);
+        return web_server_send_text(
+            broker->web_server,
+            "{\"type\":\"media-ready\",\"media\":\"hls\","
+            "\"url\":\"/live/index.m3u8\"}");
+    }
+
     if (type == VNC_BROKER_CONTROL_VIDEO_FRAME_BEGIN) {
         uint32_t width = 0, height = 0, jpeg_size = 0;
         if (broker->web_frame_active ||
@@ -694,6 +708,8 @@ clear_session(Broker *broker, int reset)
     }
 
     broker_invalidate_web_token(broker);
+    if (broker->web_server)
+        web_server_set_hls_root(broker->web_server, NULL);
     broker_reset_web_frame(broker);
     broker->web_frames_forwarded = 0;
 
@@ -972,6 +988,16 @@ broker_web_validate_websocket_token(const char *token, gpointer user_data)
 }
 
 static gboolean
+broker_web_validate_media_token(const char *token, gpointer user_data)
+{
+    Broker *broker = user_data;
+    return broker &&
+           broker->state == BROKER_SESSION_ACTIVE_WEBRTC &&
+           broker->websocket_attached &&
+           web_token_equal(broker, token);
+}
+
+static gboolean
 broker_web_bind_websocket(const char *token, gpointer user_data)
 {
     Broker *broker = user_data;
@@ -979,17 +1005,29 @@ broker_web_bind_websocket(const char *token, gpointer user_data)
     if (!broker_web_validate_websocket_token(token, user_data))
         return FALSE;
 
+    char *hls_root =
+        g_strdup_printf("/run/user/%lu/vnc-monitor/hls",
+                        (unsigned long)broker->uid);
+    if (broker->web_server)
+        web_server_set_hls_root(broker->web_server, hls_root);
+    g_free(hls_root);
+
     if (broker->control_fd < 0 ||
         vnc_broker_send_control(broker->control_fd,
                                 VNC_BROKER_CONTROL_MEDIA_START,
                                 NULL, 0) < 0) {
         LOG_INFO("Broker could not start legacy browser media for session %s: %s",
                  broker->session_id, strerror(errno));
+        if (broker->web_server)
+            web_server_set_hls_root(broker->web_server, NULL);
         return FALSE;
     }
 
     broker->websocket_attached = TRUE;
-    broker_invalidate_web_token(broker);
+    /*
+     * Retain the token only for the live viewer lifetime. WSS replay is still
+     * rejected by websocket_attached; same-origin HLS GETs use this token.
+     */
     broker_reset_web_frame(broker);
 
     if (broker->web_attach_timeout_source) {
@@ -1732,6 +1770,7 @@ main(int argc, char **argv)
         .begin_auth = broker_web_begin_auth,
         .validate_websocket_token = broker_web_validate_websocket_token,
         .bind_websocket = broker_web_bind_websocket,
+        .validate_media_token = broker_web_validate_media_token,
         .websocket_closed = broker_websocket_closed,
         .begin_management_auth = broker_management_begin_auth,
         .validate_management_token = broker_validate_management_token,

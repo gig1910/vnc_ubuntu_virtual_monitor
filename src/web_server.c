@@ -27,6 +27,8 @@
 #define WEB_WS_TOKEN_DATA_KEY       "vnc-monitor-ws-token"
 #define WEB_MANAGEMENT_MAX_AGE_S    600
 #define WEB_SETTINGS_BODY_MAX       8192
+#define WEB_HLS_PLAYLIST_MAX         (64u * 1024u)
+#define WEB_HLS_SEGMENT_MAX          (8u * 1024u * 1024u)
 
 struct WebServer {
     SoupServer *server;
@@ -36,6 +38,7 @@ struct WebServer {
     char *config_file;
     char *certificate_file;
     char *private_key_file;
+    char *hls_root;
     WebServerHooks hooks;
     gpointer user_data;
 };
@@ -80,11 +83,12 @@ static const char login_page[] =
     "    .status-error { border-color: #e4c1c1; background: #fff5f5; color: #8a4040; }\n"
     "    .status-error .status-dot { background: #c25757; }\n"
     "    .viewer { display: none; width: 100%; max-width: 1024px; margin: 18px auto 0; overflow: hidden; border: 1px solid #273542; border-radius: 10px; background: #111820; -webkit-box-shadow: 0 12px 32px rgba(28,45,61,.16); box-shadow: 0 12px 32px rgba(28,45,61,.16); }\n"
-    "    .viewer img { display: block; width: 100%; height: auto; margin: 0; }\n"
+    "    .viewer img, .viewer video { display: block; width: 100%; height: auto; margin: 0; }\n"
+    "    .viewer video { display: none; background: #000000; }\n"
     "    body.streaming { overflow: hidden; background: #000000; }\n"
     "    body.streaming .page { padding: 0; }\n"
     "    body.streaming .viewer { display: block; position: fixed; z-index: 1; left: 0; top: 0; width: 100%; height: 100%; max-width: none; margin: 0; border: 0; border-radius: 0; background: #000000; -webkit-box-shadow: none; box-shadow: none; }\n"
-    "    body.streaming .viewer img { position: absolute; left: 50%; top: 50%; width: auto; height: auto; max-width: 100%; max-height: 100%; -webkit-transform: translate(-50%, -50%); transform: translate(-50%, -50%); }\n"
+    "    body.streaming .viewer img, body.streaming .viewer video { position: absolute; left: 50%; top: 50%; width: auto; height: auto; max-width: 100%; max-height: 100%; -webkit-transform: translate(-50%, -50%); transform: translate(-50%, -50%); }\n"
     "    body.streaming .card { position: fixed; z-index: 2; top: 10px; right: 10px; width: 220px; margin: 0; border-radius: 8px; background: rgba(255,255,255,.94); -webkit-box-shadow: 0 4px 18px rgba(0,0,0,.22); box-shadow: 0 4px 18px rgba(0,0,0,.22); }\n"
     "    body.streaming .head, body.streaming .badge, body.streaming .field, body.streaming .hint, body.streaming #connect { display: none; }\n"
     "    body.streaming .body { padding: 8px; }\n"
@@ -123,7 +127,7 @@ static const char login_page[] =
     "        <p class=\"hint\">Authentication is bound to the currently active local GNOME Wayland user.<br><a href=\"/manage\">Manage sessions and settings</a></p>\n"
     "      </div>\n"
     "    </div>\n"
-    "    <div id=\"viewer\" class=\"viewer\"><img id=\"video-frame\" alt=\"Remote desktop\"></div>\n"
+    "    <div id=\"viewer\" class=\"viewer\"><img id=\"video-frame\" alt=\"Remote desktop\"><video id=\"hls-video\" controls preload=\"auto\" webkit-playsinline></video></div>\n"
     "  </div>\n"
     "</body>\n"
     "</html>\n";
@@ -140,6 +144,7 @@ static const char client_js[] =
     "  var statusText = document.getElementById('status-text');\n"
     "  var viewer = document.getElementById('viewer');\n"
     "  var videoFrame = document.getElementById('video-frame');\n"
+    "  var hlsVideo = document.getElementById('hls-video');\n"
     "  var objectUrlApi = window.URL || window.webkitURL;\n"
     "  var frameUrl = null;\n"
     "  var framePending = false;\n"
@@ -179,8 +184,33 @@ static const char client_js[] =
     "    frameUrl = null;\n"
     "    framePending = false;\n"
     "    videoFrame.removeAttribute('src');\n"
+    "    videoFrame.style.display = 'block';\n"
+    "    try { hlsVideo.pause(); } catch (e) {}\n"
+    "    hlsVideo.removeAttribute('src');\n"
+    "    hlsVideo.style.display = 'none';\n"
+    "    try { hlsVideo.load(); } catch (e) {}\n"
     "    viewer.style.display = 'none';\n"
     "    document.body.className = '';\n"
+    "  }\n"
+    "\n"
+    "  function startHlsVideo(url) {\n"
+    "    if (!url) return;\n"
+    "    if (frameUrl && objectUrlApi) { try { objectUrlApi.revokeObjectURL(frameUrl); } catch (e) {} }\n"
+    "    frameUrl = null;\n"
+    "    videoFrame.removeAttribute('src');\n"
+    "    videoFrame.style.display = 'none';\n"
+    "    hlsVideo.style.display = 'block';\n"
+    "    viewer.style.display = 'block';\n"
+    "    document.body.className = 'streaming';\n"
+    "    hlsVideo.onplaying = function () { setStatus('Connected. H.264/HLS video playing.', 'ok'); };\n"
+    "    hlsVideo.onerror = function () {\n"
+    "      if (window.console && console.error) console.error('VNC Monitor: native HLS video error code=' + String(hlsVideo.error ? hlsVideo.error.code : 0));\n"
+    "      setStatus('Native HLS video could not be played.', 'error');\n"
+    "    };\n"
+    "    hlsVideo.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'v=' + String(new Date().getTime());\n"
+    "    try { hlsVideo.load(); } catch (e) {}\n"
+    "    try { hlsVideo.play(); } catch (e) {}\n"
+    "    setStatus('H.264/HLS stream ready. Tap Play if Safari does not start automatically.', 'ok');\n"
     "  }\n"
     "\n"
     "  function renderVideoFrame(data) {\n"
@@ -190,6 +220,8 @@ static const char client_js[] =
     "    }\n"
     "    if (framePending) return;\n"
     "    framePending = true;\n"
+    "    hlsVideo.style.display = 'none';\n"
+    "    videoFrame.style.display = 'block';\n"
     "    var blob;\n"
     "    var nextUrl;\n"
     "    try {\n"
@@ -262,7 +294,9 @@ static const char client_js[] =
     "      }\n"
     "      var message = safeJson(event.data);\n"
     "      if (message.type === 'ready') {\n"
-    "        setStatus('Connected. Waiting for the first video frame...', 'ok');\n"
+    "        setStatus('Connected. Preparing browser media...', 'ok');\n"
+    "      } else if (message.type === 'media-ready' && message.media === 'hls') {\n"
+    "        startHlsVideo(message.url || '/live/index.m3u8');\n"
     "      } else if (message.error) {\n"
     "        setStatus('Server message: ' + message.error, 'error');\n"
     "      }\n"
@@ -588,14 +622,14 @@ set_security_headers(SoupServerMessage *msg)
          */
         csp = g_strdup_printf(
             "default-src 'none'; style-src 'unsafe-inline'; "
-            "script-src 'self'; img-src blob:; "
+            "script-src 'self'; img-src blob:; media-src 'self'; "
             "connect-src 'self' wss://%s; "
             "form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
             host);
     } else {
         csp = g_strdup(
             "default-src 'none'; style-src 'unsafe-inline'; "
-            "script-src 'self'; img-src blob:; connect-src 'self'; "
+            "script-src 'self'; img-src blob:; media-src 'self'; connect-src 'self'; "
             "form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     }
 
@@ -718,7 +752,7 @@ set_session_cookie(SoupServerMessage *msg, const char *token)
     }
 
     char *cookie = g_strdup_printf(
-        WEB_SESSION_COOKIE "=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=30",
+        WEB_SESSION_COOKIE "=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=86400",
         token);
     soup_message_headers_replace(headers, "Set-Cookie", cookie);
     g_free(cookie);
@@ -851,6 +885,129 @@ save_web_settings(WebServer *web,
 
     g_free(contents);
     return ok;
+}
+
+static gboolean
+hls_segment_name_valid(const char *name)
+{
+    if (!name || !g_str_has_prefix(name, "segment") ||
+        !g_str_has_suffix(name, ".ts"))
+        return FALSE;
+
+    size_t len = strlen(name);
+    const char *digits = name + strlen("segment");
+    const char *end = name + len - strlen(".ts");
+    if (digits >= end)
+        return FALSE;
+
+    for (const char *p = digits; p < end; p++) {
+        if (!g_ascii_isdigit(*p))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+media_request_authenticated(WebServer *web, SoupServerMessage *msg)
+{
+    char *token = extract_session_cookie(msg);
+    gboolean ok = token &&
+                  web->hooks.validate_media_token &&
+                  web->hooks.validate_media_token(token, web->user_data);
+    g_free(token);
+    return ok;
+}
+
+static void
+hls_handler(SoupServer *server,
+            SoupServerMessage *msg,
+            const char *path,
+            GHashTable *query,
+            gpointer user_data)
+{
+    (void)server;
+    (void)query;
+    WebServer *web = user_data;
+
+    if (strcmp(soup_server_message_get_method(msg), "GET") != 0) {
+        respond_method_not_allowed(msg, "GET");
+        return;
+    }
+
+    if (!media_request_authenticated(web, msg)) {
+        LOG_INFO("HLS request rejected: viewer cookie missing/invalid path=%s",
+                 path ? path : "(null)");
+        respond_text(msg, SOUP_STATUS_UNAUTHORIZED,
+                     "text/plain; charset=utf-8",
+                     "Authentication required\n");
+        return;
+    }
+
+    if (!web->hls_root || !*web->hls_root) {
+        respond_text(msg, SOUP_STATUS_SERVICE_UNAVAILABLE,
+                     "text/plain; charset=utf-8",
+                     "HLS media not ready\n");
+        return;
+    }
+
+    const char *name = NULL;
+    const char *content_type = NULL;
+    gsize max_size = 0;
+
+    if (strcmp(path, "/live/index.m3u8") == 0) {
+        name = "index.m3u8";
+        content_type = "application/vnd.apple.mpegurl";
+        max_size = WEB_HLS_PLAYLIST_MAX;
+    }
+    else if (g_str_has_prefix(path, "/live/") &&
+             hls_segment_name_valid(path + strlen("/live/"))) {
+        name = path + strlen("/live/");
+        content_type = "video/mp2t";
+        max_size = WEB_HLS_SEGMENT_MAX;
+    }
+    else {
+        respond_text(msg, SOUP_STATUS_NOT_FOUND,
+                     "text/plain; charset=utf-8",
+                     "Not Found\n");
+        return;
+    }
+
+    char *file_path = g_build_filename(web->hls_root, name, NULL);
+    GStatBuf st;
+    if (g_stat(file_path, &st) < 0 || st.st_size < 0 ||
+        (guint64)st.st_size > max_size) {
+        g_free(file_path);
+        respond_text(msg, SOUP_STATUS_NOT_FOUND,
+                     "text/plain; charset=utf-8",
+                     "Not Found\n");
+        return;
+    }
+
+    gchar *contents = NULL;
+    gsize length = 0;
+    GError *error = NULL;
+    if (!g_file_get_contents(file_path, &contents, &length, &error) ||
+        length > max_size) {
+        LOG_DEBUG("Could not read HLS media file %s: %s",
+                  file_path,
+                  error ? error->message : "unknown error");
+        g_clear_error(&error);
+        g_free(contents);
+        g_free(file_path);
+        respond_text(msg, SOUP_STATUS_NOT_FOUND,
+                     "text/plain; charset=utf-8",
+                     "Not Found\n");
+        return;
+    }
+
+    g_free(file_path);
+    set_security_headers(msg);
+    soup_server_message_set_status(msg, SOUP_STATUS_OK, NULL);
+    soup_server_message_set_response(msg,
+                                     content_type,
+                                     SOUP_MEMORY_TAKE,
+                                     contents,
+                                     length);
 }
 
 static void
@@ -1771,7 +1928,7 @@ websocket_handler(SoupServer *server,
     soup_websocket_connection_send_text(
         connection,
         "{\"type\":\"ready\",\"state\":\"active-browser\","
-        "\"media\":\"wss-jpeg\"}");
+        "\"media\":\"pending\"}");
 
     LOG_INFO("Broker authenticated WebSocket attached");
 }
@@ -1978,6 +2135,7 @@ web_server_start(WebServer **out,
     soup_server_add_handler(web->server, "/client.js", client_js_handler, web, NULL);
     soup_server_add_handler(web->server, "/manage.js", management_js_handler, web, NULL);
     soup_server_add_handler(web->server, "/manage", management_page_handler, web, NULL);
+    soup_server_add_handler(web->server, "/live", hls_handler, web, NULL);
     soup_server_add_handler(web->server, "/ws", ws_guard_handler, web, NULL);
     soup_server_add_websocket_handler(web->server,
                                       "/ws",
@@ -2009,9 +2167,31 @@ web_server_start(WebServer **out,
     }
 
     *out = web;
-    LOG_INFO("Broker HTTPS/WSS authentication and legacy JPEG media ready on TCP/%u (IPv4; SDP/ICE not enabled yet)",
+    LOG_INFO("Broker HTTPS/WSS authentication with HLS/H.264 test media ready on TCP/%u (WSS/JPEG fallback; SDP/ICE not enabled yet)",
              web->port);
     return 1;
+}
+
+gboolean
+web_server_send_text(WebServer *web, const char *text)
+{
+    if (!web || !web->websocket || !text ||
+        soup_websocket_connection_get_state(web->websocket) !=
+            SOUP_WEBSOCKET_STATE_OPEN)
+        return FALSE;
+
+    soup_websocket_connection_send_text(web->websocket, text);
+    return TRUE;
+}
+
+void
+web_server_set_hls_root(WebServer *web, const char *root)
+{
+    if (!web)
+        return;
+
+    g_free(web->hls_root);
+    web->hls_root = root && *root ? g_strdup(root) : NULL;
 }
 
 gboolean
@@ -2068,6 +2248,7 @@ web_server_stop(WebServer *web)
     if (web->certificate)
         g_object_unref(web->certificate);
 
+    g_free(web->hls_root);
     g_free(web->config_file);
     g_free(web->certificate_file);
     g_free(web->private_key_file);

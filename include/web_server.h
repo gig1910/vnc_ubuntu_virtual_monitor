@@ -58,11 +58,17 @@ typedef struct {
                                       gpointer completion_data,
                                       gpointer user_data);
 
-    /* Validate and then atomically consume the one-time WSS attach token. */
+    /*
+     * Validate the viewer token for WSS attach. The broker retains the token
+     * only while the exact viewer session is active so same-origin HLS GETs
+     * can authenticate with the same Secure HttpOnly cookie.
+     */
     gboolean (*validate_websocket_token)(const char *token,
                                          gpointer user_data);
     gboolean (*bind_websocket)(const char *token,
                                gpointer user_data);
+    gboolean (*validate_media_token)(const char *token,
+                                     gpointer user_data);
 
     /* Called only for the currently bound authenticated WebSocket. */
     void (*websocket_closed)(gpointer user_data);
@@ -100,10 +106,16 @@ int web_server_start(WebServer **out,
                      const WebServerHooks *hooks,
                      gpointer user_data);
 
+/* Send signalling/status messages over the authenticated browser WSS. */
+gboolean web_server_send_text(WebServer *server, const char *text);
+
 /* Send one complete encoded video frame over the authenticated browser WSS. */
 gboolean web_server_send_binary(WebServer *server,
                                 const guint8 *data,
                                 gsize length);
+
+/* Set/clear the broker-readable per-user HLS directory for the active viewer. */
+void web_server_set_hls_root(WebServer *server, const char *root);
 
 /* Close the bound browser signalling socket, if one exists. */
 void web_server_close_websocket(WebServer *server);

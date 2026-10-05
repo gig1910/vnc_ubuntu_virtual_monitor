@@ -331,3 +331,17 @@ browser transport and the iOS native HLS decoder. Once latency/compatibility is
 measured on the iPad, the encoder can be replaced with VA/QSV without changing
 the browser protocol. If the required GStreamer HLS/x264 plugins are missing,
 the agent falls back to the existing bounded WSS/JPEG path.
+
+
+### Broker-served authenticated HLS
+
+The HLS files are not a public static directory. The root broker exposes only
+/live/index.m3u8 and strictly named /live/segmentNNNNN.ts paths over the
+existing HTTPS listener. Every request must carry the same Secure HttpOnly
+viewer cookie and that token must still belong to the currently attached WSS
+viewer. WSS replay remains blocked by the one-attached-WebSocket invariant;
+teardown invalidates the token and clears the HLS root.
+
+The browser waits for HLS_READY from the user agent before assigning the
+playlist to a native video element. iOS 9 may still require a tap on Play
+because its autoplay policy predates modern muted autoplay.
