@@ -1167,6 +1167,83 @@ serve_web_media_lifetime(int control_fd,
             VncBrokerDisplayOrientation old_orientation = active_orientation;
             int old_width = session_cfg.width;
             int old_height = session_cfg.height;
+
+            /*
+             * Fullscreen/standalone transitions often change only presentation
+             * mode while retaining the same pixel size. Do not tear down the
+             * encoder or virtual monitor in that case; just switch the profile
+             * scope and acknowledge the stable browser state.
+             */
+            if ((int)requested.width == session_cfg.width &&
+                (int)requested.height == session_cfg.height) {
+                int state_changed =
+                    requested.mode != active_mode ||
+                    requested.orientation != active_orientation;
+
+                if (state_changed && media_started) {
+                    if (monitor_layout_cache_save(&layout_cache,
+                                                  &session_cfg) < 0)
+                        LOG_DEBUG("Could not save pre-mode-switch browser layout");
+
+                    char *previous_layout_path =
+                        layout_cache.cache_path ?
+                            g_strdup(layout_cache.cache_path) : NULL;
+                    monitor_layout_cache_clear(&layout_cache);
+
+                    active_mode = requested.mode;
+                    active_orientation = requested.orientation;
+
+                    if (web_device_layout_prepare(&layout_cache,
+                                                  &session_cfg,
+                                                  &device_profile,
+                                                  active_mode,
+                                                  active_orientation) == 0) {
+                        if (previous_layout_path &&
+                            !layout_cache.cache_existed)
+                            (void)monitor_layout_cache_seed_from(
+                                &layout_cache,
+                                previous_layout_path);
+                        (void)monitor_layout_cache_apply(
+                            &layout_cache,
+                            &session_cfg,
+                            session_cfg.capture_timeout_ms);
+                    }
+                    g_free(previous_layout_path);
+                }
+                else {
+                    active_mode = requested.mode;
+                    active_orientation = requested.orientation;
+                }
+
+                if (device_profile_update_state(
+                        &device_profile,
+                        (DeviceDisplayMode)active_mode,
+                        (DeviceOrientation)active_orientation,
+                        session_cfg.width,
+                        session_cfg.height) < 0 ||
+                    device_profile_save(&device_profile) < 0)
+                    LOG_DEBUG("Browser device display profile was not persisted");
+
+                applied_generation = requested.generation;
+                if (web_send_display_applied(control_fd,
+                                             &requested,
+                                             &session_cfg) < 0) {
+                    LOG_INFO("Could not acknowledge browser display state: %s",
+                             strerror(errno));
+                    result = -1;
+                    break;
+                }
+
+                LOG_INFO("Browser display state applied without monitor rebuild: device=%.8s generation=%u size=%dx%d state=%s/%s",
+                         device_profile.id,
+                         requested.generation,
+                         session_cfg.width,
+                         session_cfg.height,
+                         device_display_mode_name((DeviceDisplayMode)active_mode),
+                         device_orientation_name((DeviceOrientation)active_orientation));
+                continue;
+            }
+
             int used_jpeg = sender_started;
             int used_hls = hls_started;
 

@@ -199,6 +199,10 @@ static const char protocol_worker_js[] =
     "  var pendingSeq = 0;\n"
     "  var pendingDisplayState = null;\n"
     "  var clientProtocol = 0;\n"
+    "  var pingTimer = null;\n"
+    "  var pingSequence = 0;\n"
+    "  var pingPendingId = 0;\n"
+    "  var pingPendingAt = 0;\n"
     "\n"
     "  function emit(type, fields) {\n"
     "    var message = { type: type };\n"
@@ -257,6 +261,17 @@ static const char protocol_worker_js[] =
     "    sendText('{\"type\":\"display-state\",\"generation\":' + String(generation) + ',\"mode\":\"' + mode + '\",\"orientation\":\"' + orientation + '\",\"width\":' + String(width) + ',\"height\":' + String(height) + '}');\n"
     "  }\n"
     "\n"
+    "  function stopPing() { if (pingTimer) { clearInterval(pingTimer); pingTimer = null; } pingPendingId = 0; pingPendingAt = 0; }\n"
+    "  function sendPing() {\n"
+    "    if (!protocolConfirmed || !socket || socket.readyState !== 1) return;\n"
+    "    var now = new Date().getTime();\n"
+    "    if (pingPendingId && now - pingPendingAt < 10000) return;\n"
+    "    pingSequence += 1; if (pingSequence > 4294967295) pingSequence = 1;\n"
+    "    pingPendingId = pingSequence; pingPendingAt = now;\n"
+    "    if (!sendText('{\"type\":\"ping\",\"id\":' + String(pingPendingId) + '}')) { pingPendingId = 0; pingPendingAt = 0; }\n"
+    "  }\n"
+    "  function startPing() { stopPing(); sendPing(); pingTimer = setInterval(sendPing, 2000); }\n"
+    "\n"
     "  function closeSocket() { if (socket) { try { socket.close(); } catch (e) {} } }\n"
     "\n"
     "  function handleText(text) {\n"
@@ -270,6 +285,7 @@ static const char protocol_worker_js[] =
     "        return;\n"
     "      }\n"
     "      protocolConfirmed = true;\n"
+    "      startPing();\n"
     "      if (!sendText('{\"type\":\"protocol-ready\",\"protocol\":' + String(clientProtocol) + '}')) {\n"
     "        emit('error', { message: 'Could not confirm browser protocol version.' });\n"
     "        closeSocket();\n"
@@ -280,6 +296,10 @@ static const char protocol_worker_js[] =
     "    }\n"
     "    if (!protocolConfirmed) { emit('error', { message: 'Server sent signalling before protocol handshake.' }); closeSocket(); return; }\n"
     "    if (message.type === 'ready') emit('ready', { state: message.state || '', media: message.media || '' });\n"
+    "    else if (message.type === 'pong') {\n"
+    "      var pongId = boundedUInt(message.id);\n"
+    "      if (pongId && pongId === pingPendingId) { var rtt = Math.max(0, new Date().getTime() - pingPendingAt); pingPendingId = 0; pingPendingAt = 0; emit('network-sample', { ping: rtt }); }\n"
+    "    }\n"
     "    else if (message.type === 'media-ready' && message.media === 'hls') emit('media-ready', { media: 'hls', url: message.url || '/live/index.m3u8' });\n"
     "    else if (message.type === 'telemetry') emit('telemetry', { event: message.event || '', seq: message.seq || 0, bytes: message.bytes || 0, sha256: message.sha256 || '', checksum: message.adler32 || 0, failures: message.failures || 0 });\n"
     "    else if (message.type === 'display-state-applied') emit('display-state-applied', { generation: message.generation || 0, width: message.width || 0, height: message.height || 0, mode: message.mode || '', orientation: message.orientation || '' });\n"
@@ -329,6 +349,7 @@ static const char protocol_worker_js[] =
     "  }\n"
     "\n"
     "  function connect(message) {\n"
+    "    stopPing();\n"
     "    closeSocket();\n"
     "    clientProtocol = parseInt(message.protocol, 10) || 0;\n"
     "    protocolConfirmed = false; framePending = false; frameSeq = 0; pendingSeq = 0; socketOpened = false;\n"
@@ -340,6 +361,7 @@ static const char protocol_worker_js[] =
     "    socket.onmessage = function (event) { if (typeof event.data === 'string') handleText(event.data); else handleBinary(event.data); };\n"
     "    socket.onerror = function () { emit('socket-error', { message: socketOpened ? 'Secure WebSocket error.' : 'Secure WebSocket network/TLS handshake failed before open.' }); };\n"
     "    socket.onclose = function () {\n"
+    "      stopPing();\n"
     "      var wasOpen = socketOpened; socket = null; socketOpened = false; protocolConfirmed = false; framePending = false; pendingSeq = 0; pendingDisplayState = null;\n"
     "      emit('closed', { wasOpen: wasOpen });\n"
     "    };\n"
@@ -469,12 +491,22 @@ static const char client_js[] =
     "    else setStatus('Fullscreen is unavailable in this Safari. Use Add to Home Screen, then open VNC Monitor from the Home Screen.', 'error');\n"
     "  }\n"
     "\n"    "  function currentDisplayMode() {\n"
-    "    if (document.fullscreenElement || document.webkitFullscreenElement || navigator.standalone) return 'fullscreen';\n"
+    "    if (document.fullscreenElement || document.webkitFullscreenElement || hlsVideo.webkitDisplayingFullscreen || navigator.standalone) return 'fullscreen';\n"
     "    return 'window';\n"
     "  }\n"
     "  function currentViewport() {\n"
     "    var width = document.documentElement && document.documentElement.clientWidth ? document.documentElement.clientWidth : window.innerWidth;\n"
     "    var height = document.documentElement && document.documentElement.clientHeight ? document.documentElement.clientHeight : window.innerHeight;\n"
+    "    if (currentDisplayMode() === 'fullscreen' && (hlsVideo.webkitDisplayingFullscreen || navigator.standalone) && window.screen) {\n"
+    "      var screenWidth = window.screen.width || width;\n"
+    "      var screenHeight = window.screen.height || height;\n"
+    "      if (typeof window.orientation === 'number') {\n"
+    "        var landscape = window.orientation === 90 || window.orientation === -90;\n"
+    "        if (landscape && screenWidth < screenHeight) { var swapLandscape = screenWidth; screenWidth = screenHeight; screenHeight = swapLandscape; }\n"
+    "        if (!landscape && screenWidth > screenHeight) { var swapPortrait = screenWidth; screenWidth = screenHeight; screenHeight = swapPortrait; }\n"
+    "      }\n"
+    "      width = screenWidth; height = screenHeight;\n"
+    "    }\n"
     "    width = Math.max(64, Math.min(4096, Math.round(width || 0)));\n"
     "    height = Math.max(64, Math.min(4096, Math.round(height || 0)));\n"
     "    return { width: width, height: height };\n"
@@ -856,6 +888,8 @@ static const char client_js[] =
     "        renderVideoFrame(message);\n"
     "      } else if (message.type === 'telemetry') {\n"
     "        if (window.console && console.log) console.log('VNC Monitor telemetry event=' + String(message.event || '') + ' seq=' + String(message.seq || 0) + ' bytes=' + String(message.bytes || 0) + ' checksum=' + String(message.checksum || 0) + ' failures=' + String(message.failures || 0));\n"
+    "      } else if (message.type === 'network-sample') {\n"
+    "        if (window.console && console.log) console.log('VNC Monitor WSS ping=' + String(message.ping || 0) + 'ms');\n"
     "      } else if (message.type === 'display-state-applied') {\n"
     "        if (message.generation >= displayAppliedGeneration) { displayAppliedGeneration = message.generation; if (window.console && console.log) console.log('VNC Monitor display state applied generation=' + String(message.generation) + ' size=' + String(message.width) + 'x' + String(message.height) + ' mode=' + String(message.mode) + ' orientation=' + String(message.orientation)); }\n"
     "      } else if (message.type === 'display-state-rejected') {\n"
@@ -995,8 +1029,8 @@ static const char client_js[] =
     "  if (window.addEventListener) {\n"
     "    document.addEventListener('fullscreenchange', updateFullscreenButton, false);\n"
     "    document.addEventListener('webkitfullscreenchange', updateFullscreenButton, false);\n"
-    "    hlsVideo.addEventListener('webkitbeginfullscreen', updateFullscreenButton, false);\n"
-    "    hlsVideo.addEventListener('webkitendfullscreen', updateFullscreenButton, false);\n"
+    "    hlsVideo.addEventListener('webkitbeginfullscreen', function () { updateFullscreenButton(); scheduleDisplayState(); }, false);\n"
+    "    hlsVideo.addEventListener('webkitendfullscreen', function () { updateFullscreenButton(); scheduleDisplayState(); }, false);\n"
     "  }\n"
     "  loadPublicStatus();\n"
     "  form.onsubmit = login;\n"
@@ -3035,6 +3069,42 @@ websocket_parse_display_state(GBytes *message, WebServerDisplayState *state)
     return valid;
 }
 
+static gboolean
+websocket_parse_ping(GBytes *message, guint32 *id_out)
+{
+    static const char prefix[] = "{\"type\":\"ping\",\"id\":";
+    const char suffix = '}';
+    gsize len = 0;
+    const char *data = message ? g_bytes_get_data(message, &len) : NULL;
+
+    if (!data || !id_out ||
+        len <= sizeof(prefix) - 1u + 1u ||
+        len > sizeof(prefix) - 1u + 10u + 1u ||
+        memcmp(data, prefix, sizeof(prefix) - 1u) != 0 ||
+        data[len - 1u] != suffix)
+        return FALSE;
+
+    size_t digits_len = len - (sizeof(prefix) - 1u) - 1u;
+    if (digits_len == 0 || digits_len > 10u)
+        return FALSE;
+
+    guint64 value = 0;
+    for (size_t i = 0; i < digits_len; i++) {
+        unsigned char c = (unsigned char)data[sizeof(prefix) - 1u + i];
+        if (c < '0' || c > '9')
+            return FALSE;
+        value = value * 10u + (guint64)(c - '0');
+        if (value > G_MAXUINT32)
+            return FALSE;
+    }
+
+    if (value == 0)
+        return FALSE;
+
+    *id_out = (guint32)value;
+    return TRUE;
+}
+
 static void
 websocket_message_cb(SoupWebsocketConnection *connection,
                      SoupWebsocketDataType type,
@@ -3060,6 +3130,16 @@ websocket_message_cb(SoupWebsocketConnection *connection,
     }
 
     if (web && web->websocket_protocol_ready) {
+        guint32 ping_id = 0;
+        if (websocket_parse_ping(message, &ping_id)) {
+            char *reply = g_strdup_printf(
+                "{\"type\":\"pong\",\"id\":%u}",
+                ping_id);
+            soup_websocket_connection_send_text(connection, reply);
+            g_free(reply);
+            return;
+        }
+
         WebServerDisplayState display_state = {0};
         if (websocket_parse_display_state(message, &display_state)) {
             gint64 now = g_get_monotonic_time();

@@ -112,6 +112,9 @@ grep -Fq 'DISPLAY_STATE_HYSTERESIS_MS = 2500' <<<"$client_js"
 grep -Fq "window.addEventListener('resize'" <<<"$client_js"
 grep -Fq "window.addEventListener('orientationchange'" <<<"$client_js"
 grep -Fq "document.addEventListener('webkitfullscreenchange'" <<<"$client_js"
+grep -Fq 'hlsVideo.webkitDisplayingFullscreen' <<<"$client_js"
+grep -Fq "hlsVideo.addEventListener('webkitbeginfullscreen', function () { updateFullscreenButton(); scheduleDisplayState(); }" <<<"$client_js"
+grep -Fq 'window.screen.width' <<<"$client_js"
 grep -Fq "message.type === 'display-state'" <<<"$protocol_worker_js"
 grep -Fq 'flushDisplayState' <<<"$protocol_worker_js"
 grep -Fq 'display-state-applied' <<<"$protocol_worker_js"
@@ -282,9 +285,14 @@ grep -Fq 'validate_media_token' "$source_file"
 grep -Fq 'hls_segment_name_valid' "$source_file"
 echo "authenticated HLS serving: OK"
 
-grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              8u' include/web_server.h
+grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              9u' include/web_server.h
 grep -Fq 'VNC_WEB_PROTOCOL_VERSION' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/broker.c
+grep -Fq 'websocket_parse_ping' src/web_server.c
+grep -Fq '"type":"pong"' src/web_server.c
+grep -Fq 'function startPing()' <<<"$protocol_worker_js"
+grep -Fq "message.type === 'pong'" <<<"$protocol_worker_js"
+grep -Fq "message.type === 'network-sample'" <<<"$client_js"
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_frame_nack' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_client_diagnostic' include/web_server.h src/web_server.c src/broker.c
@@ -464,6 +472,10 @@ grep -Fq 'real_monitor_resize(&real' <<<"$display_resize_block"
 grep -Fq 'monitor_layout_cache_apply(' <<<"$display_resize_block"
 grep -Fq 'web_send_display_applied' <<<"$display_resize_block"
 echo "device display-state resize lifecycle: OK"
+
+grep -Fq 'applied without monitor rebuild' <<<"$display_resize_block"
+grep -Fq '(int)requested.width == session_cfg.width' <<<"$display_resize_block"
+echo "same-size display mode changes avoid media teardown: OK"
 grep -Fq 'VNC_BROKER_CONTROL_DISPLAY_SIZE_REJECTED' include/broker_protocol.h src/broker.c src/main.c
 grep -Fq 'web_send_display_rejected' src/main.c
 grep -Fq "message.reason === 'runtime'" <<<"$client_js"
