@@ -17,10 +17,9 @@
 #include <unistd.h>
 
 #define WEB_HLS_BITRATE_KBIT 2500
-#define WEB_HLS_PLAYLIST_FILES 12
-#define WEB_HLS_PLAYLIST_LENGTH 6
+#define WEB_HLS_PLAYLIST_FILES 4
+#define WEB_HLS_PLAYLIST_LENGTH 3
 #define WEB_HLS_TARGET_DURATION 1
-#define WEB_HLS_GOP_DIVISOR 2
 
 static int
 stream_should_stop(WebHlsStream *stream)
@@ -348,11 +347,6 @@ web_hls_start(WebHlsStream *stream,
     char *escaped_segment = g_strescape(segment_path, NULL);
     char *escaped_playlist = g_strescape(stream->playlist, NULL);
 
-    int key_int_max = (fps + WEB_HLS_GOP_DIVISOR - 1) /
-                      WEB_HLS_GOP_DIVISOR;
-    if (key_int_max < 1)
-        key_int_max = 1;
-
     char *pipeline_text = g_strdup_printf(
         "appsrc name=src is-live=true block=false format=time emit-signals=false "
         "! queue max-size-buffers=2 leaky=downstream "
@@ -366,7 +360,7 @@ web_hls_start(WebHlsStream *stream,
         "target-duration=%d send-keyframe-requests=false playlist-root=/live "
         "location=\"%s\" playlist-location=\"%s\"",
         WEB_HLS_BITRATE_KBIT,
-        key_int_max,
+        fps,
         WEB_HLS_PLAYLIST_FILES,
         WEB_HLS_PLAYLIST_LENGTH,
         WEB_HLS_TARGET_DURATION,
@@ -423,9 +417,8 @@ web_hls_start(WebHlsStream *stream,
     }
 
     stream->thread_started = 1;
-    LOG_INFO("Legacy browser HLS test path started: H.264 baseline x264 %dx%d@%dfps target=%ds key-int=%d (~%.3fs) keyframe-requests=off",
-             width, height, fps, WEB_HLS_TARGET_DURATION,
-             key_int_max, (double)key_int_max / (double)fps);
+    LOG_INFO("Legacy browser HLS path started: H.264 baseline x264 %dx%d@%dfps target=%ds key-int=%d keyframe-requests=off",
+             width, height, fps, WEB_HLS_TARGET_DURATION, fps);
     return 0;
 
 fail:
