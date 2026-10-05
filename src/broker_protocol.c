@@ -431,6 +431,51 @@ vnc_broker_send_web_auth_request(int control_fd,
 }
 
 int
+vnc_broker_parse_web_auth_request(const void *opaque_payload,
+                                  size_t payload_len,
+                                  VncBrokerWebAuthRequest *request)
+{
+    if (!request || (!opaque_payload && payload_len > 0)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(request, 0, sizeof(*request));
+    const uint8_t *payload = opaque_payload;
+
+    if (payload_len < 4) {
+        errno = EPROTO;
+        return -1;
+    }
+
+    size_t username_len = get_u16_be(payload);
+    size_t password_len = get_u16_be(payload + 2);
+
+    if (username_len == 0 || username_len > VNC_BROKER_AUTH_USERNAME_MAX ||
+        password_len > VNC_BROKER_AUTH_PASSWORD_MAX ||
+        payload_len != 4 + username_len + password_len) {
+        errno = EPROTO;
+        return -1;
+    }
+
+    request->username = calloc(username_len + 1, 1);
+    request->password = calloc(password_len + 1, 1);
+    if (!request->username || !request->password) {
+        vnc_broker_web_auth_request_clear(request);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    memcpy(request->username, payload + 4, username_len);
+    if (password_len > 0)
+        memcpy(request->password, payload + 4 + username_len, password_len);
+
+    request->username_len = username_len;
+    request->password_len = password_len;
+    return 0;
+}
+
+int
 vnc_broker_recv_web_auth_request(int control_fd,
                                  VncBrokerWebAuthRequest *request)
 {
@@ -438,8 +483,6 @@ vnc_broker_recv_web_auth_request(int control_fd,
         errno = EINVAL;
         return -1;
     }
-
-    memset(request, 0, sizeof(*request));
 
     uint8_t payload[4 + VNC_BROKER_AUTH_USERNAME_MAX + VNC_BROKER_AUTH_PASSWORD_MAX];
     VncBrokerControlType type;
@@ -453,40 +496,24 @@ vnc_broker_recv_web_auth_request(int control_fd,
     if (rc < 0)
         return -1;
 
-    if (type != VNC_BROKER_CONTROL_WEB_AUTH_REQUEST || payload_len < 4) {
+    if (type != VNC_BROKER_CONTROL_WEB_AUTH_REQUEST) {
         secure_clear(payload, payload_len);
         errno = EPROTO;
         return -1;
     }
 
-    size_t username_len = get_u16_be(payload);
-    size_t password_len = get_u16_be(payload + 2);
-
-    if (username_len == 0 || username_len > VNC_BROKER_AUTH_USERNAME_MAX ||
-        password_len > VNC_BROKER_AUTH_PASSWORD_MAX ||
-        payload_len != 4 + username_len + password_len) {
-        secure_clear(payload, payload_len);
-        errno = EPROTO;
-        return -1;
-    }
-
-    request->username = calloc(username_len + 1, 1);
-    request->password = calloc(password_len + 1, 1);
-    if (!request->username || !request->password) {
-        secure_clear(payload, payload_len);
-        vnc_broker_web_auth_request_clear(request);
-        errno = ENOMEM;
-        return -1;
-    }
-
-    memcpy(request->username, payload + 4, username_len);
-    if (password_len > 0)
-        memcpy(request->password, payload + 4 + username_len, password_len);
-
-    request->username_len = username_len;
-    request->password_len = password_len;
+    rc = vnc_broker_parse_web_auth_request(payload, payload_len, request);
     secure_clear(payload, payload_len);
-    return 0;
+    return rc;
+}
+
+int
+vnc_broker_send_web_auth_reuse(int control_fd)
+{
+    return vnc_broker_send_control(control_fd,
+                                   VNC_BROKER_CONTROL_WEB_AUTH_REUSE,
+                                   NULL,
+                                   0);
 }
 
 void

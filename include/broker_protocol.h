@@ -47,6 +47,7 @@ typedef enum {
     VNC_BROKER_CONTROL_WEB_AUTH_REQUEST = 1,
     VNC_BROKER_CONTROL_WEB_AUTH_RESULT = 2,
     VNC_BROKER_CONTROL_REVOKE = 3,
+    VNC_BROKER_CONTROL_WEB_AUTH_REUSE = 4,
     VNC_BROKER_CONTROL_SDP_OFFER = 10,
     VNC_BROKER_CONTROL_SDP_ANSWER = 11,
     VNC_BROKER_CONTROL_ICE_CANDIDATE = 12,
@@ -156,6 +157,12 @@ int vnc_broker_send_web_auth_request(int control_fd,
 
 int vnc_broker_recv_web_auth_request(int control_fd,
                                      VncBrokerWebAuthRequest *request);
+
+int vnc_broker_parse_web_auth_request(const void *payload,
+                                      size_t payload_len,
+                                      VncBrokerWebAuthRequest *request);
+
+int vnc_broker_send_web_auth_reuse(int control_fd);
 
 void vnc_broker_web_auth_request_clear(VncBrokerWebAuthRequest *request);
 

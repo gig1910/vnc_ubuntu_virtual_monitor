@@ -1357,48 +1357,40 @@ serve_web_media_lifetime(int control_fd,
 }
 
 static VncBrokerWebAuthResult
-authenticate_control_request(int control_fd,
-                             const RuntimeConfig *cfg,
-                             const char *purpose)
+authenticate_parsed_control_request(VncBrokerWebAuthRequest *request,
+                                    const RuntimeConfig *cfg,
+                                    const char *purpose)
 {
-    VncBrokerWebAuthRequest request;
-    memset(&request, 0, sizeof(request));
-
     VncBrokerWebAuthResult result = VNC_BROKER_WEB_AUTH_ERROR;
 
-    if (vnc_broker_recv_web_auth_request(control_fd, &request) < 0) {
-        LOG_ERROR("Invalid %s authentication request from broker: %s",
-                  purpose,
-                  strerror(errno));
-        goto done;
-    }
+    if (!request || !request->username || !request->password)
+        return result;
 
     struct passwd *pw = getpwuid(getuid());
     if (!pw || !pw->pw_name) {
         LOG_ERROR("Cannot resolve local Unix account for %s authentication",
                   purpose);
-        goto done;
+        return result;
     }
 
-    if (strcmp(request.username, pw->pw_name) != 0) {
+    if (strcmp(request->username, pw->pw_name) != 0) {
         LOG_INFO("Rejected %s authentication for user '%s': agent belongs to '%s'",
                  purpose,
-                 request.username,
+                 request->username,
                  pw->pw_name);
-        result = VNC_BROKER_WEB_AUTH_DENIED;
-        goto done;
+        return VNC_BROKER_WEB_AUTH_DENIED;
     }
 
     if (io_deadline_set_ms(cfg->client_handshake_timeout_ms) < 0) {
         LOG_ERROR("Could not start %s PAM deadline: %s",
                   purpose,
                   strerror(errno));
-        goto done;
+        return result;
     }
 
     int auth_rc = auth_client_check(cfg->auth_socket,
-                                    request.username,
-                                    request.password);
+                                    request->username,
+                                    request->password);
     io_deadline_clear();
 
     if (auth_rc == 1)
@@ -1406,10 +1398,86 @@ authenticate_control_request(int control_fd,
     else if (auth_rc == 0)
         result = VNC_BROKER_WEB_AUTH_DENIED;
 
-done:
+    return result;
+}
+
+static VncBrokerWebAuthResult
+authenticate_control_request(int control_fd,
+                             const RuntimeConfig *cfg,
+                             const char *purpose)
+{
+    VncBrokerWebAuthRequest request;
+    memset(&request, 0, sizeof(request));
+
+    if (vnc_broker_recv_web_auth_request(control_fd, &request) < 0) {
+        LOG_ERROR("Invalid %s authentication request from broker: %s",
+                  purpose,
+                  strerror(errno));
+        return VNC_BROKER_WEB_AUTH_ERROR;
+    }
+
+    VncBrokerWebAuthResult result =
+        authenticate_parsed_control_request(&request, cfg, purpose);
     vnc_broker_web_auth_request_clear(&request);
     return result;
 }
+
+static VncBrokerWebAuthResult
+authenticate_or_reuse_web_control_request(int control_fd,
+                                          const RuntimeConfig *cfg)
+{
+    uint8_t payload[4 + VNC_BROKER_AUTH_USERNAME_MAX +
+                    VNC_BROKER_AUTH_PASSWORD_MAX];
+    VncBrokerControlType type;
+    size_t payload_len = 0;
+
+    if (vnc_broker_recv_control(control_fd,
+                                &type,
+                                payload,
+                                sizeof(payload),
+                                &payload_len) < 0) {
+        LOG_ERROR("Invalid WebRTC authentication control packet: %s",
+                  strerror(errno));
+        return VNC_BROKER_WEB_AUTH_ERROR;
+    }
+
+    if (type == VNC_BROKER_CONTROL_WEB_AUTH_REUSE) {
+        if (payload_len != 0) {
+            errno = EPROTO;
+            return VNC_BROKER_WEB_AUTH_ERROR;
+        }
+
+        /*
+         * handle_broker_handoff() already verified SO_PEERCRED uid=0 and
+         * handoff.uid == getuid(). Reuse is therefore delegated only by the
+         * local root broker after it validates its browser session token.
+         */
+        LOG_INFO("WebRTC browser reused previously authenticated browser session");
+        return VNC_BROKER_WEB_AUTH_OK;
+    }
+
+    if (type != VNC_BROKER_CONTROL_WEB_AUTH_REQUEST) {
+        secure_clear(payload, payload_len);
+        errno = EPROTO;
+        return VNC_BROKER_WEB_AUTH_ERROR;
+    }
+
+    VncBrokerWebAuthRequest request;
+    memset(&request, 0, sizeof(request));
+    int parse_rc =
+        vnc_broker_parse_web_auth_request(payload, payload_len, &request);
+    secure_clear(payload, payload_len);
+    if (parse_rc < 0) {
+        LOG_ERROR("Invalid WebRTC authentication request payload");
+        return VNC_BROKER_WEB_AUTH_ERROR;
+    }
+
+    VncBrokerWebAuthResult result =
+        authenticate_parsed_control_request(&request, cfg, "WebRTC");
+    vnc_broker_web_auth_request_clear(&request);
+    return result;
+}
+
 
 static void
 serve_web_control_session(int control_fd,
@@ -1420,7 +1488,7 @@ serve_web_control_session(int control_fd,
                           PipelineStats *pipeline_stats)
 {
     VncBrokerWebAuthResult result =
-        authenticate_control_request(control_fd, cfg, "WebRTC");
+        authenticate_or_reuse_web_control_request(control_fd, cfg);
 
     if (vnc_broker_send_web_auth_result(control_fd, result) < 0) {
         LOG_DEBUG("Could not return WebRTC authentication result to broker: %s",

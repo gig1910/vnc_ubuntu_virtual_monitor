@@ -342,6 +342,13 @@ grep -Fq 'Broker browser JPEG decode failure:' src/broker.c
 grep -Fq 'VNC_WEB_JPEG_DECODE_FAILURE_LIMIT' include/web_server.h src/broker.c
 echo "legacy WSS/JPEG worker protocol, ACK/NACK pacing and integrity diagnostics: OK"
 
+grep -Fq 'VNC_BROKER_CONTROL_WEB_AUTH_REUSE' include/broker_protocol.h src/broker_protocol.c src/main.c
+grep -Fq 'vnc_broker_send_web_auth_reuse' include/broker_protocol.h src/broker_protocol.c
+grep -Fq 'authenticate_or_reuse_web_control_request' src/main.c
+grep -Fq 'SO_PEERCRED uid=0' src/main.c
+echo "root-broker browser authentication reuse protocol: OK"
+
+
 web_media_lifetime="$(
     awk '
         /serve_web_media_lifetime\(int control_fd,/ { capture = 1 }

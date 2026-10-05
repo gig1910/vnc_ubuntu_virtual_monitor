@@ -556,9 +556,33 @@ test_display_state_roundtrip(void)
     close(control[1]);
 }
 
+static void
+test_web_auth_reuse_packet(void)
+{
+    int control[2] = {-1, -1};
+    CHECK(make_seqpacket_pair(control) == 0);
+
+    CHECK(vnc_broker_send_web_auth_reuse(control[0]) == 0);
+
+    uint8_t payload[8] = {0};
+    VncBrokerControlType type = 0;
+    size_t payload_len = 0;
+    CHECK(vnc_broker_recv_control(control[1],
+                                  &type,
+                                  payload,
+                                  sizeof(payload),
+                                  &payload_len) == 0);
+    CHECK(type == VNC_BROKER_CONTROL_WEB_AUTH_REUSE);
+    CHECK(payload_len == 0);
+
+    close(control[0]);
+    close(control[1]);
+}
+
 int
 main(void)
 {
+    test_web_auth_reuse_packet();
     test_device_bind_roundtrip();
     test_display_state_roundtrip();
     test_legacy_broker_to_new_agent();
