@@ -323,6 +323,16 @@ grep -Fq 'monitor_layout_cache_apply(' <<<"$display_resize_block"
 grep -Fq 'web_send_display_applied' <<<"$display_resize_block"
 echo "device display-state resize lifecycle: OK"
 
+grep -Fq '"logical-width"' src/monitor_layout_cache.c
+grep -Fq '"logical-height"' src/monitor_layout_cache.c
+grep -Fq 'transform_swaps_dimensions' src/monitor_layout_cache.c
+grep -Fq 'primary_geometry_valid' src/monitor_layout_cache.c
+grep -Fq 'virtual_group && !primary' src/monitor_layout_cache.c
+grep -Fq 'primary_x - current_logical_width - gap' src/monitor_layout_cache.c
+grep -Fq 'primary_y - current_logical_height - gap' src/monitor_layout_cache.c
+echo "resized virtual monitor keeps primary-relative layout gap: OK"
+
+
 
 
 

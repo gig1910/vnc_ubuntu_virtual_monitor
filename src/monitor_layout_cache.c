@@ -315,6 +315,36 @@ current_monitors_from_state(
     return 0;
 }
 
+static int
+transform_swaps_dimensions(guint32 transform)
+{
+    return (transform & 1u) != 0;
+}
+
+static void
+logical_size_from_monitor(const CurrentMonitor *monitor,
+                          gdouble scale,
+                          guint32 transform,
+                          int *width,
+                          int *height)
+{
+    if (!monitor || !width || !height ||
+        monitor->current_width <= 0 || monitor->current_height <= 0 ||
+        scale <= 0.0)
+        return;
+
+    int physical_width = monitor->current_width;
+    int physical_height = monitor->current_height;
+    if (transform_swaps_dimensions(transform)) {
+        int tmp = physical_width;
+        physical_width = physical_height;
+        physical_height = tmp;
+    }
+
+    *width = (int)((double)physical_width / scale + 0.5);
+    *height = (int)((double)physical_height / scale + 0.5);
+}
+
 static CurrentMonitor *
 find_current_monitor(
     CurrentMonitorList *list,
@@ -497,6 +527,8 @@ keyfile_save_state(
         const char *monitor_serial = NULL;
 
         int monitor_index = 0;
+        int logical_width = 0;
+        int logical_height = 0;
 
         while (
             g_variant_iter_next(
@@ -516,6 +548,15 @@ keyfile_save_state(
                     product,
                     monitor_serial
                 );
+
+            if (logical_width <= 0 && logical_height <= 0 &&
+                current_monitor) {
+                logical_size_from_monitor(current_monitor,
+                                          scale,
+                                          transform,
+                                          &logical_width,
+                                          &logical_height);
+            }
 
             char *monitor_group =
                 g_strdup_printf(
@@ -575,6 +616,17 @@ keyfile_save_state(
             "monitor-count",
             monitor_index
         );
+
+        if (logical_width > 0 && logical_height > 0) {
+            g_key_file_set_integer(keyfile,
+                                   group,
+                                   "logical-width",
+                                   logical_width);
+            g_key_file_set_integer(keyfile,
+                                   group,
+                                   "logical-height",
+                                   logical_height);
+        }
 
         g_free(group);
 
@@ -775,6 +827,54 @@ apply_cached_layout_once(
         return -1;
     }
 
+    int primary_geometry_valid = 0;
+    gint32 primary_x = 0;
+    gint32 primary_y = 0;
+    int primary_width = 0;
+    int primary_height = 0;
+
+    for (int primary_index = 0;
+         primary_index < logical_count && !primary_geometry_valid;
+         primary_index++) {
+        char *primary_group =
+            g_strdup_printf("logical.%d", primary_index);
+
+        GError *primary_error = NULL;
+        gboolean is_primary =
+            g_key_file_get_boolean(keyfile,
+                                   primary_group,
+                                   "primary",
+                                   &primary_error);
+        if (!primary_error && is_primary) {
+            gint32 x = g_key_file_get_integer(keyfile,
+                                              primary_group,
+                                              "x",
+                                              &primary_error);
+            gint32 y = g_key_file_get_integer(keyfile,
+                                              primary_group,
+                                              "y",
+                                              &primary_error);
+            int width = g_key_file_get_integer(keyfile,
+                                               primary_group,
+                                               "logical-width",
+                                               &primary_error);
+            int height = g_key_file_get_integer(keyfile,
+                                                primary_group,
+                                                "logical-height",
+                                                &primary_error);
+            if (!primary_error && width > 0 && height > 0) {
+                primary_x = x;
+                primary_y = y;
+                primary_width = width;
+                primary_height = height;
+                primary_geometry_valid = 1;
+            }
+        }
+
+        g_clear_error(&primary_error);
+        g_free(primary_group);
+    }
+
     GVariantBuilder logical_builder;
     g_variant_builder_init(
         &logical_builder,
@@ -845,6 +945,28 @@ apply_cached_layout_once(
                 &group_error
             );
 
+        int saved_logical_width = 0;
+        int saved_logical_height = 0;
+        GError *geometry_error = NULL;
+        saved_logical_width =
+            g_key_file_get_integer(keyfile,
+                                   group,
+                                   "logical-width",
+                                   &geometry_error);
+        if (geometry_error) {
+            g_clear_error(&geometry_error);
+            saved_logical_width = 0;
+        }
+        saved_logical_height =
+            g_key_file_get_integer(keyfile,
+                                   group,
+                                   "logical-height",
+                                   &geometry_error);
+        if (geometry_error) {
+            g_clear_error(&geometry_error);
+            saved_logical_height = 0;
+        }
+
         if (
             group_error ||
             monitor_count <= 0
@@ -880,6 +1002,10 @@ apply_cached_layout_once(
                 "a(ssa{sv})"
             )
         );
+
+        int virtual_group = 0;
+        int current_logical_width = 0;
+        int current_logical_height = 0;
 
         for (
             int monitor_index = 0;
@@ -977,6 +1103,21 @@ apply_cached_layout_once(
                 return 1;
             }
 
+            if ((saved_connector &&
+                 g_str_has_prefix(saved_connector, "Meta-")) ||
+                (matched->connector &&
+                 g_str_has_prefix(matched->connector, "Meta-"))) {
+                virtual_group = 1;
+                if (current_logical_width <= 0 &&
+                    current_logical_height <= 0) {
+                    logical_size_from_monitor(matched,
+                                              scale,
+                                              transform,
+                                              &current_logical_width,
+                                              &current_logical_height);
+                }
+            }
+
             /*
              * Mode IDs are only valid for the current monitor state. Prefer
              * the current mode ID supplied by Mutter after hotplug. For the
@@ -1004,6 +1145,41 @@ apply_cached_layout_once(
             g_free(saved_serial);
             g_free(saved_mode);
             g_free(monitor_group);
+        }
+
+        /*
+         * Preserve the saved gap to the primary monitor when a virtual
+         * monitor changes dimensions. Exact x/y remains authoritative for
+         * overlapping/free-floating arrangements; only clearly separated
+         * left/right/above/below relationships are normalized.
+         */
+        if (virtual_group && !primary &&
+            primary_geometry_valid &&
+            saved_logical_width > 0 &&
+            saved_logical_height > 0 &&
+            current_logical_width > 0 &&
+            current_logical_height > 0) {
+            if (x + saved_logical_width <= primary_x) {
+                gint32 gap =
+                    primary_x - (x + saved_logical_width);
+                x = primary_x - current_logical_width - gap;
+            }
+            else if (x >= primary_x + primary_width) {
+                gint32 gap =
+                    x - (primary_x + primary_width);
+                x = primary_x + primary_width + gap;
+            }
+
+            if (y + saved_logical_height <= primary_y) {
+                gint32 gap =
+                    primary_y - (y + saved_logical_height);
+                y = primary_y - current_logical_height - gap;
+            }
+            else if (y >= primary_y + primary_height) {
+                gint32 gap =
+                    y - (primary_y + primary_height);
+                y = primary_y + primary_height + gap;
+            }
         }
 
         g_variant_builder_add(
