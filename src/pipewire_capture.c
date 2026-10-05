@@ -731,7 +731,16 @@ pipewire_capture_start(PipewireCapture *capture,
         SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
         SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
         SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(
-            &SPA_RECTANGLE((uint32_t)width, (uint32_t)height)));
+            &SPA_RECTANGLE((uint32_t)width, (uint32_t)height)),
+        /*
+         * RecordVirtual derives its output cadence from PipeWire negotiation.
+         * A 0/1 variable rate can miss compositor-only motion/effects because
+         * no client surface damage is required while an actor is moving.
+         * Request the configured monitor cadence explicitly so every stage
+         * paint can become a capture frame.
+         */
+        SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(
+            &SPA_FRACTION((uint32_t)fps, 1)));
 
     struct pw_properties *props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Video",

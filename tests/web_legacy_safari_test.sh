@@ -173,6 +173,12 @@ grep -Fq 'max-width: 760px' <<<"$management_page"
 
 echo "legacy Safari frontend: OK"
 
+grep -Fq 'SPA_FORMAT_VIDEO_framerate' src/pipewire_capture.c
+grep -Fq 'SPA_FRACTION((uint32_t)fps, 1)' src/pipewire_capture.c
+grep -Fq 'RecordVirtual derives its output cadence' src/pipewire_capture.c
+echo "virtual monitor fixed PipeWire cadence: OK"
+
+
 public_status_handler="$(
     awk '
         /status_handler\(SoupServer \*server,/ { capture = 1 }
