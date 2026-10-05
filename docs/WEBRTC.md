@@ -366,3 +366,10 @@ The advertised playlist remains three segments long to preserve classic-HLS clie
 ### Legacy Safari live-window compatibility probe
 
 With ~0.533 s segments and only three advertised entries, iOS 9 Safari fetched the playlist but did not begin playback. The prior working 1 s profile exposed roughly 3 s of media in the live window, while the three-entry sub-second profile exposed only about 1.6 s. The next probe keeps ~0.533 s segments but advertises six entries (~3.2 s of media) and retains twelve files on disk. This also matches Apple's guidance to provide at least six segments in a live playlist while preserving the short segment duration for latency measurement.
+
+
+### Legacy HLS latency conclusion
+
+The iPad 3 / iOS 9.3.6 compatibility probe with ~0.533 s MPEG-TS fragments and a six-entry playlist did play, but end-to-end delay increased to roughly 3 seconds or more. The client continuously fetched every short segment, so transport, authentication, playlist refresh and H.264 decode were all functioning. The behavior is consistent with classic live-HLS clients maintaining a multi-target-duration live buffer rather than following each shorter fragment at the live edge.
+
+The legacy browser fallback therefore returns to the previously working one-second GOP with a three-entry playlist. That profile produced the lowest observed delay (about 1-2 seconds by visual measurement) and is retained as the compatibility baseline. Sub-second classic-HLS fragmentation is not used as a production latency optimization. Successful HLS GET/HEAD request logs are debug-level after this diagnosis; failures remain visible at info/error levels.
