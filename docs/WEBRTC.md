@@ -310,3 +310,8 @@ state restores the normal login layout.
 
 Broker shutdown is also state-aware: an already-closing libsoup WebSocket is
 not closed a second time during server teardown.
+
+
+### iOS 9 JPEG decode compatibility
+
+Legacy Safari receives WebSocket binary messages as ArrayBuffer where possible and always normalizes each frame through a Blob explicitly typed image/jpeg. The client pre-decodes a candidate frame with an off-screen Image before replacing the visible framebuffer. This avoids typeless WebSocket Blob objects and revoking the previous ObjectURL while Safari is still decoding it. At most one candidate frame is decoded at a time; additional frames are dropped until that decode completes. The UI enters live-view mode only after Image.onload, and a failed first decode is reported explicitly in both status and Web Inspector console.
