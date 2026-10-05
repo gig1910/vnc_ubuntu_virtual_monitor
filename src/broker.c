@@ -661,6 +661,32 @@ broker_handle_web_media_packet(Broker *broker,
     if (!broker)
         return FALSE;
 
+    if (type == VNC_BROKER_CONTROL_DISPLAY_SIZE_REJECTED) {
+        VncBrokerDisplayState state;
+        if (!broker->websocket_attached ||
+            !broker->web_protocol_ready ||
+            vnc_broker_parse_display_state(payload,
+                                           payload_len,
+                                           &state) < 0)
+            return FALSE;
+
+        char *message = g_strdup_printf(
+            "{\"type\":\"display-state-rejected\","
+            "\"generation\":%u,\"reason\":\"runtime\","
+            "\"width\":%u,\"height\":%u,"
+            "\"mode\":\"%s\",\"orientation\":\"%s\"}",
+            state.generation,
+            state.width,
+            state.height,
+            state.mode == VNC_BROKER_DISPLAY_FULLSCREEN ?
+                "fullscreen" : "window",
+            state.orientation == VNC_BROKER_ORIENTATION_LANDSCAPE ?
+                "landscape" : "portrait");
+        gboolean sent = web_server_send_text(broker->web_server, message);
+        g_free(message);
+        return sent;
+    }
+
     if (type == VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED) {
         VncBrokerDisplayState state;
         if (!broker->websocket_attached ||

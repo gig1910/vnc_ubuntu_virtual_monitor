@@ -322,6 +322,12 @@ grep -Fq 'real_monitor_resize(&real' <<<"$display_resize_block"
 grep -Fq 'monitor_layout_cache_apply(' <<<"$display_resize_block"
 grep -Fq 'web_send_display_applied' <<<"$display_resize_block"
 echo "device display-state resize lifecycle: OK"
+grep -Fq 'VNC_BROKER_CONTROL_DISPLAY_SIZE_REJECTED' include/broker_protocol.h src/broker.c src/main.c
+grep -Fq 'web_send_display_rejected' src/main.c
+grep -Fq "message.reason === 'runtime'" <<<"$client_js"
+grep -Fq "message.reason === 'rate-limit'" <<<"$client_js"
+echo "display resize rollback is acknowledged without retry loop: OK"
+
 
 grep -Fq '"logical-width"' src/monitor_layout_cache.c
 grep -Fq '"logical-height"' src/monitor_layout_cache.c

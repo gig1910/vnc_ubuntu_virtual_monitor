@@ -541,6 +541,17 @@ test_display_state_roundtrip(void)
     CHECK(parsed.mode == VNC_BROKER_DISPLAY_WINDOW);
     CHECK(parsed.orientation == VNC_BROKER_ORIENTATION_PORTRAIT);
 
+    sent.generation++;
+    CHECK(vnc_broker_send_display_state(control[0],
+                                        VNC_BROKER_CONTROL_DISPLAY_SIZE_REJECTED,
+                                        &sent) == 0);
+    CHECK(vnc_broker_recv_control(control[1], &type,
+                                  payload, sizeof(payload),
+                                  &payload_len) == 0);
+    CHECK(type == VNC_BROKER_CONTROL_DISPLAY_SIZE_REJECTED);
+    CHECK(vnc_broker_parse_display_state(payload, payload_len, &parsed) == 0);
+    CHECK(parsed.generation == sent.generation);
+
     close(control[0]);
     close(control[1]);
 }

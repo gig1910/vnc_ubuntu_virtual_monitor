@@ -895,6 +895,30 @@ web_device_layout_seed_legacy(MonitorLayoutCache *target,
 }
 
 static int
+web_send_display_rejected(int control_fd,
+                          uint32_t generation,
+                          VncBrokerDisplayMode mode,
+                          VncBrokerDisplayOrientation orientation,
+                          const RuntimeConfig *cfg)
+{
+    if (!cfg || generation == 0)
+        return -1;
+
+    VncBrokerDisplayState rejected = {
+        .generation = generation,
+        .width = (uint32_t)cfg->width,
+        .height = (uint32_t)cfg->height,
+        .mode = mode,
+        .orientation = orientation
+    };
+
+    return vnc_broker_send_display_state(
+        control_fd,
+        VNC_BROKER_CONTROL_DISPLAY_SIZE_REJECTED,
+        &rejected);
+}
+
+static int
 web_send_display_applied(int control_fd,
                          const VncBrokerDisplayState *state,
                          const RuntimeConfig *cfg)
@@ -1271,8 +1295,19 @@ serve_web_media_lifetime(int control_fd,
                 }
             }
 
-            if (!resize_ok)
+            if (!resize_ok) {
+                if (web_send_display_rejected(control_fd,
+                                              requested.generation,
+                                              old_mode,
+                                              old_orientation,
+                                              &session_cfg) < 0) {
+                    LOG_INFO("Could not report rejected browser display state: %s",
+                             strerror(errno));
+                    result = -1;
+                    break;
+                }
                 continue;
+            }
 
             if (web_send_display_applied(control_fd,
                                          &requested,

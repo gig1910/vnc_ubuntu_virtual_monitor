@@ -620,7 +620,8 @@ vnc_broker_send_display_state(int control_fd,
 {
     if (!state ||
         (type != VNC_BROKER_CONTROL_DISPLAY_SIZE &&
-         type != VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED) ||
+         type != VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED &&
+         type != VNC_BROKER_CONTROL_DISPLAY_SIZE_REJECTED) ||
         state->generation == 0 ||
         state->width < VNC_BROKER_VIDEO_DIMENSION_MIN ||
         state->height < VNC_BROKER_VIDEO_DIMENSION_MIN ||
