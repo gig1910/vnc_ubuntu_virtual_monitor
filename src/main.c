@@ -70,15 +70,26 @@ typedef struct {
     int stop;
     int frame_in_flight;
     uint64_t frames_acked;
+    uint64_t ack_last_ms;
+    double ack_ewma_ms;
+    uint64_t adapt_slow_since_ms;
+    uint64_t source_starved_until_ms;
+    int target_fps;
     int control_fd;
     int width;
     int height;
     FrameBridge *frames;
 } WebMediaSender;
 
-#define WEB_LEGACY_JPEG_QUALITY 65
-#define WEB_LEGACY_MAX_FPS       8
-#define WEB_HLS_TEST_FPS         15
+#define WEB_LEGACY_JPEG_QUALITY          65
+#define WEB_LEGACY_MIN_FPS                3
+#define WEB_LEGACY_MAX_FPS                8
+#define WEB_LEGACY_CAPTURE_MAX_FPS       12
+#define WEB_LEGACY_ADAPT_STABLE_MS     5000u
+#define WEB_LEGACY_SOURCE_STALL_MS       250u
+#define WEB_LEGACY_SOURCE_HOLD_MS       3000u
+#define WEB_LEGACY_TELEMETRY_MS         5000u
+#define WEB_HLS_TEST_FPS                  15
 
 static int
 create_public_listener(const RuntimeConfig *cfg)
@@ -660,21 +671,6 @@ web_media_sender_begin_frame(WebMediaSender *sender)
     return 1;
 }
 
-static void
-web_media_sender_ack(WebMediaSender *sender)
-{
-    if (!sender)
-        return;
-
-    pthread_mutex_lock(&sender->mutex);
-    if (sender->frame_in_flight) {
-        sender->frame_in_flight = 0;
-        sender->frames_acked++;
-        pthread_cond_signal(&sender->ack_cond);
-    }
-    pthread_mutex_unlock(&sender->mutex);
-}
-
 static uint64_t
 web_monotonic_ms(void)
 {
@@ -684,6 +680,109 @@ web_monotonic_ms(void)
 
     return (uint64_t)ts.tv_sec * 1000u +
            (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int
+web_media_sender_target_fps(WebMediaSender *sender)
+{
+    int fps = WEB_LEGACY_MAX_FPS;
+    if (!sender)
+        return fps;
+
+    pthread_mutex_lock(&sender->mutex);
+    if (sender->target_fps >= WEB_LEGACY_MIN_FPS &&
+        sender->target_fps <= WEB_LEGACY_MAX_FPS)
+        fps = sender->target_fps;
+    pthread_mutex_unlock(&sender->mutex);
+    return fps;
+}
+
+static void
+web_media_sender_note_source_wait(WebMediaSender *sender,
+                                  uint64_t wait_ms)
+{
+    if (!sender || wait_ms < WEB_LEGACY_SOURCE_STALL_MS)
+        return;
+
+    uint64_t now_ms = web_monotonic_ms();
+    pthread_mutex_lock(&sender->mutex);
+    sender->source_starved_until_ms = now_ms + WEB_LEGACY_SOURCE_HOLD_MS;
+    sender->adapt_slow_since_ms = 0;
+    pthread_mutex_unlock(&sender->mutex);
+}
+
+static void
+web_media_sender_ack(WebMediaSender *sender)
+{
+    if (!sender)
+        return;
+
+    uint64_t now_ms = web_monotonic_ms();
+    pthread_mutex_lock(&sender->mutex);
+    if (sender->frame_in_flight) {
+        sender->frame_in_flight = 0;
+        sender->frames_acked++;
+
+        if (sender->ack_last_ms != 0 && now_ms > sender->ack_last_ms) {
+            double sample_ms = (double)(now_ms - sender->ack_last_ms);
+            if (sender->ack_ewma_ms <= 0.0)
+                sender->ack_ewma_ms = sample_ms;
+            else
+                sender->ack_ewma_ms +=
+                    (sample_ms - sender->ack_ewma_ms) / 8.0;
+
+            int source_starved =
+                now_ms < sender->source_starved_until_ms;
+
+            /*
+             * ACK cadence is a WEB-only back-pressure signal. Never reduce
+             * the sender because the source itself is idle/starved; that
+             * would turn capture stalls or static-screen periods into a
+             * self-reinforcing FPS reduction.
+             */
+            if (!source_starved &&
+                sender->target_fps > WEB_LEGACY_MIN_FPS) {
+                double budget_ms =
+                    1000.0 / (double)sender->target_fps;
+                if (sender->ack_ewma_ms > budget_ms * 1.35) {
+                    if (sender->adapt_slow_since_ms == 0)
+                        sender->adapt_slow_since_ms = now_ms;
+                    else if (now_ms - sender->adapt_slow_since_ms >=
+                             WEB_LEGACY_ADAPT_STABLE_MS) {
+                        sender->target_fps--;
+                        sender->adapt_slow_since_ms = 0;
+                        LOG_INFO("[WEB][ADAPT] target-fps=%d reason=ack-bound ack-ewma=%.1fms",
+                                 sender->target_fps,
+                                 sender->ack_ewma_ms);
+                    }
+                }
+                else {
+                    sender->adapt_slow_since_ms = 0;
+                }
+            }
+            else {
+                sender->adapt_slow_since_ms = 0;
+            }
+
+            /* Recovery is intentionally faster than reduction. */
+            if (!source_starved &&
+                sender->target_fps < WEB_LEGACY_MAX_FPS) {
+                double faster_budget_ms =
+                    1000.0 / (double)(sender->target_fps + 1);
+                if (sender->ack_ewma_ms <= faster_budget_ms * 1.05) {
+                    sender->target_fps++;
+                    sender->adapt_slow_since_ms = 0;
+                    LOG_INFO("[WEB][ADAPT] target-fps=%d reason=ack-recovered ack-ewma=%.1fms",
+                             sender->target_fps,
+                             sender->ack_ewma_ms);
+                }
+            }
+        }
+
+        sender->ack_last_ms = now_ms;
+        pthread_cond_signal(&sender->ack_cond);
+    }
+    pthread_mutex_unlock(&sender->mutex);
 }
 
 static void *
@@ -701,7 +800,11 @@ web_media_sender_worker(void *opaque)
     uint64_t last_sequence = 0;
     uint64_t last_sent_ms = 0;
     uint64_t frames_sent = 0;
-    const uint64_t min_interval_ms = 1000u / WEB_LEGACY_MAX_FPS;
+    uint64_t telemetry_started_ms = web_monotonic_ms();
+    uint64_t telemetry_frames = 0;
+    uint64_t telemetry_jpeg_bytes = 0;
+    uint64_t telemetry_encode_ms = 0;
+    uint64_t latest_source_wait_ms = 0;
 
     while (!web_media_sender_should_stop(sender)) {
         /*
@@ -713,15 +816,25 @@ web_media_sender_worker(void *opaque)
             break;
 
         uint64_t current_sequence = 0;
+        uint64_t source_wait_started_ms = web_monotonic_ms();
         int wait_rc = frame_bridge_wait_for_change(sender->frames,
                                                    last_sequence,
                                                    100,
                                                    &current_sequence);
+        uint64_t source_wait_finished_ms = web_monotonic_ms();
+        latest_source_wait_ms =
+            source_wait_finished_ms >= source_wait_started_ms ?
+                source_wait_finished_ms - source_wait_started_ms : 0;
         if (wait_rc < 0)
             break;
         if (wait_rc == 0)
             continue;
 
+        web_media_sender_note_source_wait(sender, latest_source_wait_ms);
+
+        int target_fps = web_media_sender_target_fps(sender);
+        uint64_t min_interval_ms =
+            1000u / (uint64_t)(target_fps > 0 ? target_fps : WEB_LEGACY_MAX_FPS);
         uint64_t now_ms = web_monotonic_ms();
         if (last_sent_ms != 0 && now_ms > last_sent_ms &&
             now_ms - last_sent_ms < min_interval_ms) {
@@ -747,6 +860,7 @@ web_media_sender_worker(void *opaque)
 
         uint8_t *jpeg = NULL;
         size_t jpeg_size = 0;
+        uint64_t encode_started_ms = web_monotonic_ms();
         if (web_jpeg_encode_bgrx(pixels,
                                  sender->width,
                                  sender->height,
@@ -796,9 +910,50 @@ web_media_sender_worker(void *opaque)
             break;
         }
 
+        uint64_t sent_ms = web_monotonic_ms();
+        uint64_t encode_ms =
+            sent_ms >= encode_started_ms ? sent_ms - encode_started_ms : 0;
         free(jpeg);
-        last_sent_ms = web_monotonic_ms();
+        last_sent_ms = sent_ms;
         frames_sent++;
+        telemetry_frames++;
+        telemetry_jpeg_bytes += (uint64_t)jpeg_size;
+        telemetry_encode_ms += encode_ms;
+
+        if (telemetry_started_ms == 0)
+            telemetry_started_ms = sent_ms;
+        if (sent_ms >= telemetry_started_ms &&
+            sent_ms - telemetry_started_ms >= WEB_LEGACY_TELEMETRY_MS) {
+            double ack_ewma_ms = 0.0;
+            int source_starved = 0;
+            int telemetry_target_fps = WEB_LEGACY_MAX_FPS;
+            pthread_mutex_lock(&sender->mutex);
+            ack_ewma_ms = sender->ack_ewma_ms;
+            source_starved = sent_ms < sender->source_starved_until_ms;
+            telemetry_target_fps = sender->target_fps;
+            pthread_mutex_unlock(&sender->mutex);
+
+            LOG_INFO("[WEB][PIPELINE] capture-cap=%d target-fps=%d sent=%" PRIu64
+                     " encode-avg=%.1fms jpeg-avg=%" PRIu64
+                     "B ack-ewma=%.1fms source-wait=%" PRIu64
+                     "ms source-starved=%d latest-only=1",
+                     WEB_LEGACY_CAPTURE_MAX_FPS,
+                     telemetry_target_fps,
+                     telemetry_frames,
+                     telemetry_frames ?
+                         (double)telemetry_encode_ms /
+                             (double)telemetry_frames : 0.0,
+                     telemetry_frames ?
+                         telemetry_jpeg_bytes / telemetry_frames : 0,
+                     ack_ewma_ms,
+                     latest_source_wait_ms,
+                     source_starved);
+
+            telemetry_started_ms = sent_ms;
+            telemetry_frames = 0;
+            telemetry_jpeg_bytes = 0;
+            telemetry_encode_ms = 0;
+        }
 
         if (frames_sent == 1) {
             LOG_INFO("Legacy browser media sent first JPEG frame: %dx%d quality=%d; browser-ACK pacing active",
@@ -824,6 +979,12 @@ web_media_sender_start(WebMediaSender *sender,
     pthread_mutex_lock(&sender->mutex);
     sender->stop = 0;
     sender->frame_in_flight = 0;
+    sender->frames_acked = 0;
+    sender->ack_last_ms = 0;
+    sender->ack_ewma_ms = 0.0;
+    sender->adapt_slow_since_ms = 0;
+    sender->source_starved_until_ms = 0;
+    sender->target_fps = WEB_LEGACY_MAX_FPS;
     sender->width = width;
     sender->height = height;
     pthread_mutex_unlock(&sender->mutex);
@@ -1088,6 +1249,16 @@ serve_web_media_lifetime(int control_fd,
             else {
                 web_device_layout_seed_legacy(&layout_cache, &session_cfg);
             }
+
+            /*
+             * WEB sessions get their own capture ceiling. session_cfg is a
+             * private copy, so the VNC transport and its capture policy are
+             * deliberately untouched.
+             */
+            if (session_cfg.max_fps > WEB_LEGACY_CAPTURE_MAX_FPS)
+                session_cfg.max_fps = WEB_LEGACY_CAPTURE_MAX_FPS;
+            LOG_INFO("[WEB][CAPTURE] upper-bound=%d fps transport=wss-jpeg vnc-policy=unchanged",
+                     session_cfg.max_fps);
 
             if (real_monitor_start(&real,
                                    &session_cfg,
