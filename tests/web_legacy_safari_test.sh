@@ -206,7 +206,7 @@ grep -Fq 'recordFrameMetric();' <<<"$client_js"
 grep -Fq "message.type === 'network-sample'" <<<"$client_js"
 grep -Fq 'latestPing' <<<"$client_js"
 grep -Fq 'latestJitter' <<<"$client_js"
-grep -Fq 'FPS / jitter / ping overlay' <<<"$login_page"
+grep -Fq 'FPS / RTT jitter / ping overlay' <<<"$login_page"
 echo "optional truthful FPS jitter ping overlay: OK"
 
 grep -Fq 'function recordNetworkSample(value)' <<<"$client_js"
