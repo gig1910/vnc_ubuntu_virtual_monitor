@@ -209,6 +209,16 @@ grep -Fq 'latestJitter' <<<"$client_js"
 grep -Fq 'FPS / jitter / ping overlay' <<<"$login_page"
 echo "optional truthful FPS jitter ping overlay: OK"
 
+grep -Fq 'function recordNetworkSample(value)' <<<"$client_js"
+grep -Fq 'Math.abs(pingSample - lastPing)' <<<"$client_js"
+grep -Fq '(delta - latestJitter) / 16' <<<"$client_js"
+grep -Fq 'RTT jitter' <<<"$login_page"
+if grep -Fq 'latestJitter = count ? deviation / count' <<<"$client_js"; then
+    echo "Performance overlay regression: jitter is frame cadence, not WSS RTT jitter" >&2
+    exit 1
+fi
+echo "performance overlay jitter is WSS RTT jitter: OK"
+
 grep -Fq 'debug-log' <<<"$login_page"
 grep -Fq 'debug-summary' <<<"$login_page"
 grep -Fq 'function appendDebug(level, text)' <<<"$client_js"
@@ -342,6 +352,14 @@ grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/br
 grep -Fq 'websocket_parse_ping' src/web_server.c
 grep -Fq '\"type\":\"pong\"' src/web_server.c
 grep -Fq 'function startPing()' <<<"$protocol_worker_js"
+
+protocol_ready_line="$(grep -Fn 'protocol-ready' <<<"$protocol_worker_js" | grep 'sendText' | head -n1 | cut -d: -f1)"
+start_ping_line="$(grep -Fn 'startPing();' <<<"$protocol_worker_js" | head -n1 | cut -d: -f1)"
+if [[ -z "$protocol_ready_line" || -z "$start_ping_line" || "$start_ping_line" -le "$protocol_ready_line" ]]; then
+    echo "WSS ping regression: ping starts before protocol-ready" >&2
+    exit 1
+fi
+echo "WSS ping starts only after protocol-ready: OK"
 grep -Fq "message.type === 'pong'" <<<"$protocol_worker_js"
 grep -Fq "message.type === 'network-sample'" <<<"$client_js"
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c
