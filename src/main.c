@@ -872,6 +872,28 @@ web_device_layout_prepare(MonitorLayoutCache *cache,
     return monitor_layout_cache_prepare_scoped(cache, cfg, scope);
 }
 
+static void
+web_device_layout_seed_legacy(MonitorLayoutCache *target,
+                              const RuntimeConfig *cfg)
+{
+    if (!target || !cfg || target->cache_existed)
+        return;
+
+    MonitorLayoutCache legacy = {0};
+    if (monitor_layout_cache_prepare(&legacy, cfg) < 0)
+        return;
+
+    if (legacy.cache_existed &&
+        monitor_layout_cache_file_has_virtual(&legacy) &&
+        monitor_layout_cache_seed_from(target, legacy.cache_path) == 0) {
+        LOG_INFO("Browser device layout inherited existing VNC layout: %dx%d",
+                 cfg->width,
+                 cfg->height);
+    }
+
+    monitor_layout_cache_clear(&legacy);
+}
+
 static int
 web_send_display_applied(int control_fd,
                          const VncBrokerDisplayState *state,
@@ -1038,6 +1060,9 @@ serve_web_media_lifetime(int control_fd,
                                           active_mode,
                                           active_orientation) < 0) {
                 LOG_DEBUG("Browser device layout cache preparation failed; continuing without cached layout");
+            }
+            else {
+                web_device_layout_seed_legacy(&layout_cache, &session_cfg);
             }
 
             if (real_monitor_start(&real,

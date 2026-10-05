@@ -337,6 +337,13 @@ grep -Fq '!layout_cache.cache_existed' src/main.c
 grep -Fq 'g_chmod(cache->cache_path, 0600)' src/monitor_layout_cache.c
 echo "new display state inherits previous layout before first apply: OK"
 
+grep -Fq 'web_device_layout_seed_legacy' src/main.c
+grep -Fq 'monitor_layout_cache_prepare(&legacy, cfg)' src/main.c
+grep -Fq 'monitor_layout_cache_file_has_virtual(&legacy)' src/main.c
+grep -Fq 'Browser device layout inherited existing VNC layout:' src/main.c
+echo "first device state inherits existing VNC layout non-destructively: OK"
+
+
 
 
 
