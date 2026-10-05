@@ -208,6 +208,6 @@ echo "HLS HEAD/byte-range serving: OK"
 
 grep -Fq '#define WEB_HLS_GOP_DIVISOR 2' "$hls_source"
 grep -Fq 'key_int_max = (fps + WEB_HLS_GOP_DIVISOR - 1)' "$hls_source"
-grep -Fq 'WEB_HLS_PLAYLIST_LENGTH 3' "$hls_source"
-grep -Fq 'WEB_HLS_PLAYLIST_FILES 8' "$hls_source"
+grep -Fq 'WEB_HLS_PLAYLIST_LENGTH 6' "$hls_source"
+grep -Fq 'WEB_HLS_PLAYLIST_FILES 12' "$hls_source"
 echo "HLS sub-second GOP latency profile: OK"
