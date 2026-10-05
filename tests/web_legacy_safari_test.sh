@@ -76,6 +76,9 @@ done
 grep -Fq 'XMLHttpRequest' <<<"$client_js"
 grep -Fq 'new Worker' <<<"$client_js"
 grep -Fq '/protocol-worker.js?protocol=' <<<"$client_js"
+grep -Fq '/client.js?protocol=' <<<"$login_page"
+grep -Fq 'protocol_worker_js_handler' "$source_file"
+grep -Fq '"/protocol-worker.js"' "$source_file"
 grep -Fq 'new WebSocket' <<<"$protocol_worker_js"
 grep -Fq 'WebSocket constructor failed' <<<"$protocol_worker_js"
 grep -Fq 'network/TLS handshake failed' <<<"$protocol_worker_js"
@@ -88,7 +91,15 @@ grep -Fq 'socket.send' <<<"$protocol_worker_js"
 grep -Fq 'frame-ack' <<<"$protocol_worker_js"
 grep -Fq 'frame-nack' <<<"$protocol_worker_js"
 grep -Fq 'new Uint8Array(data)' <<<"$protocol_worker_js"
-grep -Fq 'WSS JPEG bytes=' <<<"$client_js"
+if grep -Fq 'new WebSocket' <<<"$client_js" ||
+   grep -Fq 'new Uint8Array(data)' <<<"$client_js"; then
+    echo "Legacy Safari regression: WSS/protocol parsing leaked back to the UI thread" >&2
+    exit 1
+fi
+if grep -Eq 'document\.|window\.' <<<"$protocol_worker_js"; then
+    echo "Legacy Safari regression: protocol worker depends on DOM/window state" >&2
+    exit 1
+fi
 grep -Fq 'Protocol client/server:' <<<"$login_page"
 grep -Fq 'Build client/server:' <<<"$login_page"
 grep -Fq 'protocol-mismatch' <<<"$protocol_worker_js"
