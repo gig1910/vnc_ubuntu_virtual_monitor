@@ -6,6 +6,7 @@
 #include "tls_pair.h"
 
 #include <gio/gio.h>
+#include <glib/gstdio.h>
 #include <libsoup/soup.h>
 #include <errno.h>
 #include <limits.h>

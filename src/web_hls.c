@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -208,10 +209,13 @@ hls_feeder_thread(void *opaque)
             break;
 
         GstMapInfo map;
-        if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE) ||
-            map.size < frame_bytes) {
-            if (map.data)
-                gst_buffer_unmap(buffer, &map);
+        memset(&map, 0, sizeof(map));
+        if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+            gst_buffer_unref(buffer);
+            break;
+        }
+        if (map.size < frame_bytes) {
+            gst_buffer_unmap(buffer, &map);
             gst_buffer_unref(buffer);
             break;
         }
@@ -318,9 +322,15 @@ web_hls_start(WebHlsStream *stream,
 
     gst_init(NULL, NULL);
 
-    if (!gst_element_factory_find("x264enc") ||
-        !gst_element_factory_find("hlssink2") ||
-        !gst_element_factory_find("h264parse")) {
+    GstElementFactory *x264_factory = gst_element_factory_find("x264enc");
+    GstElementFactory *hls_factory = gst_element_factory_find("hlssink2");
+    GstElementFactory *parse_factory = gst_element_factory_find("h264parse");
+    gboolean have_plugins = x264_factory && hls_factory && parse_factory;
+    if (x264_factory) gst_object_unref(x264_factory);
+    if (hls_factory) gst_object_unref(hls_factory);
+    if (parse_factory) gst_object_unref(parse_factory);
+
+    if (!have_plugins) {
         LOG_INFO("Legacy browser HLS unavailable: x264enc/hlssink2/h264parse plugin missing");
         errno = ENOSYS;
         goto fail;
