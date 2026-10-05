@@ -315,3 +315,19 @@ not closed a second time during server teardown.
 ### iOS 9 JPEG decode compatibility
 
 Legacy Safari receives WebSocket binary messages as ArrayBuffer where possible and always normalizes each frame through a Blob explicitly typed image/jpeg. The client pre-decodes a candidate frame with an off-screen Image before replacing the visible framebuffer. This avoids typeless WebSocket Blob objects and revoking the previous ObjectURL while Safari is still decoding it. At most one candidate frame is decoded at a time; additional frames are dropped until that decode completes. The UI enters live-view mode only after Image.onload, and a failed first decode is reported explicitly in both status and Web Inspector console.
+
+
+## Experimental iOS 9 HLS/H.264 path
+
+The legacy iOS path now tries an HLS/H.264 transport before WSS/JPEG. After the
+authenticated WSS bind and MEDIA_START, the user agent keeps the existing
+Mutter/PipeWire raw capture but feeds the latest BGRx frame into a GStreamer
+appsrc at 15 fps. The test encoder is x264 baseline, ultrafast/zerolatency,
+2500 kbit/s, one-second GOPs. hlssink2 writes a three-segment live MPEG-TS
+playlist under $XDG_RUNTIME_DIR/vnc-monitor/hls.
+
+This first experiment intentionally uses software H.264 encoding to isolate the
+browser transport and the iOS native HLS decoder. Once latency/compatibility is
+measured on the iPad, the encoder can be replaced with VA/QSV without changing
+the browser protocol. If the required GStreamer HLS/x264 plugins are missing,
+the agent falls back to the existing bounded WSS/JPEG path.

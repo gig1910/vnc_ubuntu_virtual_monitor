@@ -10,6 +10,7 @@
 #include "shutdown_signal.h"
 #include "frame_bridge.h"
 #include "web_jpeg.h"
+#include "web_hls.h"
 #include "real_monitor.h"
 #include "monitor_layout_cache.h"
 #include "pipeline_stats.h"
@@ -72,6 +73,7 @@ typedef struct {
 
 #define WEB_LEGACY_JPEG_QUALITY 65
 #define WEB_LEGACY_MAX_FPS       8
+#define WEB_HLS_TEST_FPS         15
 
 static int
 create_public_listener(const RuntimeConfig *cfg)
@@ -751,6 +753,9 @@ serve_web_media_lifetime(int control_fd,
     sender.height = cfg->height;
     sender.frames = frames;
 
+    WebHlsStream hls;
+    memset(&hls, 0, sizeof(hls));
+
     int mutex_rc = pthread_mutex_init(&sender.mutex, NULL);
     if (mutex_rc != 0) {
         errno = mutex_rc;
@@ -759,6 +764,7 @@ serve_web_media_lifetime(int control_fd,
 
     pthread_t sender_thread;
     int sender_started = 0;
+    int hls_started = 0;
     int media_started = 0;
     int result = 0;
 
@@ -801,6 +807,19 @@ serve_web_media_lifetime(int control_fd,
 
             media_started = 1;
 
+            if (web_hls_start(&hls,
+                              control_fd,
+                              frames,
+                              cfg->width,
+                              cfg->height,
+                              WEB_HLS_TEST_FPS) == 0) {
+                hls_started = 1;
+                LOG_INFO("Legacy browser media selected HLS/H.264 test transport");
+                continue;
+            }
+
+            LOG_INFO("Legacy browser HLS test path unavailable; falling back to WSS/JPEG");
+
             int rc = pthread_create(&sender_thread, NULL,
                                     web_media_sender_worker, &sender);
             if (rc != 0) {
@@ -811,7 +830,7 @@ serve_web_media_lifetime(int control_fd,
             }
 
             sender_started = 1;
-            LOG_INFO("Legacy browser WSS/JPEG media active: %dx%d max-fps=%d quality=%d",
+            LOG_INFO("Legacy browser WSS/JPEG fallback active: %dx%d max-fps=%d quality=%d",
                      cfg->width, cfg->height,
                      WEB_LEGACY_MAX_FPS, WEB_LEGACY_JPEG_QUALITY);
             continue;
@@ -821,6 +840,9 @@ serve_web_media_lifetime(int control_fd,
         LOG_DEBUG("Ignoring unsupported browser control message type=%u payload=%zu",
                   (unsigned)type, payload_len);
     }
+
+    if (hls_started)
+        web_hls_stop(&hls);
 
     if (sender_started) {
         web_media_sender_stop(&sender);

@@ -336,7 +336,7 @@ Section: net
 Priority: optional
 Architecture: $architecture
 Maintainer: $DEB_MAINTAINER
-Depends: $runtime_deps, pipewire
+Depends: $runtime_deps, pipewire, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly
 Description: GNOME Wayland virtual monitor over VNC
  VNC Monitor exposes a real Mutter virtual monitor from the active local GNOME
  Wayland login session through a view-only RA2r VNC server. A root system broker
