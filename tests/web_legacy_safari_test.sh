@@ -220,8 +220,8 @@ grep -Fq 'websocket_client_diagnostic' include/web_server.h src/web_server.c src
 grep -Fq 'WEB_WS_DIAGNOSTIC_MAX' src/web_server.c
 grep -Fq 'WEB_WS_DIAGNOSTIC_RATE' src/web_server.c
 grep -Fq 'websocket_client_event_valid' src/web_server.c
-grep -Fq 'client-telemetry' <<<"$protocol_worker_js"
-grep -Fq 'client-log' <<<"$protocol_worker_js"
+grep -Fq "sendDiagnostic('telemetry'" <<<"$protocol_worker_js"
+grep -Fq "sendDiagnostic('log'" <<<"$protocol_worker_js"
 grep -Fq 'worker-jpeg-envelope-ok' <<<"$protocol_worker_js"
 grep -Fq 'main-blob-integrity' <<<"$client_js"
 grep -Fq 'img-decode-error' <<<"$client_js"
