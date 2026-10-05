@@ -806,6 +806,7 @@ web_media_sender_worker(void *opaque)
     uint64_t telemetry_jpeg_bytes = 0;
     uint64_t telemetry_encode_ms = 0;
     uint64_t latest_source_wait_ms = 0;
+    uint64_t source_idle_ms = 0;
 
     while (!web_media_sender_should_stop(sender)) {
         /*
@@ -828,9 +829,13 @@ web_media_sender_worker(void *opaque)
                 source_wait_finished_ms - source_wait_started_ms : 0;
         if (wait_rc < 0)
             break;
-        if (wait_rc == 0)
+        if (wait_rc == 0) {
+            source_idle_ms += latest_source_wait_ms;
             continue;
+        }
 
+        latest_source_wait_ms += source_idle_ms;
+        source_idle_ms = 0;
         web_media_sender_note_source_wait(sender, latest_source_wait_ms);
 
         int target_fps = web_media_sender_target_fps(sender);
