@@ -229,7 +229,7 @@ grep -Fq 'validate_media_token' "$source_file"
 grep -Fq 'hls_segment_name_valid' "$source_file"
 echo "authenticated HLS serving: OK"
 
-grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              3u' include/web_server.h
+grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              4u' include/web_server.h
 grep -Fq 'VNC_WEB_PROTOCOL_VERSION' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c
@@ -244,6 +244,17 @@ grep -Fq 'worker-jpeg-envelope-ok' <<<"$protocol_worker_js"
 grep -Fq 'main-blob-integrity' <<<"$client_js"
 grep -Fq 'img-blob-decode-error' <<<"$client_js"
 grep -Fq 'img-data-url-decode-ok' <<<"$client_js"
+grep -Fq "var jpegRenderMode = 'probe'" <<<"$client_js"
+grep -Fq "jpegRenderMode === 'data'" <<<"$client_js"
+grep -Fq "jpegRenderMode = 'data'" <<<"$client_js"
+grep -Fq "jpegRenderMode = 'blob'" <<<"$client_js"
+sticky_line="$(grep -nF "if (jpegRenderMode === 'data')" <<<"$client_js" | tail -n1 | cut -d: -f1)"
+blob_create_line="$(grep -nF 'objectUrlApi.createObjectURL(blob)' <<<"$client_js" | head -n1 | cut -d: -f1)"
+if [[ -z "$sticky_line" || -z "$blob_create_line" || "$sticky_line" -ge "$blob_create_line" ]]; then
+    echo "Legacy Safari regression: sticky data-URL path must bypass Blob URL creation" >&2
+    exit 1
+fi
+echo "legacy Safari sticky data-URL JPEG rendering: OK"
 grep -Fq 'img-data-url-decode-error' <<<"$client_js"
 grep -Fq 'img-data-url-read-failed' <<<"$client_js"
 grep -Fq 'readAsDataURL(blob)' <<<"$client_js"

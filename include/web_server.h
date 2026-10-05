@@ -4,8 +4,8 @@
 #include <glib.h>
 #include "broker_protocol.h"
 
-#define VNC_WEB_PROTOCOL_VERSION              3u
-#define VNC_WEB_PROTOCOL_VERSION_TEXT         "3"
+#define VNC_WEB_PROTOCOL_VERSION              4u
+#define VNC_WEB_PROTOCOL_VERSION_TEXT         "4"
 #define VNC_WEB_JPEG_DECODE_FAILURE_LIMIT     3u
 
 typedef struct WebServer WebServer;
