@@ -272,15 +272,15 @@ web_media_lifetime="$(
     ' src/main.c
 )"
 grep -Fq 'MonitorLayoutCache layout_cache' <<<"$web_media_lifetime"
-grep -Fq 'monitor_layout_cache_prepare(&layout_cache, cfg)' <<<"$web_media_lifetime"
+grep -Fq 'web_device_layout_prepare(&layout_cache' <<<"$web_media_lifetime"
 grep -Fq 'monitor_layout_cache_apply(&layout_cache' <<<"$web_media_lifetime"
-grep -Fq 'monitor_layout_cache_save(&layout_cache, cfg)' <<<"$web_media_lifetime"
+grep -Fq 'monitor_layout_cache_save(&layout_cache' <<<"$web_media_lifetime"
 grep -Fq 'monitor_layout_cache_clear(&layout_cache)' <<<"$web_media_lifetime"
 
-save_line="$(grep -nF 'monitor_layout_cache_save(&layout_cache, cfg)' <<<"$web_media_lifetime" | head -n1 | cut -d: -f1)"
-stop_line="$(grep -nF 'real_monitor_stop(&real)' <<<"$web_media_lifetime" | head -n1 | cut -d: -f1)"
+save_line="$(grep -nF 'monitor_layout_cache_save(&layout_cache' <<<"$web_media_lifetime" | tail -n1 | cut -d: -f1)"
+stop_line="$(grep -nF 'real_monitor_stop(&real)' <<<"$web_media_lifetime" | tail -n1 | cut -d: -f1)"
 if [[ -z "$save_line" || -z "$stop_line" || "$save_line" -ge "$stop_line" ]]; then
-    echo "Web monitor layout regression: layout must be saved before virtual monitor teardown" >&2
+    echo "Web monitor layout regression: device layout must be saved before virtual monitor teardown" >&2
     exit 1
 fi
 echo "transport-independent monitor layout persistence: OK"
