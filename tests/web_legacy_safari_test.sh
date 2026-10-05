@@ -331,6 +331,12 @@ grep -Fq 'virtual_group && !primary' src/monitor_layout_cache.c
 grep -Fq 'primary_x - current_logical_width - gap' src/monitor_layout_cache.c
 grep -Fq 'primary_y - current_logical_height - gap' src/monitor_layout_cache.c
 echo "resized virtual monitor keeps primary-relative layout gap: OK"
+grep -Fq 'monitor_layout_cache_seed_from' include/monitor_layout_cache.h src/monitor_layout_cache.c src/main.c
+grep -Fq 'previous_layout_path' src/main.c
+grep -Fq '!layout_cache.cache_existed' src/main.c
+grep -Fq 'g_chmod(cache->cache_path, 0600)' src/monitor_layout_cache.c
+echo "new display state inherits previous layout before first apply: OK"
+
 
 
 

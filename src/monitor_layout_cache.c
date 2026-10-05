@@ -1,6 +1,7 @@
 #include "monitor_layout_cache.h"
 
 #include <glib.h>
+#include <glib/gstdio.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -1470,6 +1471,46 @@ monitor_layout_cache_apply(
 
         g_usleep(100000);
     }
+}
+
+int
+monitor_layout_cache_seed_from(MonitorLayoutCache *cache,
+                               const char *source_path)
+{
+    if (!cache || !cache->prepared || !cache->cache_path ||
+        !source_path || !*source_path)
+        return -1;
+    if (cache->cache_existed ||
+        strcmp(cache->cache_path, source_path) == 0)
+        return 0;
+    if (!g_file_test(source_path, G_FILE_TEST_IS_REGULAR))
+        return 0;
+
+    gchar *data = NULL;
+    gsize length = 0;
+    GError *error = NULL;
+    if (!g_file_get_contents(source_path, &data, &length, &error)) {
+        g_clear_error(&error);
+        return -1;
+    }
+    gboolean ok = g_file_set_contents(cache->cache_path,
+                                      data,
+                                      (gssize)length,
+                                      &error);
+    g_free(data);
+    if (!ok) {
+        fprintf(stderr, "Cannot seed monitor layout cache %s from %s: %s\n",
+                cache->cache_path, source_path,
+                error ? error->message : "unknown error");
+        g_clear_error(&error);
+        return -1;
+    }
+    if (g_chmod(cache->cache_path, 0600) < 0)
+        return -1;
+    cache->cache_existed = 1;
+    printf("Seeded monitor layout state: %s <- %s\n",
+           cache->cache_path, source_path);
+    return 0;
 }
 
 int

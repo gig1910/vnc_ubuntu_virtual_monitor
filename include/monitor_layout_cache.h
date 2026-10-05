@@ -45,6 +45,10 @@ int monitor_layout_cache_save(
     MonitorLayoutCache *cache,
     const RuntimeConfig *cfg);
 
+int monitor_layout_cache_seed_from(
+    MonitorLayoutCache *cache,
+    const char *source_path);
+
 /*
  * A cache for a virtual-monitor session is only safe to apply when it actually
  * contains Mutter's virtual connector. A physical-monitor-only cache can be

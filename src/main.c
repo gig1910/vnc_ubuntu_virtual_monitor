@@ -1135,6 +1135,9 @@ serve_web_media_lifetime(int control_fd,
                                           &session_cfg) < 0) {
                 LOG_DEBUG("Could not save pre-resize browser device layout");
             }
+            char *previous_layout_path =
+                layout_cache.cache_path ?
+                    g_strdup(layout_cache.cache_path) : NULL;
             monitor_layout_cache_clear(&layout_cache);
 
             int resize_ok = 1;
@@ -1180,12 +1183,22 @@ serve_web_media_lifetime(int control_fd,
                                               active_orientation) < 0) {
                     LOG_DEBUG("Could not prepare resized browser layout scope");
                 }
-                else if (media_started &&
-                         monitor_layout_cache_apply(
-                             &layout_cache,
-                             &session_cfg,
-                             session_cfg.capture_timeout_ms) < 0) {
-                    LOG_DEBUG("No cached layout for resized browser display state");
+                else {
+                    if (media_started &&
+                        previous_layout_path &&
+                        !layout_cache.cache_existed &&
+                        monitor_layout_cache_seed_from(
+                            &layout_cache,
+                            previous_layout_path) < 0) {
+                        LOG_DEBUG("Could not seed first layout for new browser display state");
+                    }
+                    if (media_started &&
+                        monitor_layout_cache_apply(
+                            &layout_cache,
+                            &session_cfg,
+                            session_cfg.capture_timeout_ms) < 0) {
+                        LOG_DEBUG("No cached layout for resized browser display state");
+                    }
                 }
 
                 if (device_profile_update_state(
@@ -1200,6 +1213,9 @@ serve_web_media_lifetime(int control_fd,
 
                 applied_generation = requested.generation;
             }
+
+            g_free(previous_layout_path);
+            previous_layout_path = NULL;
 
             if (media_started && used_jpeg) {
                 if (web_media_sender_start(&sender,
