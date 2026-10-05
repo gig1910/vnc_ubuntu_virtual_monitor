@@ -361,3 +361,8 @@ The byte-range experiment showed that iOS 9 Safari fetches the playlist and MPEG
 The next latency probe keeps protocol version 3 and EXT-X-TARGETDURATION:1, but halves the encoder GOP. At 15 fps the x264 keyframe interval is 8 frames (~0.533 s). With hlssink2 keyframe requests disabled, fragment boundaries follow those regular encoder keyframes, so the playlist should contain floating-point EXTINF values around 0.53 s. HLS version 3 permits floating-point segment durations, and each fragment remains below the one-second target duration.
 
 The advertised playlist remains three segments long to preserve classic-HLS client compatibility. File retention is increased to eight fragments so a slower legacy client can still complete an older segment request without affecting the live playlist window.
+
+
+### Legacy Safari live-window compatibility probe
+
+With ~0.533 s segments and only three advertised entries, iOS 9 Safari fetched the playlist but did not begin playback. The prior working 1 s profile exposed roughly 3 s of media in the live window, while the three-entry sub-second profile exposed only about 1.6 s. The next probe keeps ~0.533 s segments but advertises six entries (~3.2 s of media) and retains twelve files on disk. This also matches Apple's guidance to provide at least six segments in a live playlist while preserving the short segment duration for latency measurement.
