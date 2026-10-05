@@ -2,6 +2,7 @@
 
 #include "web_server.h"
 #include "broker_protocol.h"
+#include "config.h"
 #include "log.h"
 #include "tls_pair.h"
 
@@ -97,6 +98,8 @@ static const char login_page[] =
     "    body.streaming .status { margin: 7px 0 0; padding: 6px 8px; font-size: 11px; line-height: 15px; }\n"
     "    body.streaming .status-dot { width: 7px; height: 7px; margin-right: 6px; }\n"
     "    .hint { margin: 18px 0 0; color: #84919c; font-size: 12px; line-height: 18px; text-align: center; }\n"
+    "    .protocol { margin: 10px 0 0; color: #84919c; font-size: 11px; line-height: 16px; text-align: center; }\n"
+    "    body.streaming .protocol { display: none; }\n"
     "    @media only screen and (max-width: 600px) {\n"
     "      .page { padding: 16px 10px; }\n"
     "      .card { border-radius: 10px; }\n"
@@ -106,7 +109,7 @@ static const char login_page[] =
     "      h1 { font-size: 26px; line-height: 32px; }\n"
     "    }\n"
     "  </style>\n"
-    "  <script src=\"/client.js\" defer></script>\n"
+    "  <script src=\"/client.js?protocol=" VNC_WEB_PROTOCOL_VERSION_TEXT "\" defer></script>\n"
     "</head>\n"
     "<body>\n"
     "  <div class=\"page\">\n"
@@ -126,6 +129,7 @@ static const char login_page[] =
     "        </form>\n"
     "        <div id=\"status\" class=\"status\"><span class=\"status-dot\"></span><span id=\"status-text\">Ready to connect.</span></div>\n"
     "        <p class=\"hint\">Authentication is bound to the currently active local GNOME Wayland user.<br><a href=\"/manage\">Manage sessions and settings</a></p>\n"
+    "        <p id=\"protocol-info\" class=\"protocol\">Protocol client/server: <span id=\"protocol-client\">-</span> / <span id=\"protocol-server\">-</span><br>Build client/server: <span id=\"build-client\">-</span> / <span id=\"build-server\">-</span></p>\n"
     "      </div>\n"
     "    </div>\n"
     "    <div id=\"viewer\" class=\"viewer\"><img id=\"video-frame\" alt=\"Remote desktop\"><video id=\"hls-video\" controls preload=\"auto\" webkit-playsinline></video></div>\n"
@@ -133,261 +137,111 @@ static const char login_page[] =
     "</body>\n"
     "</html>\n";
 
-static const char client_js[] =
+
+static const char protocol_worker_js[] =
     "(function () {\n"
     "  'use strict';\n"
-    "  var form = document.getElementById('login');\n"
-    "  var username = document.getElementById('username');\n"
-    "  var password = document.getElementById('password');\n"
-    "  var connectButton = document.getElementById('connect');\n"
-    "  var disconnectButton = document.getElementById('disconnect');\n"
-    "  var statusBox = document.getElementById('status');\n"
-    "  var statusText = document.getElementById('status-text');\n"
-    "  var viewer = document.getElementById('viewer');\n"
-    "  var videoFrame = document.getElementById('video-frame');\n"
-    "  var hlsVideo = document.getElementById('hls-video');\n"
-    "  var objectUrlApi = window.URL || window.webkitURL;\n"
-    "  var frameUrl = null;\n"
-    "  var framePending = false;\n"
-    "  var frameDiagnosticsLogged = false;\n"
-    "  var hlsLiveSeekDone = false;\n"
     "  var socket = null;\n"
     "  var socketOpened = false;\n"
+    "  var protocolConfirmed = false;\n"
+    "  var framePending = false;\n"
+    "  var frameSeq = 0;\n"
+    "  var pendingSeq = 0;\n"
+    "  var clientProtocol = 0;\n"
+    "  var clientBuild = '';\n"
     "\n"
-    "  function setStatus(text, kind) {\n"
-    "    statusText.innerHTML = '';\n"
-    "    statusText.appendChild(document.createTextNode(text));\n"
-    "    statusBox.className = 'status' + (kind ? ' status-' + kind : '');\n"
-    "  }\n"
-    "\n"
-    "  function setFormBusy(busy) {\n"
-    "    username.disabled = busy;\n"
-    "    password.disabled = busy;\n"
-    "    connectButton.disabled = busy;\n"
-    "    connectButton.innerHTML = busy ? 'Connecting...' : 'Connect';\n"
-    "  }\n"
-    "\n"
-    "  function setConnected(connected) {\n"
-    "    username.disabled = connected;\n"
-    "    password.disabled = connected;\n"
-    "    connectButton.style.display = connected ? 'none' : 'block';\n"
-    "    disconnectButton.style.display = connected ? 'block' : 'none';\n"
-    "    if (!connected) connectButton.disabled = false;\n"
+    "  function emit(type, a, b, c) {\n"
+    "    var message = { type: type };\n"
+    "    if (a) { for (var k in a) { if (Object.prototype.hasOwnProperty.call(a, k)) message[k] = a[k]; } }\n"
+    "    self.postMessage(message);\n"
     "  }\n"
     "\n"
     "  function safeJson(text) {\n"
-    "    try { return JSON.parse(text || '{}'); }\n"
-    "    catch (e) { return {}; }\n"
+    "    try { return JSON.parse(text || '{}'); } catch (e) { return {}; }\n"
     "  }\n"
     "\n"
-    "  function clearVideoFrame() {\n"
-    "    if (frameUrl && objectUrlApi) {\n"
-    "      try { objectUrlApi.revokeObjectURL(frameUrl); } catch (e) {}\n"
-    "    }\n"
-    "    frameUrl = null;\n"
-    "    framePending = false;\n"
-    "    hlsLiveSeekDone = false;\n"
-    "    videoFrame.onload = null;\n"
-    "    videoFrame.onerror = null;\n"
-    "    videoFrame.removeAttribute('src');\n"
-    "    videoFrame.style.display = 'block';\n"
-    "    try { hlsVideo.pause(); } catch (e) {}\n"
-    "    hlsVideo.removeAttribute('src');\n"
-    "    hlsVideo.style.display = 'none';\n"
-    "    try { hlsVideo.load(); } catch (e) {}\n"
-    "    viewer.style.display = 'none';\n"
-    "    document.body.className = '';\n"
+    "  function sendText(text) {\n"
+    "    if (!socket || socket.readyState !== 1) return false;\n"
+    "    try { socket.send(text); return true; } catch (e) { return false; }\n"
     "  }\n"
     "\n"
-    "  function seekHlsNearLiveEdge(reason) {\n"
-    "    if (hlsLiveSeekDone || !hlsVideo.seekable || !hlsVideo.seekable.length) return false;\n"
-    "    try {\n"
-    "      var index = hlsVideo.seekable.length - 1;\n"
-    "      var start = hlsVideo.seekable.start(index);\n"
-    "      var end = hlsVideo.seekable.end(index);\n"
-    "      var target = end - 0.75;\n"
-    "      if (target < start) target = start;\n"
-    "      if (!isFinite(target) || target < 0) return false;\n"
-    "      hlsVideo.currentTime = target;\n"
-    "      hlsLiveSeekDone = true;\n"
-    "      if (window.console && console.log) console.log('VNC Monitor: HLS live-edge seek reason=' + reason + ' start=' + start.toFixed(3) + ' end=' + end.toFixed(3) + ' target=' + target.toFixed(3));\n"
-    "      return true;\n"
-    "    } catch (e) {\n"
-    "      if (window.console && console.log) console.log('VNC Monitor: HLS live-edge seek deferred reason=' + reason);\n"
-    "      return false;\n"
-    "    }\n"
+    "  function stopProtocolWorker() {\n"
+    "    if (!protocolWorker) return;\n"
+    "    try { protocolWorker.postMessage({ type: 'close' }); } catch (e) {}\n"
     "  }\n"
     "\n"
-    "  function startHlsVideo(url) {\n"
-    "    if (!url) return;\n"
-    "    if (frameUrl && objectUrlApi) { try { objectUrlApi.revokeObjectURL(frameUrl); } catch (e) {} }\n"
-    "    frameUrl = null;\n"
-    "    hlsLiveSeekDone = false;\n"
-    "    videoFrame.removeAttribute('src');\n"
-    "    videoFrame.style.display = 'none';\n"
-    "    hlsVideo.style.display = 'block';\n"
-    "    viewer.style.display = 'block';\n"
-    "    document.body.className = 'streaming';\n"
-    "    hlsVideo.onloadedmetadata = function () { seekHlsNearLiveEdge('loadedmetadata'); };\n"
-    "    hlsVideo.oncanplay = function () { seekHlsNearLiveEdge('canplay'); };\n"
-    "    hlsVideo.onplaying = function () {\n"
-    "      seekHlsNearLiveEdge('playing');\n"
-    "      setStatus('Connected. H.264/HLS video playing near live edge.', 'ok');\n"
-    "    };\n"
-    "    hlsVideo.onerror = function () {\n"
-    "      if (window.console && console.error) console.error('VNC Monitor: native HLS video error code=' + String(hlsVideo.error ? hlsVideo.error.code : 0));\n"
-    "      setStatus('Native HLS video could not be played.', 'error');\n"
-    "    };\n"
-    "    hlsVideo.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'v=' + String(new Date().getTime());\n"
-    "    try { hlsVideo.load(); } catch (e) {}\n"
-    "    try { hlsVideo.play(); } catch (e) {}\n"
-    "    setStatus('H.264/HLS stream ready. Tap Play if Safari does not start automatically.', 'ok');\n"
+    "  function destroyProtocolWorker() {\n"
+    "    if (!protocolWorker) return;\n"
+    "    try { protocolWorker.terminate(); } catch (e) {}\n"
+    "    protocolWorker = null;\n"
+    "    workerConnected = false;\n"
     "  }\n"
     "\n"
-    "  function acknowledgeVideoFrame() {\n"
-    "    if (!socket || socket.readyState !== 1) return;\n"
-    "    try { socket.send('{\\\"type\\\":\\\"frame-ack\\\"}'); } catch (e) {}\n"
-    "  }\n"
-    "\n"
-    "  function rejectVideoFrame() {\n"
-    "    if (!socket || socket.readyState !== 1) return;\n"
-    "    try { socket.send('{\\\"type\\\":\\\"frame-nack\\\"}'); } catch (e) {}\n"
-    "  }\n"
-    "\n"
-    "  function renderVideoFrame(data) {\n"
-    "    if (!objectUrlApi || !window.Blob) {\n"
-    "      setStatus('This browser cannot display the binary video stream.', 'error');\n"
-    "      return;\n"
-    "    }\n"
-    "    /* Server-side ACK pacing makes this an invariant, not a drop policy. */\n"
-    "    if (framePending) return;\n"
-    "    framePending = true;\n"
-    "    hlsVideo.style.display = 'none';\n"
-    "    videoFrame.style.display = 'block';\n"
-    "    var blob;\n"
-    "    var nextUrl;\n"
-    "    var previousUrl = frameUrl;\n"
-    "    var bytes;\n"
-    "    var byteLength = 0;\n"
-    "    var soiOk = false;\n"
-    "    var eoiOk = false;\n"
-    "    try {\n"
-    "      if (!data || typeof data.byteLength !== 'number') throw new Error('binary frame is not an ArrayBuffer');\n"
-    "      bytes = new Uint8Array(data);\n"
-    "      byteLength = bytes.byteLength;\n"
-    "      soiOk = byteLength >= 2 && bytes[0] === 255 && bytes[1] === 216;\n"
-    "      eoiOk = byteLength >= 2 && bytes[byteLength - 2] === 255 && bytes[byteLength - 1] === 217;\n"
-    "      if (!frameDiagnosticsLogged && window.console && console.log) {\n"
-    "        frameDiagnosticsLogged = true;\n"
-    "        console.log('VNC Monitor: WSS JPEG bytes=' + String(byteLength) + ' soi=' + String(soiOk) + ' eoi=' + String(eoiOk));\n"
-    "      }\n"
-    "      if (!soiOk || !eoiOk) {\n"
-    "        framePending = false;\n"
-    "        rejectVideoFrame();\n"
-    "        setStatus('Received binary frame is not a complete JPEG.', 'error');\n"
-    "        return;\n"
-    "      }\n"
-    "      /* Keep the first compatibility probe on iOS 9: inspect with Uint8Array,\n"
-    "       * but preserve the original ArrayBuffer -> Blob construction path. */\n"
-    "      blob = new Blob([data], { type: 'image/jpeg' });\n"
-    "      nextUrl = objectUrlApi.createObjectURL(blob);\n"
-    "    } catch (e) {\n"
-    "      framePending = false;\n"
-    "      rejectVideoFrame();\n"
-    "      setStatus('Could not prepare the browser video frame.', 'error');\n"
-    "      return;\n"
-    "    }\n"
-    "    videoFrame.onload = function () {\n"
-    "      videoFrame.onload = null;\n"
-    "      videoFrame.onerror = null;\n"
-    "      frameUrl = nextUrl;\n"
-    "      viewer.style.display = 'block';\n"
-    "      document.body.className = 'streaming';\n"
-    "      framePending = false;\n"
-    "      if (previousUrl) {\n"
-    "        try { objectUrlApi.revokeObjectURL(previousUrl); } catch (e) {}\n"
-    "      }\n"
-    "      acknowledgeVideoFrame();\n"
-    "      setStatus('Connected. Live browser video.', 'ok');\n"
-    "    };\n"
-    "    videoFrame.onerror = function () {\n"
-    "      videoFrame.onload = null;\n"
-    "      videoFrame.onerror = null;\n"
-    "      try { objectUrlApi.revokeObjectURL(nextUrl); } catch (e) {}\n"
-    "      framePending = false;\n"
-    "      rejectVideoFrame();\n"
-    "      if (window.console && console.error) console.error('VNC Monitor: Safari rejected JPEG frame bytes=' + String(blob.size || 0) + ' type=' + String(blob.type || '') + ' inputBytes=' + String(byteLength) + ' soi=' + String(soiOk) + ' eoi=' + String(eoiOk));\n"
-    "      if (!frameUrl) setStatus('Received video frame could not be decoded as JPEG.', 'error');\n"
-    "    };\n"
-    "    videoFrame.src = nextUrl;\n"
-    "  }\n"
-    "\n"
-    "  function closeSocket() {\n"
-    "    if (!socket) return;\n"
-    "    try { socket.close(); } catch (e) {}\n"
-    "  }\n"
-    "\n"
-    "  function openSocket() {\n"
-    "    var url = 'wss://' + window.location.host + '/ws';\n"
-    "    socketOpened = false;\n"
-    "    try { socket = new WebSocket(url); }\n"
+    "  function startProtocolWorker() {\n"
+    "    destroyProtocolWorker();\n"
+    "    protocolFatal = false;\n"
+    "    updateProtocolInfo(null, null);\n"
+    "    try { protocolWorker = new Worker('/protocol-worker.js?protocol=' + String(CLIENT_PROTOCOL_VERSION)); }\n"
     "    catch (e) {\n"
-    "      socket = null;\n"
+    "      protocolWorker = null;\n"
     "      setFormBusy(false);\n"
     "      setConnected(false);\n"
-    "      var detail = '';\n"
-    "      if (e) {\n"
-    "        if (e.name) detail += String(e.name);\n"
-    "        if (e.message) detail += (detail ? ': ' : '') + String(e.message);\n"
-    "        if (e.code != null) detail += (detail ? ' ' : '') + '[code=' + String(e.code) + ']';\n"
-    "      }\n"
-    "      setStatus('WebSocket constructor failed' + (detail ? ': ' + detail : '.'), 'error');\n"
+    "      setStatus('Protocol worker could not be started.', 'error');\n"
     "      return;\n"
     "    }\n"
-    "\n"
-    "    try { socket.binaryType = 'arraybuffer'; } catch (e) {}\n"
-    "\n"
-    "    socket.onopen = function () {\n"
-    "      socketOpened = true;\n"
-    "      setFormBusy(false);\n"
-    "      setConnected(true);\n"
-    "      setStatus('Connected. Secure control channel is active.', 'ok');\n"
-    "    };\n"
-    "\n"
-    "    socket.onmessage = function (event) {\n"
-    "      if (typeof event.data !== 'string') {\n"
-    "        renderVideoFrame(event.data);\n"
-    "        return;\n"
-    "      }\n"
-    "      var message = safeJson(event.data);\n"
-    "      if (message.type === 'ready') {\n"
+    "    protocolWorker.onmessage = function (event) {\n"
+    "      var message = event.data || {};\n"
+    "      if (message.type === 'socket-open') {\n"
+    "        workerConnected = true;\n"
+    "        setFormBusy(false);\n"
+    "        setConnected(true);\n"
+    "        setStatus('Connected. Verifying browser protocol...', 'working');\n"
+    "      } else if (message.type === 'hello') {\n"
+    "        updateProtocolInfo(message.protocol, message.build);\n"
+    "      } else if (message.type === 'protocol-mismatch') {\n"
+    "        updateProtocolInfo(message.serverProtocol, message.serverBuild);\n"
+    "        handleProtocolMismatch(message.clientProtocol, message.serverProtocol);\n"
+    "      } else if (message.type === 'protocol-ready') {\n"
+    "        updateProtocolInfo(message.protocol, message.build);\n"
+    "        setStatus('Connected. Protocol verified; preparing browser media...', 'ok');\n"
+    "      } else if (message.type === 'ready') {\n"
     "        setStatus('Connected. Preparing browser media...', 'ok');\n"
     "      } else if (message.type === 'media-ready' && message.media === 'hls') {\n"
     "        startHlsVideo(message.url || '/live/index.m3u8');\n"
-    "      } else if (message.error) {\n"
-    "        setStatus('Server message: ' + message.error, 'error');\n"
+    "      } else if (message.type === 'frame') {\n"
+    "        renderVideoFrame(message);\n"
+    "      } else if (message.type === 'frame-rejected') {\n"
+    "        if (window.console && console.error) console.error('VNC Monitor worker rejected JPEG frame seq=' + String(message.seq || 0) + ' bytes=' + String(message.bytes || 0) + ' reason=' + String(message.reason || 'unknown'));\n"
+    "        setStatus('Invalid JPEG frame dropped; waiting for the next frame.', 'working');\n"
+    "      } else if (message.type === 'socket-error') {\n"
+    "        if (!protocolFatal) setStatus(message.message || 'Secure WebSocket error.', 'error');\n"
+    "      } else if (message.type === 'error') {\n"
+    "        if (!protocolFatal) setStatus('Server/protocol message: ' + String(message.message || 'unknown error'), 'error');\n"
+    "      } else if (message.type === 'closed') {\n"
+    "        var wasOpen = workerConnected || message.wasOpen;\n"
+    "        destroyProtocolWorker();\n"
+    "        setFormBusy(false);\n"
+    "        setConnected(false);\n"
+    "        clearVideoFrame();\n"
+    "        if (!protocolFatal) {\n"
+    "          if (wasOpen) setStatus('Disconnected. Ready to connect again.', '');\n"
+    "          else if (statusBox.className.indexOf('status-error') < 0) setStatus('Connection closed before it was ready.', 'error');\n"
+    "        }\n"
     "      }\n"
     "    };\n"
-    "\n"
-    "    socket.onerror = function () {\n"
-    "      if (!socketOpened) setStatus('Secure WebSocket network/TLS handshake failed before open.', 'error');\n"
+    "    protocolWorker.onerror = function () {\n"
+    "      if (!protocolFatal) setStatus('Protocol worker failed.', 'error');\n"
     "    };\n"
-    "\n"
-    "    socket.onclose = function () {\n"
-    "      var wasOpen = socketOpened;\n"
-    "      socket = null;\n"
-    "      socketOpened = false;\n"
-    "      setFormBusy(false);\n"
-    "      setConnected(false);\n"
-    "      clearVideoFrame();\n"
-    "      if (wasOpen) setStatus('Disconnected. Ready to connect again.', '');\n"
-    "      else if (statusBox.className.indexOf('status-error') < 0) setStatus('Connection closed before it was ready.', 'error');\n"
-    "    };\n"
+    "    protocolWorker.postMessage({\n"
+    "      type: 'connect',\n"
+    "      url: 'wss://' + window.location.host + '/ws',\n"
+    "      protocol: CLIENT_PROTOCOL_VERSION,\n"
+    "      build: CLIENT_BUILD\n"
+    "    });\n"
     "  }\n"
-    "\n"
-    "  function login(event) {\n"
+    "\n"    "  function login(event) {\n"
     "    if (event && event.preventDefault) event.preventDefault();\n"
-    "    if (socket) closeSocket();\n"
+    "    if (protocolWorker) stopProtocolWorker();\n"
     "\n"
     "    var userValue = username.value || '';\n"
     "    var passwordValue = password.value || '';\n"
@@ -411,7 +265,7 @@ static const char client_js[] =
     "\n"
     "      if (xhr.status === 200 && result.ok) {\n"
     "        setStatus('Authenticated. Opening secure control channel...', 'working');\n"
-    "        openSocket();\n"
+    "        startProtocolWorker();\n"
     "        return;\n"
     "      }\n"
     "\n"
@@ -436,10 +290,11 @@ static const char client_js[] =
     "  form.onsubmit = login;\n"
     "  disconnectButton.onclick = function () {\n"
     "    setStatus('Disconnecting...', 'working');\n"
-    "    closeSocket();\n"
+    "    stopProtocolWorker();\n"
     "  };\n"
     "\n"
-    "  if (!window.WebSocket || !window.XMLHttpRequest || !window.JSON || !window.Blob || !objectUrlApi) {\n"
+    "  updateProtocolInfo(null, null);\n"
+    "  if (!window.Worker || !window.XMLHttpRequest || !window.JSON || !window.Blob || !objectUrlApi) {\n"
     "    connectButton.disabled = true;\n"
     "    setStatus('This browser is too old for the secure browser connection.', 'error');\n"
     "  }\n"
@@ -1226,6 +1081,29 @@ root_handler(SoupServer *server,
                  SOUP_STATUS_OK,
                  "text/html; charset=utf-8",
                  login_page);
+}
+
+static void
+protocol_worker_js_handler(SoupServer *server,
+                           SoupServerMessage *msg,
+                           const char *path,
+                           GHashTable *query,
+                           gpointer user_data)
+{
+    (void)server;
+    (void)path;
+    (void)query;
+    (void)user_data;
+
+    if (strcmp(soup_server_message_get_method(msg), "GET") != 0) {
+        respond_method_not_allowed(msg, "GET");
+        return;
+    }
+
+    respond_text(msg,
+                 SOUP_STATUS_OK,
+                 "text/javascript; charset=utf-8",
+                 protocol_worker_js);
 }
 
 static void
@@ -2074,6 +1952,28 @@ websocket_message_cb(SoupWebsocketConnection *connection,
         return;
     }
 
+    if (websocket_message_equals(
+            message,
+            "{\"type\":\"protocol-ready\",\"protocol\":" VNC_WEB_PROTOCOL_VERSION_TEXT "}")) {
+        if (web && web->hooks.websocket_protocol_ready &&
+            web->hooks.websocket_protocol_ready(VNC_WEB_PROTOCOL_VERSION,
+                                                web->user_data)) {
+            soup_websocket_connection_send_text(
+                connection,
+                "{\"type\":\"ready\",\"state\":\"active-browser\","
+                "\"media\":\"pending\"}");
+            return;
+        }
+
+        soup_websocket_connection_send_text(
+            connection,
+            "{\"type\":\"error\",\"error\":\"protocol-not-accepted\"}");
+        soup_websocket_connection_close(connection,
+                                        SOUP_WEBSOCKET_CLOSE_POLICY_VIOLATION,
+                                        "Protocol not accepted");
+        return;
+    }
+
     if (websocket_message_equals(message, "{\"type\":\"frame-ack\"}")) {
         if (web && web->hooks.websocket_frame_ack &&
             web->hooks.websocket_frame_ack(web->user_data)) {
@@ -2087,10 +1987,15 @@ websocket_message_cb(SoupWebsocketConnection *connection,
     }
 
     if (websocket_message_equals(message, "{\"type\":\"frame-nack\"}")) {
-        LOG_INFO("Authenticated legacy browser reported JPEG decode failure; closing media session");
+        if (web && web->hooks.websocket_frame_nack &&
+            web->hooks.websocket_frame_nack(web->user_data)) {
+            return;
+        }
+
+        LOG_INFO("Authenticated legacy browser reached consecutive JPEG decode failure limit; closing media session");
         soup_websocket_connection_close(connection,
                                         SOUP_WEBSOCKET_CLOSE_UNSUPPORTED_DATA,
-                                        "JPEG decode failed");
+                                        "JPEG decode failure limit");
         return;
     }
 
@@ -2149,10 +2054,12 @@ websocket_handler(SoupServer *server,
 
     soup_websocket_connection_send_text(
         connection,
-        "{\"type\":\"ready\",\"state\":\"active-browser\","
-        "\"media\":\"pending\"}");
+        "{\"type\":\"hello\",\"protocol\":" VNC_WEB_PROTOCOL_VERSION_TEXT
+        ",\"build\":\"" VNC_MONITOR_VERSION "\"}");
 
-    LOG_INFO("Broker authenticated WebSocket attached");
+    LOG_INFO("Broker authenticated WebSocket attached; browser protocol hello=%u build=%s",
+             VNC_WEB_PROTOCOL_VERSION,
+             VNC_MONITOR_VERSION);
 }
 
 static int
@@ -2355,6 +2262,7 @@ web_server_start(WebServer **out,
     soup_server_add_handler(web->server, "/api/manage/disconnect", management_disconnect_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/manage/logout", management_logout_handler, web, NULL);
     soup_server_add_handler(web->server, "/client.js", client_js_handler, web, NULL);
+    soup_server_add_handler(web->server, "/protocol-worker.js", protocol_worker_js_handler, web, NULL);
     soup_server_add_handler(web->server, "/manage.js", management_js_handler, web, NULL);
     soup_server_add_handler(web->server, "/manage", management_page_handler, web, NULL);
     soup_server_add_handler(web->server, "/live", hls_handler, web, NULL);

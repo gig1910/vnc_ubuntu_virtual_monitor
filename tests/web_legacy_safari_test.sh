@@ -3,6 +3,14 @@ set -euo pipefail
 
 source_file="src/web_server.c"
 
+protocol_worker_js="$(
+    awk '
+        /static const char protocol_worker_js\[\] =/ { capture = 1; next }
+        capture && /static const char client_js\[\] =/ { exit }
+        capture { print }
+    ' "$source_file"
+)"
+
 client_js="$(
     awk '
         /static const char client_js\[\] =/ { capture = 1; next }
@@ -36,7 +44,7 @@ management_page="$(
     ' "$source_file"
 )"
 
-if [[ -z "$client_js" || -z "$login_page" || -z "$management_js" || -z "$management_page" ]]; then
+if [[ -z "$protocol_worker_js" || -z "$client_js" || -z "$login_page" || -z "$management_js" || -z "$management_page" ]]; then
     echo "Could not extract embedded browser frontend" >&2
     exit 1
 fi
@@ -57,27 +65,35 @@ forbidden_js=(
 )
 
 for token in "${forbidden_js[@]}"; do
-    if grep -Fq -- "$token" <<<"$client_js" || grep -Fq -- "$token" <<<"$management_js"; then
+    if grep -Fq -- "$token" <<<"$protocol_worker_js" ||
+       grep -Fq -- "$token" <<<"$client_js" ||
+       grep -Fq -- "$token" <<<"$management_js"; then
         echo "Legacy Safari regression: forbidden JavaScript token: $token" >&2
         exit 1
     fi
 done
 
 grep -Fq 'XMLHttpRequest' <<<"$client_js"
-grep -Fq 'new WebSocket' <<<"$client_js"
-grep -Fq 'WebSocket constructor failed' <<<"$client_js"
-grep -Fq 'network/TLS handshake failed' <<<"$client_js"
+grep -Fq 'new Worker' <<<"$client_js"
+grep -Fq '/protocol-worker.js?protocol=' <<<"$client_js"
+grep -Fq 'new WebSocket' <<<"$protocol_worker_js"
+grep -Fq 'WebSocket constructor failed' <<<"$protocol_worker_js"
+grep -Fq 'network/TLS handshake failed' <<<"$protocol_worker_js"
 grep -Fq 'encodeURIComponent' <<<"$client_js"
 grep -Fq 'function (' <<<"$client_js"
-grep -Fq "socket.binaryType = 'arraybuffer'" <<<"$client_js"
+grep -Fq "socket.binaryType = 'arraybuffer'" <<<"$protocol_worker_js"
 grep -Fq "new Blob([data], { type: 'image/jpeg' })" <<<"$client_js"
-grep -Fq 'function acknowledgeVideoFrame()' <<<"$client_js"
-grep -Fq 'function rejectVideoFrame()' <<<"$client_js"
-grep -Fq 'socket.send' <<<"$client_js"
-grep -Fq 'frame-ack' <<<"$client_js"
-grep -Fq 'frame-nack' <<<"$client_js"
-grep -Fq 'new Uint8Array(data)' <<<"$client_js"
+grep -Fq "type: 'frame-result'" <<<"$client_js"
+grep -Fq 'socket.send' <<<"$protocol_worker_js"
+grep -Fq 'frame-ack' <<<"$protocol_worker_js"
+grep -Fq 'frame-nack' <<<"$protocol_worker_js"
+grep -Fq 'new Uint8Array(data)' <<<"$protocol_worker_js"
 grep -Fq 'WSS JPEG bytes=' <<<"$client_js"
+grep -Fq 'Protocol client/server:' <<<"$login_page"
+grep -Fq 'Build client/server:' <<<"$login_page"
+grep -Fq 'protocol-mismatch' <<<"$protocol_worker_js"
+grep -Fq 'protocol-ready' <<<"$protocol_worker_js"
+grep -Fq 'protocol-reload=' <<<"$client_js"
 grep -Fq 'videoFrame.onload = function ()' <<<"$client_js"
 grep -Fq 'videoFrame.onerror = function ()' <<<"$client_js"
 grep -Fq 'framePending' <<<"$client_js"
@@ -180,13 +196,18 @@ grep -Fq 'validate_media_token' "$source_file"
 grep -Fq 'hls_segment_name_valid' "$source_file"
 echo "authenticated HLS serving: OK"
 
+grep -Fq 'VNC_WEB_PROTOCOL_VERSION' include/web_server.h src/web_server.c src/broker.c
+grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c
+grep -Fq 'websocket_frame_nack' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'VNC_BROKER_CONTROL_VIDEO_FRAME_ACK' include/broker_protocol.h src/broker.c src/main.c
 grep -Fq 'queue-depth=1' src/main.c src/broker.c
 grep -Fq 'Legacy browser first JPEG integrity:' src/main.c
 grep -Fq 'Broker first JPEG integrity:' src/broker.c
-grep -Fq 'Authenticated legacy browser reported JPEG decode failure' src/web_server.c
-echo "legacy WSS/JPEG ACK pacing and integrity diagnostics: OK"
+grep -Fq 'reached consecutive JPEG decode failure limit' src/web_server.c
+grep -Fq 'Broker browser JPEG decode failure:' src/broker.c
+grep -Fq 'VNC_WEB_JPEG_DECODE_FAILURE_LIMIT' include/web_server.h src/broker.c
+echo "legacy WSS/JPEG worker protocol, ACK/NACK pacing and integrity diagnostics: OK"
 
 grep -Fq 'soup_websocket_connection_get_state(web->websocket) ==' "$source_file"
 echo "WebSocket shutdown state guard: OK"

@@ -4,6 +4,10 @@
 #include <glib.h>
 #include "broker_protocol.h"
 
+#define VNC_WEB_PROTOCOL_VERSION              1u
+#define VNC_WEB_PROTOCOL_VERSION_TEXT         "1"
+#define VNC_WEB_JPEG_DECODE_FAILURE_LIMIT     3u
+
 typedef struct WebServer WebServer;
 
 typedef enum {
@@ -71,11 +75,20 @@ typedef struct {
                                      gpointer user_data);
 
     /*
-     * Browser confirms that the previous WSS/JPEG frame reached the image
-     * decoder. The broker uses this as transport backpressure so no second
-     * full frame is queued behind a stale one.
+     * Browser and broker must agree on the explicit browser wire protocol
+     * before media starts. This version is independent of broker-agent IPC.
+     */
+    gboolean (*websocket_protocol_ready)(guint protocol,
+                                         gpointer user_data);
+
+    /*
+     * Browser reports whether the in-flight WSS/JPEG reached the image
+     * decoder. ACK resets the consecutive-failure counter. NACK drops one
+     * independent frame and releases queue-depth=1 pacing unless the broker
+     * reaches the consecutive decode-failure limit.
      */
     gboolean (*websocket_frame_ack)(gpointer user_data);
+    gboolean (*websocket_frame_nack)(gpointer user_data);
 
     /* Called only for the currently bound authenticated WebSocket. */
     void (*websocket_closed)(gpointer user_data);
