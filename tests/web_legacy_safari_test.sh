@@ -348,6 +348,28 @@ grep -Fq 'authenticate_or_reuse_web_control_request' src/main.c
 grep -Fq 'SO_PEERCRED uid=0' src/main.c
 echo "root-broker browser authentication reuse protocol: OK"
 
+grep -Fq 'begin_resume' include/web_server.h src/broker.c
+grep -Fq 'web_token_uid' src/broker.c
+grep -Fq 'web_token_session_id' src/broker.c
+grep -Fq 'web_token_valid_for_active_session' src/broker.c
+grep -Fq 'vnc_broker_send_web_auth_reuse' src/broker.c
+grep -Fq 'Broker resumed authenticated browser' src/broker.c
+grep -Fq 'shared browser token' src/broker.c
+grep -Fq 'explicit browser logout' src/broker.c
+clear_session_block="$(
+    awk '
+        /clear_session\(Broker \*broker, int reset\)/ { capture = 1 }
+        capture { print }
+        capture && /^}/ { exit }
+    ' src/broker.c
+)"
+if grep -Fq 'broker_invalidate_web_token(broker)' <<<"$clear_session_block"; then
+    echo "Browser auth regression: viewer teardown invalidates login session" >&2
+    exit 1
+fi
+echo "browser authentication lifetime separated from viewer lifetime: OK"
+
+
 
 web_media_lifetime="$(
     awk '

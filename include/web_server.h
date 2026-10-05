@@ -89,6 +89,19 @@ typedef struct {
                                       gpointer user_data);
 
     /*
+     * Re-open a viewer over an already authenticated browser session. The
+     * opaque token is validated by the broker against the same active
+     * uid/logind session before AUTH_REUSE is delegated to the root-owned
+     * broker-agent control channel.
+     */
+    WebServerAuthResult (*begin_resume)(const char *token,
+                                        const char *peer_addr,
+                                        const char *device_id,
+                                        WebServerAuthComplete completion,
+                                        gpointer completion_data,
+                                        gpointer user_data);
+
+    /*
      * Validate the viewer token for WSS attach. The broker retains the token
      * only while the exact viewer session is active so same-origin HLS GETs
      * can authenticate with the same Secure HttpOnly cookie.
@@ -144,6 +157,7 @@ typedef struct {
                                                  gpointer user_data);
     gboolean (*validate_management_token)(const char *token,
                                           gpointer user_data);
+    void (*browser_logout)(gpointer user_data);
     void (*management_logout)(gpointer user_data);
     int (*get_management_info)(WebServerManagementInfo *info,
                                gpointer user_data);
