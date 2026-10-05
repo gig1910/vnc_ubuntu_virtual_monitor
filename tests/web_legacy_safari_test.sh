@@ -384,6 +384,25 @@ grep -Fq 'set_session_cookie(pending->msg, session_token)' src/web_server.c
 grep -Fq 'set_session_cookie(msg, NULL)' src/web_server.c
 echo "shared persistent browser authentication with explicit logout: OK"
 
+session_cookie_block="$(
+    awk '
+        /set_session_cookie\(SoupServerMessage \*msg,/ { capture = 1 }
+        /set_management_cookie\(SoupServerMessage \*msg,/ { if (capture) exit }
+        capture { print }
+    ' src/web_server.c
+)"
+management_cookie_block="$(
+    awk '
+        /set_management_cookie\(SoupServerMessage \*msg,/ { capture = 1 }
+        /management_request_authenticated\(WebServer \*web,/ { if (capture) exit }
+        capture { print }
+    ' src/web_server.c
+)"
+grep -Fq 'soup_message_headers_append' <<<"$session_cookie_block"
+grep -Fq 'soup_message_headers_append' <<<"$management_cookie_block"
+echo "multiple authentication cookies coexist in one response: OK"
+
+
 
 
 

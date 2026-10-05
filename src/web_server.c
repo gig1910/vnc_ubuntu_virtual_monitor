@@ -1438,7 +1438,7 @@ set_session_cookie(SoupServerMessage *msg, const char *token)
     SoupMessageHeaders *headers = soup_server_message_get_response_headers(msg);
 
     if (!token || !*token) {
-        soup_message_headers_replace(
+        soup_message_headers_append(
             headers,
             "Set-Cookie",
             WEB_SESSION_COOKIE "=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0");
@@ -1449,7 +1449,7 @@ set_session_cookie(SoupServerMessage *msg, const char *token)
         WEB_SESSION_COOKIE "=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=%d",
         token,
         WEB_SESSION_MAX_AGE_S);
-    soup_message_headers_replace(headers, "Set-Cookie", cookie);
+    soup_message_headers_append(headers, "Set-Cookie", cookie);
     g_free(cookie);
 }
 
@@ -1458,9 +1458,9 @@ set_management_cookie(SoupServerMessage *msg, const char *token)
 {
     SoupMessageHeaders *headers = soup_server_message_get_response_headers(msg);
     if (!token || !*token) {
-        soup_message_headers_replace(headers,
-                                     "Set-Cookie",
-                                     WEB_MANAGEMENT_COOKIE "=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0");
+        soup_message_headers_append(headers,
+                                    "Set-Cookie",
+                                    WEB_MANAGEMENT_COOKIE "=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0");
         return;
     }
 
@@ -1468,7 +1468,7 @@ set_management_cookie(SoupServerMessage *msg, const char *token)
         WEB_MANAGEMENT_COOKIE "=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=%d",
         token,
         WEB_MANAGEMENT_MAX_AGE_S);
-    soup_message_headers_replace(headers, "Set-Cookie", cookie);
+    soup_message_headers_append(headers, "Set-Cookie", cookie);
     g_free(cookie);
 }
 
