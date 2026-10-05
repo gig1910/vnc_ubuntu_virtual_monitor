@@ -207,7 +207,11 @@ grep -Fq "message.type === 'network-sample'" <<<"$client_js"
 grep -Fq 'latestPing' <<<"$client_js"
 grep -Fq 'latestJitter' <<<"$client_js"
 grep -Fq 'FPS / RTT jitter / ping overlay' <<<"$login_page"
-echo "optional truthful FPS jitter ping overlay: OK"
+grep -Fq 'recordReceiveMetric(message.bytes || 0)' <<<"$client_js"
+grep -Fq "render ' + (latestFps == null ? '-' : latestFps.toFixed(1)) + ' FPS | receive '" <<<"$client_js"
+grep -Fq "decode ' + (latestDecodeMs == null ? '-' : latestDecodeMs.toFixed(0) + 'ms')" <<<"$client_js"
+grep -Fq "JPEG ' + String(jpegRenderMode)" <<<"$client_js"
+echo "optional truthful FPS receive/decode jitter ping overlay: OK"
 
 grep -Fq 'function recordNetworkSample(value)' <<<"$client_js"
 grep -Fq 'Math.abs(pingSample - lastPing)' <<<"$client_js"
@@ -238,11 +242,31 @@ grep -Fq 'window.localStorage.setItem' <<<"$client_js"
 grep -Fq 'window.localStorage.getItem' <<<"$client_js"
 grep -Fq 'function toggleControls()' <<<"$client_js"
 grep -Fq 'function toggleFullscreen()' <<<"$client_js"
+grep -Fq 'function browserFullscreenSupported()' <<<"$client_js"
+grep -Fq "fullscreenButton.style.display = supported ? 'block' : 'none'" <<<"$client_js"
+grep -Fq 'fullscreen-hint' <<<"$login_page"
 grep -Fq 'viewer.webkitRequestFullscreen' <<<"$client_js"
 grep -Fq 'hlsVideo.webkitEnterFullscreen' <<<"$client_js"
 grep -Fq 'Add to Home Screen' <<<"$client_js"
 grep -Fq 'control-collapsed' <<<"$login_page"
-echo "collapsible anchored viewer controls and fullscreen fallback: OK"
+echo "collapsible anchored viewer controls and capability-gated fullscreen fallback: OK"
+
+grep -Fq "clearVideoFrame();" <<<"$client_js"
+grep -Fq "setConnected(false);" <<<"$client_js"
+grep -Fq "selectTab('sessions');" <<<"$client_js"
+grep -Fq "Viewer disconnected. Browser login remains active." <<<"$client_js"
+echo "disconnect closes viewer and returns to active sessions: OK"
+
+grep -Fq 'WEB_LEGACY_CAPTURE_MAX_FPS       12' src/main.c
+grep -Fq 'WEB_LEGACY_MIN_FPS                3' src/main.c
+grep -Fq 'WEB_LEGACY_ADAPT_STABLE_MS     5000u' src/main.c
+grep -Fq 'source_starved_until_ms' src/main.c
+grep -Fq 'reason=ack-bound' src/main.c
+grep -Fq 'reason=ack-recovered' src/main.c
+grep -Fq '[WEB][PIPELINE]' src/main.c
+grep -Fq 'vnc-policy=unchanged' src/main.c
+grep -Fq 'session_cfg.max_fps > WEB_LEGACY_CAPTURE_MAX_FPS' src/main.c
+echo "WEB-only adaptive JPEG pacing and capture ceiling contract: OK"
 
 
 grep -Fq 'SPA_FORMAT_VIDEO_framerate' src/pipewire_capture.c
