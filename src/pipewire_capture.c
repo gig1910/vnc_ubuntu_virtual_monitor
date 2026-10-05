@@ -113,7 +113,16 @@ log_capture_summary(const PipewireCapture *capture)
             " cursor=%" PRIu64
             " cursor-only=%" PRIu64
             " cursor-invalid=%" PRIu64
-            " invalid=%" PRIu64 "\n",
+            " invalid=%" PRIu64
+            " meta[header=%" PRIu64
+            " damage=%" PRIu64
+            " regions=%" PRIu64
+            " video-damage=%" PRIu64
+            " empty-header=%" PRIu64
+            " empty-damage=%" PRIu64
+            " header-gaps=%" PRIu64
+            " header-nonmono=%" PRIu64
+            " last-header-seq=%" PRIu64 "]\n",
             capture->sample_sequence,
             capture->interval_count,
             capture->stall_count,
@@ -132,7 +141,16 @@ log_capture_summary(const PipewireCapture *capture)
             capture->cursor_updates,
             capture->cursor_only_updates,
             capture->invalid_cursor_metadata,
-            capture->invalid_buffers);
+            capture->invalid_buffers,
+            capture->header_buffers,
+            capture->damage_meta_buffers,
+            capture->damage_regions,
+            capture->video_damage_buffers,
+            capture->empty_header_buffers,
+            capture->empty_damage_buffers,
+            capture->header_sequence_gaps,
+            capture->header_nonmonotonic,
+            capture->last_header_sequence);
 }
 
 static void
@@ -197,10 +215,10 @@ on_stream_param_changed(void *userdata,
     if (info.format == SPA_VIDEO_FORMAT_BGRx &&
         (int)info.size.width == capture->width &&
         (int)info.size.height == capture->height) {
-        uint8_t params_buffer[1024];
+        uint8_t params_buffer[2048];
         struct spa_pod_builder b =
             SPA_POD_BUILDER_INIT(params_buffer, sizeof(params_buffer));
-        const struct spa_pod *params[2];
+        const struct spa_pod *params[4];
         int stride = capture->width * 4;
         int size = stride * capture->height;
 
@@ -217,13 +235,29 @@ on_stream_param_changed(void *userdata,
         params[1] = spa_pod_builder_add_object(
             &b,
             SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+            SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
+            SPA_PARAM_META_size,
+            SPA_POD_Int((int)sizeof(struct spa_meta_header)));
+
+        params[2] = spa_pod_builder_add_object(
+            &b,
+            SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+            SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoDamage),
+            SPA_PARAM_META_size, SPA_POD_CHOICE_RANGE_Int(
+                (int)(sizeof(struct spa_meta_region) * 16u),
+                (int)sizeof(struct spa_meta_region),
+                (int)(sizeof(struct spa_meta_region) * 16u)));
+
+        params[3] = spa_pod_builder_add_object(
+            &b,
+            SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
             SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Cursor),
             SPA_PARAM_META_size, SPA_POD_CHOICE_RANGE_Int(
                 CURSOR_META_SIZE(CURSOR_MAX_WIDTH, CURSOR_MAX_HEIGHT),
                 CURSOR_META_SIZE(1, 1),
                 CURSOR_META_SIZE(CURSOR_MAX_WIDTH, CURSOR_MAX_HEIGHT)));
 
-        int rc = pw_stream_update_params(capture->stream, params, 2);
+        int rc = pw_stream_update_params(capture->stream, params, 4);
         if (rc < 0) {
             fprintf(stderr,
                     "[PIPEWIRE] buffer/cursor-meta parameter update failed: %s\n",
@@ -235,6 +269,9 @@ on_stream_param_changed(void *userdata,
                     "(range 2..16), stride=%d size=%d\n",
                     stride,
                     size);
+            fprintf(stderr,
+                    "[CAPTURE] native PipeWire frame metadata: requested "
+                    "Header + VideoDamage (up to 16 regions)\n");
             fprintf(stderr,
                     "[CAPTURE] native PipeWire cursor metadata: requested "
                     "up to %dx%d RGBA\n",
@@ -318,6 +355,82 @@ copy_pw_buffer(PipewireCapture *capture, struct pw_buffer *pwbuf)
     }
 
     return 1;
+}
+
+/*
+ * Read producer timing/sequence metadata before the pw_buffer is recycled.
+ * Header sequence lets us distinguish "producer did not emit a frame" from
+ * "consumer received a producer buffer with no usable video payload".
+ */
+static int
+read_header_metadata(PipewireCapture *capture,
+                     struct spa_buffer *buf,
+                     uint64_t *sequence_out)
+{
+    struct spa_meta *meta =
+        buf ? spa_buffer_find_meta(buf, SPA_META_Header) : NULL;
+
+    if (!meta || !meta->data || meta->size < sizeof(struct spa_meta_header))
+        return 0;
+
+    const struct spa_meta_header *header = meta->data;
+    uint64_t sequence = header->seq;
+
+    capture->header_buffers++;
+
+    if (capture->have_header_sequence) {
+        if (sequence > capture->last_header_sequence + 1u)
+            capture->header_sequence_gaps +=
+                sequence - capture->last_header_sequence - 1u;
+        else if (sequence <= capture->last_header_sequence)
+            capture->header_nonmonotonic++;
+    }
+
+    capture->last_header_sequence = sequence;
+    capture->have_header_sequence = 1;
+
+    if (sequence_out)
+        *sequence_out = sequence;
+
+    return 1;
+}
+
+/*
+ * Count non-empty VideoDamage rectangles. The metadata itself is optional;
+ * absence and a present-but-empty damage set are intentionally distinct.
+ */
+static uint32_t
+read_video_damage_metadata(PipewireCapture *capture,
+                           struct spa_buffer *buf,
+                           int *present_out)
+{
+    struct spa_meta *meta =
+        buf ? spa_buffer_find_meta(buf, SPA_META_VideoDamage) : NULL;
+
+    if (present_out)
+        *present_out = 0;
+
+    if (!meta || !meta->data || meta->size < sizeof(struct spa_meta_region))
+        return 0;
+
+    if (present_out)
+        *present_out = 1;
+
+    capture->damage_meta_buffers++;
+
+    size_t capacity = meta->size / sizeof(struct spa_meta_region);
+    const struct spa_meta_region *regions = meta->data;
+    uint32_t count = 0;
+
+    for (size_t i = 0; i < capacity; i++) {
+        if (regions[i].region.size.width == 0 ||
+            regions[i].region.size.height == 0)
+            continue;
+        count++;
+    }
+
+    capture->damage_regions += count;
+    return count;
 }
 
 /*
@@ -549,6 +662,16 @@ on_stream_process(void *userdata)
         capture->dequeued_buffers++;
 
         struct spa_buffer *spa_buffer = buffer->buffer;
+        uint64_t header_sequence = 0;
+        int header_present =
+            read_header_metadata(capture,
+                                 spa_buffer,
+                                 &header_sequence);
+        int damage_present = 0;
+        uint32_t damage_count =
+            read_video_damage_metadata(capture,
+                                       spa_buffer,
+                                       &damage_present);
         int cursor_result =
             read_cursor_metadata(capture, spa_buffer);
 
@@ -574,11 +697,32 @@ on_stream_process(void *userdata)
 
         if (copy_result == 0) {
             capture->empty_buffers++;
+            if (header_present)
+                capture->empty_header_buffers++;
+            if (damage_present && damage_count > 0)
+                capture->empty_damage_buffers++;
+
+            if (capture->capture_trace &&
+                (header_present || damage_present)) {
+                fprintf(stderr,
+                        "[CAPTURE][META] payload=empty header=%s"
+                        " header-seq=%" PRIu64
+                        " damage-meta=%s damage-regions=%u"
+                        " cursor-changed=%s\n",
+                        header_present ? "yes" : "no",
+                        header_sequence,
+                        damage_present ? "yes" : "no",
+                        damage_count,
+                        cursor_result > 0 ? "yes" : "no");
+            }
             continue;
         }
 
         if (copy_result < 0)
             continue;
+
+        if (damage_present && damage_count > 0)
+            capture->video_damage_buffers++;
 
         if (valid_video_buffers > 0)
             capture->stale_buffers_recycled++;

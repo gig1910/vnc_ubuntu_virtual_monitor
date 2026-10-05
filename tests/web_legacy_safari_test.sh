@@ -243,6 +243,17 @@ grep -Fq 'params,' src/pipewire_capture.c
 grep -Fq '        2);' src/pipewire_capture.c
 echo "virtual monitor PipeWire cadence preference with compatible fallback: OK"
 
+grep -Fq 'SPA_META_Header' src/pipewire_capture.c
+grep -Fq 'SPA_META_VideoDamage' src/pipewire_capture.c
+grep -Fq 'sizeof(struct spa_meta_region) * 16u' src/pipewire_capture.c
+grep -Fq 'pw_stream_update_params(capture->stream, params, 4)' src/pipewire_capture.c
+grep -Fq 'read_header_metadata' src/pipewire_capture.c
+grep -Fq 'read_video_damage_metadata' src/pipewire_capture.c
+grep -Fq 'empty-damage=%' src/pipewire_capture.c
+grep -Fq '[CAPTURE][META] payload=empty' src/pipewire_capture.c
+echo "PipeWire Header/VideoDamage repaint diagnostics: OK"
+
+
 
 public_status_handler="$(
     awk '

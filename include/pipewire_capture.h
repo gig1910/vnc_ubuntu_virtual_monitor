@@ -67,6 +67,22 @@ typedef struct {
     uint64_t invalid_cursor_metadata;
     uint64_t invalid_buffers;
 
+    /*
+     * PipeWire/Mutter producer-side evidence. These counters stay owned by
+     * the capture callback thread and are summarized only after the stream is
+     * stopped, avoiding cross-thread telemetry races.
+     */
+    uint64_t header_buffers;
+    uint64_t damage_meta_buffers;
+    uint64_t damage_regions;
+    uint64_t video_damage_buffers;
+    uint64_t empty_header_buffers;
+    uint64_t empty_damage_buffers;
+    uint64_t header_sequence_gaps;
+    uint64_t header_nonmonotonic;
+    uint64_t last_header_sequence;
+    int have_header_sequence;
+
     int initialized;
     int have_base_frame;
     int first_frame;
