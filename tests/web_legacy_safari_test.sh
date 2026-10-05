@@ -297,6 +297,33 @@ grep -Fq '"device-%s-%s-%s"' src/device_profile.c
 grep -Fq 'src/device_profile.c' Makefile
 echo "device-scoped display profile persistence: OK"
 
+grep -Fq '#include "device_profile.h"' src/main.c
+grep -Fq 'VNC_BROKER_CONTROL_DEVICE_BIND' src/main.c
+grep -Fq 'device_profile_load(&device_profile' src/main.c
+grep -Fq 'device_profile_get_size(' src/main.c
+grep -Fq 'VNC_BROKER_CONTROL_DISPLAY_SIZE' src/main.c
+grep -Fq 'real_monitor_resize(&real' src/main.c
+grep -Fq 'device_profile_update_state(' src/main.c
+grep -Fq 'device_profile_save(&device_profile)' src/main.c
+grep -Fq 'web_device_layout_prepare(&layout_cache' src/main.c
+grep -Fq 'VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED' src/main.c
+
+display_resize_block="$(
+    awk '
+        /if \(type == VNC_BROKER_CONTROL_DISPLAY_SIZE\)/ { capture = 1 }
+        capture { print }
+        capture && /Browser display state applied:/ { done = 1 }
+        done && /continue;/ { exit }
+    ' src/main.c
+)"
+grep -Fq 'web_media_sender_stop_join' <<<"$display_resize_block"
+grep -Fq 'monitor_layout_cache_save(&layout_cache' <<<"$display_resize_block"
+grep -Fq 'real_monitor_resize(&real' <<<"$display_resize_block"
+grep -Fq 'monitor_layout_cache_apply(' <<<"$display_resize_block"
+grep -Fq 'web_send_display_applied' <<<"$display_resize_block"
+echo "device display-state resize lifecycle: OK"
+
+
 
 
 grep -Fq 'soup_websocket_connection_get_state(web->websocket) ==' "$source_file"

@@ -13,6 +13,7 @@
 #include "web_hls.h"
 #include "real_monitor.h"
 #include "monitor_layout_cache.h"
+#include "device_profile.h"
 #include "pipeline_stats.h"
 #include "io.h"
 #include "log.h"
@@ -812,39 +813,120 @@ web_media_sender_worker(void *opaque)
 }
 
 static int
+web_media_sender_start(WebMediaSender *sender,
+                       pthread_t *thread,
+                       int width,
+                       int height)
+{
+    if (!sender || !thread)
+        return -1;
+
+    pthread_mutex_lock(&sender->mutex);
+    sender->stop = 0;
+    sender->frame_in_flight = 0;
+    sender->width = width;
+    sender->height = height;
+    pthread_mutex_unlock(&sender->mutex);
+
+    int rc = pthread_create(thread, NULL, web_media_sender_worker, sender);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+
+    return 0;
+}
+
+static void
+web_media_sender_stop_join(WebMediaSender *sender,
+                           pthread_t thread,
+                           int *started)
+{
+    if (!sender || !started || !*started)
+        return;
+
+    web_media_sender_stop(sender);
+    (void)pthread_join(thread, NULL);
+    *started = 0;
+}
+
+static int
+web_device_layout_prepare(MonitorLayoutCache *cache,
+                          const RuntimeConfig *cfg,
+                          const DeviceProfile *profile,
+                          VncBrokerDisplayMode mode,
+                          VncBrokerDisplayOrientation orientation)
+{
+    if (!cache || !cfg || !profile)
+        return -1;
+
+    char scope[160];
+    if (device_profile_layout_scope(
+            profile,
+            (DeviceDisplayMode)mode,
+            (DeviceOrientation)orientation,
+            scope,
+            sizeof(scope)) < 0)
+        return -1;
+
+    return monitor_layout_cache_prepare_scoped(cache, cfg, scope);
+}
+
+static int
+web_send_display_applied(int control_fd,
+                         const VncBrokerDisplayState *state,
+                         const RuntimeConfig *cfg)
+{
+    if (!state || !cfg)
+        return -1;
+
+    VncBrokerDisplayState applied = *state;
+    applied.width = (uint32_t)cfg->width;
+    applied.height = (uint32_t)cfg->height;
+    return vnc_broker_send_display_state(
+        control_fd,
+        VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED,
+        &applied);
+}
+
+static int
 serve_web_media_lifetime(int control_fd,
                          const RuntimeConfig *cfg,
                          FrameBridge *frames,
                          PipelineStats *pipeline_stats)
 {
-    if (cfg->width <= 0 || cfg->height <= 0 ||
+    if (!cfg || cfg->width < (int)VNC_BROKER_VIDEO_DIMENSION_MIN ||
+        cfg->height < (int)VNC_BROKER_VIDEO_DIMENSION_MIN ||
         (uint32_t)cfg->width > VNC_BROKER_VIDEO_DIMENSION_MAX ||
         (uint32_t)cfg->height > VNC_BROKER_VIDEO_DIMENSION_MAX) {
-        LOG_ERROR("Legacy browser media size %dx%d exceeds safe limit %u",
-                  cfg->width,
-                  cfg->height,
-                  VNC_BROKER_VIDEO_DIMENSION_MAX);
+        LOG_ERROR("Legacy browser media size exceeds safe display limits");
         errno = EINVAL;
         return -1;
     }
 
+    RuntimeConfig session_cfg = *cfg;
+
     RealMonitor real;
     memset(&real, 0, sizeof(real));
 
-    /*
-     * Layout persistence belongs to the virtual-monitor lifetime, not to a
-     * specific client transport. Reuse the exact same Mutter DisplayConfig
-     * cache as the VNC path so VNC, WSS/JPEG, HLS and future WebRTC sessions
-     * restore/update one shared per-user monitor arrangement.
-     */
     MonitorLayoutCache layout_cache;
     memset(&layout_cache, 0, sizeof(layout_cache));
+
+    DeviceProfile device_profile;
+    memset(&device_profile, 0, sizeof(device_profile));
+    int device_bound = 0;
+    VncBrokerDisplayMode active_mode = VNC_BROKER_DISPLAY_WINDOW;
+    VncBrokerDisplayOrientation active_orientation =
+        session_cfg.width >= session_cfg.height ?
+            VNC_BROKER_ORIENTATION_LANDSCAPE :
+            VNC_BROKER_ORIENTATION_PORTRAIT;
+    uint32_t applied_generation = 0;
 
     WebMediaSender sender;
     memset(&sender, 0, sizeof(sender));
     sender.control_fd = control_fd;
-    sender.width = cfg->width;
-    sender.height = cfg->height;
+    sender.width = session_cfg.width;
+    sender.height = session_cfg.height;
     sender.frames = frames;
 
     WebHlsStream hls;
@@ -864,6 +946,7 @@ serve_web_media_lifetime(int control_fd,
     }
 
     pthread_t sender_thread;
+    memset(&sender_thread, 0, sizeof(sender_thread));
     int sender_started = 0;
     int hls_started = 0;
     int media_started = 0;
@@ -884,27 +967,83 @@ serve_web_media_lifetime(int control_fd,
         if (type == VNC_BROKER_CONTROL_REVOKE && payload_len == 0)
             break;
 
-        if (type == VNC_BROKER_CONTROL_MEDIA_START && payload_len == 0) {
-            if (media_started) {
-                LOG_ERROR("Duplicate legacy browser media start request");
+        if (type == VNC_BROKER_CONTROL_DEVICE_BIND) {
+            if (device_bound || media_started) {
+                LOG_ERROR("Duplicate/late browser device binding");
                 result = -1;
                 break;
             }
 
-            if (frame_bridge_resize(frames, cfg->width, cfg->height) < 0) {
+            char device_id[VNC_BROKER_DEVICE_ID_HEX_LEN + 1];
+            if (vnc_broker_parse_device_bind(payload,
+                                             payload_len,
+                                             device_id) < 0 ||
+                device_profile_load(&device_profile,
+                                    device_id,
+                                    session_cfg.width,
+                                    session_cfg.height) < 0) {
+                LOG_ERROR("Could not load browser device profile");
+                result = -1;
+                break;
+            }
+
+            device_bound = 1;
+            active_mode = (VncBrokerDisplayMode)device_profile.last_mode;
+            active_orientation =
+                (VncBrokerDisplayOrientation)device_profile.last_orientation;
+
+            int remembered_width = 0;
+            int remembered_height = 0;
+            if (device_profile_get_size(
+                    &device_profile,
+                    (DeviceDisplayMode)active_mode,
+                    (DeviceOrientation)active_orientation,
+                    &remembered_width,
+                    &remembered_height) == 0) {
+                session_cfg.width = remembered_width;
+                session_cfg.height = remembered_height;
+            }
+
+            LOG_INFO("Browser device profile bound: device=%.8s state=%s/%s size=%dx%d",
+                     device_profile.id,
+                     device_display_mode_name((DeviceDisplayMode)active_mode),
+                     device_orientation_name((DeviceOrientation)active_orientation),
+                     session_cfg.width,
+                     session_cfg.height);
+            continue;
+        }
+
+        if (type == VNC_BROKER_CONTROL_MEDIA_START && payload_len == 0) {
+            if (media_started || !device_bound) {
+                LOG_ERROR("Invalid browser media start: media=%d device-bound=%d",
+                          media_started, device_bound);
+                result = -1;
+                break;
+            }
+
+            if (frame_bridge_resize(frames,
+                                    session_cfg.width,
+                                    session_cfg.height) < 0) {
                 LOG_ERROR("Could not prepare browser FrameBridge at %dx%d",
-                          cfg->width, cfg->height);
+                          session_cfg.width, session_cfg.height);
                 result = -1;
                 break;
             }
 
             frame_bridge_clear(frames);
 
-            if (monitor_layout_cache_prepare(&layout_cache, cfg) < 0) {
-                LOG_DEBUG("Browser monitor-layout cache preparation failed; continuing without cached layout");
+            if (web_device_layout_prepare(&layout_cache,
+                                          &session_cfg,
+                                          &device_profile,
+                                          active_mode,
+                                          active_orientation) < 0) {
+                LOG_DEBUG("Browser device layout cache preparation failed; continuing without cached layout");
             }
 
-            if (real_monitor_start(&real, cfg, frames, pipeline_stats) < 0) {
+            if (real_monitor_start(&real,
+                                   &session_cfg,
+                                   frames,
+                                   pipeline_stats) < 0) {
                 LOG_ERROR("Could not start legacy browser virtual monitor/capture");
                 monitor_layout_cache_clear(&layout_cache);
                 result = -1;
@@ -914,37 +1053,36 @@ serve_web_media_lifetime(int control_fd,
             media_started = 1;
 
             if (monitor_layout_cache_apply(&layout_cache,
-                                           cfg,
-                                           cfg->capture_timeout_ms) < 0) {
-                LOG_DEBUG("Cached browser monitor layout could not be applied; using Mutter's current layout");
+                                           &session_cfg,
+                                           session_cfg.capture_timeout_ms) < 0) {
+                LOG_DEBUG("Cached browser device layout could not be applied; using Mutter's current layout");
             }
 
             if (vnc_log_enabled(VNC_LOG_DEBUG))
-                (void)monitor_layout_log_matching_modes(&layout_cache, cfg);
+                (void)monitor_layout_log_matching_modes(&layout_cache,
+                                                        &session_cfg);
 
-            /*
-             * Low-latency legacy proof: prefer decode-paced WSS/JPEG. HLS is
-             * retained as the compatibility fallback, but its multi-segment
-             * live buffer cannot provide remote-desktop latency on iOS 9.
-             */
-            int rc = pthread_create(&sender_thread, NULL,
-                                    web_media_sender_worker, &sender);
-            if (rc == 0) {
+            if (web_media_sender_start(&sender,
+                                       &sender_thread,
+                                       session_cfg.width,
+                                       session_cfg.height) == 0) {
                 sender_started = 1;
                 LOG_INFO("Legacy browser media selected low-latency WSS/JPEG: %dx%d max-fps=%d quality=%d queue-depth=1",
-                         cfg->width, cfg->height,
-                         WEB_LEGACY_MAX_FPS, WEB_LEGACY_JPEG_QUALITY);
+                         session_cfg.width,
+                         session_cfg.height,
+                         WEB_LEGACY_MAX_FPS,
+                         WEB_LEGACY_JPEG_QUALITY);
                 continue;
             }
 
             LOG_INFO("Legacy browser WSS/JPEG sender unavailable (%s); falling back to HLS/H.264",
-                     strerror(rc));
+                     strerror(errno));
 
             if (web_hls_start(&hls,
                               control_fd,
                               frames,
-                              cfg->width,
-                              cfg->height,
+                              session_cfg.width,
+                              session_cfg.height,
                               WEB_HLS_TEST_FPS) == 0) {
                 hls_started = 1;
                 LOG_INFO("Legacy browser media selected HLS/H.264 fallback transport");
@@ -962,6 +1100,158 @@ serve_web_media_lifetime(int control_fd,
             continue;
         }
 
+        if (type == VNC_BROKER_CONTROL_DISPLAY_SIZE) {
+            VncBrokerDisplayState requested;
+            if (!device_bound ||
+                vnc_broker_parse_display_state(payload,
+                                               payload_len,
+                                               &requested) < 0) {
+                LOG_ERROR("Invalid browser display-state control packet");
+                result = -1;
+                break;
+            }
+
+            if (requested.generation <= applied_generation)
+                continue;
+
+            VncBrokerDisplayMode old_mode = active_mode;
+            VncBrokerDisplayOrientation old_orientation = active_orientation;
+            int old_width = session_cfg.width;
+            int old_height = session_cfg.height;
+            int used_jpeg = sender_started;
+            int used_hls = hls_started;
+
+            if (sender_started)
+                web_media_sender_stop_join(&sender,
+                                           sender_thread,
+                                           &sender_started);
+            if (hls_started) {
+                web_hls_stop(&hls);
+                hls_started = 0;
+            }
+
+            if (media_started &&
+                monitor_layout_cache_save(&layout_cache,
+                                          &session_cfg) < 0) {
+                LOG_DEBUG("Could not save pre-resize browser device layout");
+            }
+            monitor_layout_cache_clear(&layout_cache);
+
+            int resize_ok = 1;
+            if (media_started &&
+                real_monitor_resize(&real,
+                                    &session_cfg,
+                                    frames,
+                                    pipeline_stats,
+                                    (int)requested.width,
+                                    (int)requested.height) < 0) {
+                resize_ok = 0;
+                LOG_INFO("Browser display resize rejected by runtime; keeping %dx%d",
+                         old_width, old_height);
+            }
+            else if (!media_started) {
+                session_cfg.width = (int)requested.width;
+                session_cfg.height = (int)requested.height;
+            }
+
+            if (!resize_ok) {
+                active_mode = old_mode;
+                active_orientation = old_orientation;
+                if (web_device_layout_prepare(&layout_cache,
+                                              &session_cfg,
+                                              &device_profile,
+                                              active_mode,
+                                              active_orientation) == 0 &&
+                    media_started) {
+                    (void)monitor_layout_cache_apply(
+                        &layout_cache,
+                        &session_cfg,
+                        session_cfg.capture_timeout_ms);
+                }
+            }
+            else {
+                active_mode = requested.mode;
+                active_orientation = requested.orientation;
+
+                if (web_device_layout_prepare(&layout_cache,
+                                              &session_cfg,
+                                              &device_profile,
+                                              active_mode,
+                                              active_orientation) < 0) {
+                    LOG_DEBUG("Could not prepare resized browser layout scope");
+                }
+                else if (media_started &&
+                         monitor_layout_cache_apply(
+                             &layout_cache,
+                             &session_cfg,
+                             session_cfg.capture_timeout_ms) < 0) {
+                    LOG_DEBUG("No cached layout for resized browser display state");
+                }
+
+                if (device_profile_update_state(
+                        &device_profile,
+                        (DeviceDisplayMode)active_mode,
+                        (DeviceOrientation)active_orientation,
+                        session_cfg.width,
+                        session_cfg.height) < 0 ||
+                    device_profile_save(&device_profile) < 0) {
+                    LOG_DEBUG("Browser device display profile was not persisted");
+                }
+
+                applied_generation = requested.generation;
+            }
+
+            if (media_started && used_jpeg) {
+                if (web_media_sender_start(&sender,
+                                           &sender_thread,
+                                           session_cfg.width,
+                                           session_cfg.height) == 0) {
+                    sender_started = 1;
+                }
+                else {
+                    LOG_INFO("JPEG sender restart failed after display resize; trying HLS");
+                    used_hls = 1;
+                }
+            }
+
+            if (media_started && used_hls && !sender_started) {
+                if (web_hls_start(&hls,
+                                  control_fd,
+                                  frames,
+                                  session_cfg.width,
+                                  session_cfg.height,
+                                  WEB_HLS_TEST_FPS) == 0) {
+                    hls_started = 1;
+                }
+                else {
+                    LOG_ERROR("Could not restore browser media after display resize");
+                    result = -1;
+                    break;
+                }
+            }
+
+            if (!resize_ok)
+                continue;
+
+            if (web_send_display_applied(control_fd,
+                                         &requested,
+                                         &session_cfg) < 0) {
+                LOG_INFO("Could not acknowledge browser display state: %s",
+                         strerror(errno));
+                result = -1;
+                break;
+            }
+
+            LOG_INFO("Browser display state applied: device=%.8s generation=%u size=%dx%d state=%s/%s",
+                     device_profile.id,
+                     requested.generation,
+                     session_cfg.width,
+                     session_cfg.height,
+                     device_display_mode_name((DeviceDisplayMode)active_mode),
+                     device_orientation_name((DeviceOrientation)active_orientation));
+            continue;
+        }
+
         /* SDP/ICE will be handled here when the modern WebRTC backend lands. */
         LOG_DEBUG("Ignoring unsupported browser control message type=%u payload=%zu",
                   (unsigned)type, payload_len);
@@ -970,25 +1260,20 @@ serve_web_media_lifetime(int control_fd,
     if (hls_started)
         web_hls_stop(&hls);
 
-    if (sender_started) {
-        web_media_sender_stop(&sender);
-        (void)pthread_join(sender_thread, NULL);
-    }
+    if (sender_started)
+        web_media_sender_stop_join(&sender, sender_thread, &sender_started);
 
     if (media_started) {
-        /*
-         * Save before RecordVirtual teardown while Mutter still exposes the
-         * Meta-* connector. monitor_layout_cache_save() is wrapped here by
-         * save_latest(), so the last live arrangement replaces the old cache.
-         */
-        if (monitor_layout_cache_save(&layout_cache, cfg) < 0)
-            LOG_DEBUG("Browser monitor layout was not saved");
+        if (monitor_layout_cache_save(&layout_cache,
+                                      &session_cfg) < 0)
+            LOG_DEBUG("Browser device layout was not saved");
 
         real_monitor_stop(&real);
         frame_bridge_clear(frames);
     }
 
     monitor_layout_cache_clear(&layout_cache);
+    device_profile_clear(&device_profile);
 
     pthread_cond_destroy(&sender.ack_cond);
     pthread_mutex_destroy(&sender.mutex);
