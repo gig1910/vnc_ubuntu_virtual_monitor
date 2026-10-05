@@ -1100,10 +1100,30 @@ apply_cached_layout_once(
     return 0;
 }
 
+static int
+monitor_layout_scope_valid(const char *scope)
+{
+    if (!scope || !*scope)
+        return 0;
+
+    size_t len = strlen(scope);
+    if (len > 160)
+        return 0;
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)scope[i];
+        if (!(g_ascii_isalnum(c) || c == '-' || c == '_' || c == '.'))
+            return 0;
+    }
+
+    return 1;
+}
+
 int
-monitor_layout_cache_prepare(
+monitor_layout_cache_prepare_scoped(
     MonitorLayoutCache *cache,
-    const RuntimeConfig *cfg)
+    const RuntimeConfig *cfg,
+    const char *scope)
 {
     if (!cache || !cfg)
         return -1;
@@ -1162,12 +1182,29 @@ monitor_layout_cache_prepare(
         return -1;
     }
 
-    char *cache_name =
-        g_strdup_printf(
-            "layout-v2-%dx%d.ini",
-            cfg->width,
-            cfg->height
-        );
+    char *cache_name = NULL;
+    if (scope && *scope) {
+        if (!monitor_layout_scope_valid(scope)) {
+            fprintf(stderr, "Invalid monitor-layout cache scope\n");
+            g_free(own_dir);
+            monitor_layout_cache_clear(cache);
+            return -1;
+        }
+
+        cache_name =
+            g_strdup_printf(
+                "layout-v3-%s.ini",
+                scope
+            );
+    }
+    else {
+        cache_name =
+            g_strdup_printf(
+                "layout-v2-%dx%d.ini",
+                cfg->width,
+                cfg->height
+            );
+    }
 
     cache->cache_path =
         g_build_filename(
@@ -1200,6 +1237,14 @@ monitor_layout_cache_prepare(
 
     cache->prepared = 1;
     return 0;
+}
+
+int
+monitor_layout_cache_prepare(
+    MonitorLayoutCache *cache,
+    const RuntimeConfig *cfg)
+{
+    return monitor_layout_cache_prepare_scoped(cache, cfg, NULL);
 }
 
 int

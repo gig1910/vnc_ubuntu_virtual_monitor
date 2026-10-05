@@ -29,6 +29,7 @@ SOURCES := \
 	src/frame_diff.c \
 	src/adaptive_rfb_transport.c \
 	src/pipeline_stats.c \
+	src/device_profile.c \
 	src/monitor_layout_cache.c \
 	src/mutter_virtual_monitor.c \
 	src/pipewire_resolver.c \

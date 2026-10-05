@@ -26,6 +26,16 @@ int monitor_layout_cache_prepare(
     MonitorLayoutCache *cache,
     const RuntimeConfig *cfg);
 
+/*
+ * Prepare an independent layout namespace. scope is a server-constructed
+ * token ([A-Za-z0-9._-], max 160 chars); NULL keeps the historical
+ * layout-v2-WxH cache used by VNC.
+ */
+int monitor_layout_cache_prepare_scoped(
+    MonitorLayoutCache *cache,
+    const RuntimeConfig *cfg,
+    const char *scope);
+
 int monitor_layout_cache_apply(
     MonitorLayoutCache *cache,
     const RuntimeConfig *cfg,

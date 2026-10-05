@@ -268,6 +268,19 @@ if [[ -z "$save_line" || -z "$stop_line" || "$save_line" -ge "$stop_line" ]]; th
 fi
 echo "transport-independent monitor layout persistence: OK"
 
+grep -Fq 'monitor_layout_cache_prepare_scoped' include/monitor_layout_cache.h src/monitor_layout_cache.c
+grep -Fq 'layout-v3-%s.ini' src/monitor_layout_cache.c
+grep -Fq 'device_profile_id_valid' include/device_profile.h src/device_profile.c
+grep -Fq 'DEVICE_DISPLAY_WINDOW' include/device_profile.h src/device_profile.c
+grep -Fq 'DEVICE_DISPLAY_FULLSCREEN' include/device_profile.h src/device_profile.c
+grep -Fq 'DEVICE_ORIENTATION_PORTRAIT' include/device_profile.h src/device_profile.c
+grep -Fq 'DEVICE_ORIENTATION_LANDSCAPE' include/device_profile.h src/device_profile.c
+grep -Fq '"%s.%s"' src/device_profile.c
+grep -Fq '"device-%s-%s-%s"' src/device_profile.c
+grep -Fq 'src/device_profile.c' Makefile
+echo "device-scoped display profile persistence: OK"
+
+
 
 grep -Fq 'soup_websocket_connection_get_state(web->websocket) ==' "$source_file"
 echo "WebSocket shutdown state guard: OK"
