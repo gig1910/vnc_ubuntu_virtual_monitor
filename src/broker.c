@@ -90,7 +90,9 @@ typedef struct {
     guint32 web_frame_width;
     guint32 web_frame_height;
     gboolean web_frame_active;
+    gboolean web_frame_in_flight;
     guint64 web_frames_forwarded;
+    guint64 web_frames_acked;
 
     ManagementAuth *management_auth;
     gboolean management_token_valid;
@@ -637,6 +639,7 @@ broker_handle_web_media_packet(Broker *broker,
     if (type == VNC_BROKER_CONTROL_VIDEO_FRAME_BEGIN) {
         uint32_t width = 0, height = 0, jpeg_size = 0;
         if (broker->web_frame_active ||
+            broker->web_frame_in_flight ||
             vnc_broker_parse_video_frame_begin(payload, payload_len,
                                                &width, &height,
                                                &jpeg_size) < 0 ||
@@ -680,6 +683,7 @@ broker_handle_web_media_packet(Broker *broker,
         if (!sent)
             return FALSE;
 
+        broker->web_frame_in_flight = TRUE;
         broker->web_frames_forwarded++;
         if (broker->web_frames_forwarded == 1) {
             LOG_INFO("Broker forwarded first legacy browser video frame: %ux%u JPEG=%u bytes",
@@ -711,7 +715,9 @@ clear_session(Broker *broker, int reset)
     if (broker->web_server)
         web_server_set_hls_root(broker->web_server, NULL);
     broker_reset_web_frame(broker);
+    broker->web_frame_in_flight = FALSE;
     broker->web_frames_forwarded = 0;
+    broker->web_frames_acked = 0;
 
     if (broker->web_attach_timeout_source) {
         guint source = broker->web_attach_timeout_source;
@@ -1051,6 +1057,8 @@ broker_web_bind_websocket(const char *token, gpointer user_data)
      * rejected by websocket_attached; same-origin HLS GETs use this token.
      */
     broker_reset_web_frame(broker);
+    broker->web_frame_in_flight = FALSE;
+    broker->web_frames_acked = 0;
 
     if (broker->web_attach_timeout_source) {
         guint source = broker->web_attach_timeout_source;
@@ -1062,6 +1070,41 @@ broker_web_bind_websocket(const char *token, gpointer user_data)
              broker->peer_addr,
              (unsigned long)broker->uid,
              broker->session_id);
+    return TRUE;
+}
+
+static gboolean
+broker_websocket_frame_ack(gpointer user_data)
+{
+    Broker *broker = user_data;
+    if (!broker ||
+        broker->state != BROKER_SESSION_ACTIVE_WEBRTC ||
+        !broker->websocket_attached ||
+        broker->control_fd < 0)
+        return FALSE;
+
+    /* Duplicate/stale ACKs are harmless but never release a second slot. */
+    if (!broker->web_frame_in_flight)
+        return TRUE;
+
+    broker->web_frame_in_flight = FALSE;
+    broker->web_frames_acked++;
+
+    if (vnc_broker_send_control(broker->control_fd,
+                                VNC_BROKER_CONTROL_VIDEO_FRAME_ACK,
+                                NULL,
+                                0) < 0) {
+        LOG_INFO("Broker could not forward browser frame ACK for session %s: %s",
+                 broker->session_id,
+                 strerror(errno));
+        (void)shutdown(broker->control_fd, SHUT_RDWR);
+        return FALSE;
+    }
+
+    if (broker->web_frames_acked == 1) {
+        LOG_INFO("Broker received first browser JPEG frame ACK; queue-depth=1 decode pacing active");
+    }
+
     return TRUE;
 }
 
@@ -1793,6 +1836,7 @@ main(int argc, char **argv)
         .validate_websocket_token = broker_web_validate_websocket_token,
         .bind_websocket = broker_web_bind_websocket,
         .validate_media_token = broker_web_validate_media_token,
+        .websocket_frame_ack = broker_websocket_frame_ack,
         .websocket_closed = broker_websocket_closed,
         .begin_management_auth = broker_management_begin_auth,
         .validate_management_token = broker_validate_management_token,

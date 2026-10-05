@@ -186,6 +186,8 @@ static const char client_js[] =
     "    frameUrl = null;\n"
     "    framePending = false;\n"
     "    hlsLiveSeekDone = false;\n"
+    "    videoFrame.onload = null;\n"
+    "    videoFrame.onerror = null;\n"
     "    videoFrame.removeAttribute('src');\n"
     "    videoFrame.style.display = 'block';\n"
     "    try { hlsVideo.pause(); } catch (e) {}\n"
@@ -241,46 +243,57 @@ static const char client_js[] =
     "    setStatus('H.264/HLS stream ready. Tap Play if Safari does not start automatically.', 'ok');\n"
     "  }\n"
     "\n"
+    "  function acknowledgeVideoFrame() {\n"
+    "    if (!socket || socket.readyState !== 1) return;\n"
+    "    try { socket.send('{\\\"type\\\":\\\"frame-ack\\\"}'); } catch (e) {}\n"
+    "  }\n"
+    "\n"
     "  function renderVideoFrame(data) {\n"
     "    if (!objectUrlApi || !window.Blob) {\n"
     "      setStatus('This browser cannot display the binary video stream.', 'error');\n"
     "      return;\n"
     "    }\n"
+    "    /* Server-side ACK pacing makes this an invariant, not a drop policy. */\n"
     "    if (framePending) return;\n"
     "    framePending = true;\n"
     "    hlsVideo.style.display = 'none';\n"
     "    videoFrame.style.display = 'block';\n"
     "    var blob;\n"
     "    var nextUrl;\n"
+    "    var previousUrl = frameUrl;\n"
     "    try {\n"
     "      /* Normalize MIME because iOS 9 WebSocket Blob frames may have an empty type. */\n"
     "      blob = new Blob([data], { type: 'image/jpeg' });\n"
     "      nextUrl = objectUrlApi.createObjectURL(blob);\n"
     "    } catch (e) {\n"
     "      framePending = false;\n"
+    "      acknowledgeVideoFrame();\n"
     "      setStatus('Could not prepare the browser video frame.', 'error');\n"
     "      return;\n"
     "    }\n"
-    "    var loader = new Image();\n"
-    "    loader.onload = function () {\n"
-    "      var previousUrl = frameUrl;\n"
+    "    videoFrame.onload = function () {\n"
+    "      videoFrame.onload = null;\n"
+    "      videoFrame.onerror = null;\n"
     "      frameUrl = nextUrl;\n"
-    "      videoFrame.src = nextUrl;\n"
     "      viewer.style.display = 'block';\n"
     "      document.body.className = 'streaming';\n"
     "      framePending = false;\n"
     "      if (previousUrl) {\n"
     "        try { objectUrlApi.revokeObjectURL(previousUrl); } catch (e) {}\n"
     "      }\n"
+    "      acknowledgeVideoFrame();\n"
     "      setStatus('Connected. Live browser video.', 'ok');\n"
     "    };\n"
-    "    loader.onerror = function () {\n"
+    "    videoFrame.onerror = function () {\n"
+    "      videoFrame.onload = null;\n"
+    "      videoFrame.onerror = null;\n"
     "      try { objectUrlApi.revokeObjectURL(nextUrl); } catch (e) {}\n"
     "      framePending = false;\n"
+    "      acknowledgeVideoFrame();\n"
     "      if (window.console && console.error) console.error('VNC Monitor: Safari rejected JPEG frame bytes=' + String(blob.size || 0) + ' type=' + String(blob.type || ''));\n"
     "      if (!frameUrl) setStatus('Received video frame could not be decoded as JPEG.', 'error');\n"
     "    };\n"
-    "    loader.src = nextUrl;\n"
+    "    videoFrame.src = nextUrl;\n"
     "  }\n"
     "\n"
     "  function closeSocket() {\n"
@@ -2005,19 +2018,45 @@ ws_guard_handler(SoupServer *server,
                            g_free);
 }
 
+static gboolean
+websocket_message_equals(GBytes *message, const char *expected)
+{
+    if (!message || !expected)
+        return FALSE;
+
+    gsize length = 0;
+    const guint8 *data = g_bytes_get_data(message, &length);
+    gsize expected_len = strlen(expected);
+
+    return data &&
+           length == expected_len &&
+           memcmp(data, expected, expected_len) == 0;
+}
+
 static void
 websocket_message_cb(SoupWebsocketConnection *connection,
                      SoupWebsocketDataType type,
                      GBytes *message,
                      gpointer user_data)
 {
-    (void)message;
-    (void)user_data;
+    WebServer *web = user_data;
 
     if (type != SOUP_WEBSOCKET_DATA_TEXT) {
         soup_websocket_connection_close(connection,
                                         SOUP_WEBSOCKET_CLOSE_UNSUPPORTED_DATA,
                                         "Text signalling only");
+        return;
+    }
+
+    if (websocket_message_equals(message, "{\"type\":\"frame-ack\"}")) {
+        if (web && web->hooks.websocket_frame_ack &&
+            web->hooks.websocket_frame_ack(web->user_data)) {
+            return;
+        }
+
+        soup_websocket_connection_send_text(
+            connection,
+            "{\"type\":\"error\",\"error\":\"frame-ack-not-accepted\"}");
         return;
     }
 

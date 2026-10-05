@@ -70,6 +70,13 @@ typedef struct {
     gboolean (*validate_media_token)(const char *token,
                                      gpointer user_data);
 
+    /*
+     * Browser confirms that the previous WSS/JPEG frame reached the image
+     * decoder. The broker uses this as transport backpressure so no second
+     * full frame is queued behind a stale one.
+     */
+    gboolean (*websocket_frame_ack)(gpointer user_data);
+
     /* Called only for the currently bound authenticated WebSocket. */
     void (*websocket_closed)(gpointer user_data);
 

@@ -64,7 +64,10 @@ typedef struct {
 
 typedef struct {
     pthread_mutex_t mutex;
+    pthread_cond_t ack_cond;
     int stop;
+    int frame_in_flight;
+    uint64_t frames_acked;
     int control_fd;
     int width;
     int height;
@@ -618,8 +621,56 @@ web_media_sender_stop(WebMediaSender *sender)
 
     pthread_mutex_lock(&sender->mutex);
     sender->stop = 1;
+    pthread_cond_broadcast(&sender->ack_cond);
     pthread_mutex_unlock(&sender->mutex);
     frame_bridge_wake_all(sender->frames);
+}
+
+static int
+web_media_sender_wait_for_slot(WebMediaSender *sender)
+{
+    if (!sender)
+        return 0;
+
+    pthread_mutex_lock(&sender->mutex);
+    while (!sender->stop && sender->frame_in_flight)
+        pthread_cond_wait(&sender->ack_cond, &sender->mutex);
+
+    int ready = !sender->stop;
+    pthread_mutex_unlock(&sender->mutex);
+    return ready;
+}
+
+static int
+web_media_sender_begin_frame(WebMediaSender *sender)
+{
+    if (!sender)
+        return 0;
+
+    pthread_mutex_lock(&sender->mutex);
+    if (sender->stop) {
+        pthread_mutex_unlock(&sender->mutex);
+        return 0;
+    }
+
+    sender->frame_in_flight = 1;
+    pthread_mutex_unlock(&sender->mutex);
+    return 1;
+}
+
+static void
+web_media_sender_ack(WebMediaSender *sender)
+{
+    if (!sender)
+        return;
+
+    pthread_mutex_lock(&sender->mutex);
+    if (sender->frame_in_flight) {
+        sender->frame_in_flight = 0;
+        sender->frames_acked++;
+        pthread_cond_signal(&sender->ack_cond);
+    }
+    pthread_mutex_unlock(&sender->mutex);
 }
 
 static uint64_t
@@ -651,6 +702,14 @@ web_media_sender_worker(void *opaque)
     const uint64_t min_interval_ms = 1000u / WEB_LEGACY_MAX_FPS;
 
     while (!web_media_sender_should_stop(sender)) {
+        /*
+         * At most one JPEG may exist beyond the agent. Once the browser ACKs
+         * that frame, consume the then-current FrameBridge state. Intermediate
+         * source changes are intentionally collapsed instead of queued.
+         */
+        if (!web_media_sender_wait_for_slot(sender))
+            break;
+
         uint64_t current_sequence = 0;
         int wait_rc = frame_bridge_wait_for_change(sender->frames,
                                                    last_sequence,
@@ -697,6 +756,11 @@ web_media_sender_worker(void *opaque)
             break;
         }
 
+        if (!web_media_sender_begin_frame(sender)) {
+            free(jpeg);
+            break;
+        }
+
         if (jpeg_size > VNC_BROKER_VIDEO_FRAME_MAX ||
             vnc_broker_send_video_frame(sender->control_fd,
                                         (uint32_t)sender->width,
@@ -715,7 +779,7 @@ web_media_sender_worker(void *opaque)
         frames_sent++;
 
         if (frames_sent == 1) {
-            LOG_INFO("Legacy browser media sent first JPEG frame: %dx%d quality=%d",
+            LOG_INFO("Legacy browser media sent first JPEG frame: %dx%d quality=%d; browser-ACK pacing active",
                      sender->width,
                      sender->height,
                      WEB_LEGACY_JPEG_QUALITY);
@@ -759,6 +823,13 @@ serve_web_media_lifetime(int control_fd,
     int mutex_rc = pthread_mutex_init(&sender.mutex, NULL);
     if (mutex_rc != 0) {
         errno = mutex_rc;
+        return -1;
+    }
+
+    int cond_rc = pthread_cond_init(&sender.ack_cond, NULL);
+    if (cond_rc != 0) {
+        pthread_mutex_destroy(&sender.mutex);
+        errno = cond_rc;
         return -1;
     }
 
@@ -807,6 +878,24 @@ serve_web_media_lifetime(int control_fd,
 
             media_started = 1;
 
+            /*
+             * Low-latency legacy proof: prefer decode-paced WSS/JPEG. HLS is
+             * retained as the compatibility fallback, but its multi-segment
+             * live buffer cannot provide remote-desktop latency on iOS 9.
+             */
+            int rc = pthread_create(&sender_thread, NULL,
+                                    web_media_sender_worker, &sender);
+            if (rc == 0) {
+                sender_started = 1;
+                LOG_INFO("Legacy browser media selected low-latency WSS/JPEG: %dx%d max-fps=%d quality=%d queue-depth=1",
+                         cfg->width, cfg->height,
+                         WEB_LEGACY_MAX_FPS, WEB_LEGACY_JPEG_QUALITY);
+                continue;
+            }
+
+            LOG_INFO("Legacy browser WSS/JPEG sender unavailable (%s); falling back to HLS/H.264",
+                     strerror(rc));
+
             if (web_hls_start(&hls,
                               control_fd,
                               frames,
@@ -814,25 +903,18 @@ serve_web_media_lifetime(int control_fd,
                               cfg->height,
                               WEB_HLS_TEST_FPS) == 0) {
                 hls_started = 1;
-                LOG_INFO("Legacy browser media selected HLS/H.264 test transport");
+                LOG_INFO("Legacy browser media selected HLS/H.264 fallback transport");
                 continue;
             }
 
-            LOG_INFO("Legacy browser HLS test path unavailable; falling back to WSS/JPEG");
+            LOG_ERROR("Could not start either legacy browser media transport");
+            result = -1;
+            break;
+        }
 
-            int rc = pthread_create(&sender_thread, NULL,
-                                    web_media_sender_worker, &sender);
-            if (rc != 0) {
-                LOG_ERROR("Could not start legacy browser media sender: %s",
-                          strerror(rc));
-                result = -1;
-                break;
-            }
-
-            sender_started = 1;
-            LOG_INFO("Legacy browser WSS/JPEG fallback active: %dx%d max-fps=%d quality=%d",
-                     cfg->width, cfg->height,
-                     WEB_LEGACY_MAX_FPS, WEB_LEGACY_JPEG_QUALITY);
+        if (type == VNC_BROKER_CONTROL_VIDEO_FRAME_ACK && payload_len == 0) {
+            if (sender_started)
+                web_media_sender_ack(&sender);
             continue;
         }
 
@@ -854,6 +936,7 @@ serve_web_media_lifetime(int control_fd,
         frame_bridge_clear(frames);
     }
 
+    pthread_cond_destroy(&sender.ack_cond);
     pthread_mutex_destroy(&sender.mutex);
     return result;
 }
