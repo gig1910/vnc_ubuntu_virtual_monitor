@@ -1507,8 +1507,7 @@ broker_management_begin_auth(const char *username,
                              gpointer user_data)
 {
     Broker *broker = user_data;
-    if (!broker || !username || !password || !device_id || !completion ||
-        strlen(device_id) != VNC_BROKER_DEVICE_ID_HEX_LEN)
+    if (!broker || !username || !password || !completion)
         return WEB_SERVER_AUTH_ERROR;
 
     if (broker->management_auth)
@@ -1677,7 +1676,8 @@ broker_web_begin_auth(const char *username,
 {
     Broker *broker = user_data;
 
-    if (!broker || !username || !password || !completion)
+    if (!broker || !username || !password || !device_id || !completion ||
+        strlen(device_id) != VNC_BROKER_DEVICE_ID_HEX_LEN)
         return WEB_SERVER_AUTH_ERROR;
 
     if (broker_session_owns_slot(broker))
