@@ -229,7 +229,7 @@ grep -Fq 'validate_media_token' "$source_file"
 grep -Fq 'hls_segment_name_valid' "$source_file"
 echo "authenticated HLS serving: OK"
 
-grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              4u' include/web_server.h
+grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              5u' include/web_server.h
 grep -Fq 'VNC_WEB_PROTOCOL_VERSION' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c
@@ -255,6 +255,20 @@ if [[ -z "$sticky_line" || -z "$blob_create_line" || "$sticky_line" -ge "$blob_c
     exit 1
 fi
 echo "legacy Safari sticky data-URL JPEG rendering: OK"
+grep -Fq 'id="video-frame-a"' <<<"$login_page"
+grep -Fq 'id="video-frame-b"' <<<"$login_page"
+grep -Fq "var activeVideoFrame = videoFrameA" <<<"$client_js"
+grep -Fq "var stagingVideoFrame = videoFrameB" <<<"$client_js"
+grep -Fq "activeVideoFrame = stagingVideoFrame" <<<"$client_js"
+grep -Fq "stagingVideoFrame = oldActive" <<<"$client_js"
+grep -Fq "stagingVideoFrame.src = nextUrl" <<<"$client_js"
+grep -Fq "stagingVideoFrame.removeAttribute('src')" <<<"$client_js"
+if grep -Fq "videoFrame.src = nextUrl" <<<"$client_js"; then
+    echo "Legacy Safari regression: JPEG renderer writes directly into visible frame" >&2
+    exit 1
+fi
+echo "legacy Safari double-buffer JPEG swap: OK"
+
 grep -Fq 'img-data-url-decode-error' <<<"$client_js"
 grep -Fq 'img-data-url-read-failed' <<<"$client_js"
 grep -Fq 'readAsDataURL(blob)' <<<"$client_js"
