@@ -211,10 +211,26 @@ grep -Fq 'validate_media_token' "$source_file"
 grep -Fq 'hls_segment_name_valid' "$source_file"
 echo "authenticated HLS serving: OK"
 
+grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              2u' include/web_server.h
 grep -Fq 'VNC_WEB_PROTOCOL_VERSION' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_frame_nack' include/web_server.h src/web_server.c src/broker.c
+grep -Fq 'websocket_client_diagnostic' include/web_server.h src/web_server.c src/broker.c
+grep -Fq 'WEB_WS_DIAGNOSTIC_MAX' src/web_server.c
+grep -Fq 'WEB_WS_DIAGNOSTIC_RATE' src/web_server.c
+grep -Fq 'websocket_client_event_valid' src/web_server.c
+grep -Fq 'client-telemetry' <<<"$protocol_worker_js"
+grep -Fq 'client-log' <<<"$protocol_worker_js"
+grep -Fq 'worker-jpeg-envelope-ok' <<<"$protocol_worker_js"
+grep -Fq 'main-blob-integrity' <<<"$client_js"
+grep -Fq 'img-decode-error' <<<"$client_js"
+grep -Fq 'readAsBinaryString' <<<"$client_js"
+grep -Fq 'Broker browser client diagnostic:' src/broker.c
+grep -Fq '"frame-forwarded"' src/broker.c
+grep -Fq '"frame-ack"' src/broker.c
+grep -Fq '"frame-nack"' src/broker.c
+grep -Fq 'web_in_flight_adler32' src/broker.c
 grep -Fq 'VNC_BROKER_CONTROL_VIDEO_FRAME_ACK' include/broker_protocol.h src/broker.c src/main.c
 grep -Fq 'queue-depth=1' src/main.c src/broker.c
 grep -Fq 'Legacy browser first JPEG integrity:' src/main.c

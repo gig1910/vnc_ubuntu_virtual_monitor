@@ -97,6 +97,7 @@ typedef struct {
     guint64 web_in_flight_seq;
     guint32 web_in_flight_bytes;
     char web_in_flight_sha256[65];
+    guint32 web_in_flight_adler32;
     guint web_decode_failures;
 
     ManagementAuth *management_auth;
@@ -618,6 +619,38 @@ broker_reset_web_frame(Broker *broker)
     broker->web_frame_active = FALSE;
 }
 
+static guint32
+broker_adler32(const guint8 *data, gsize length)
+{
+    guint32 a = 1, b = 0;
+    if (!data) return 0;
+    for (gsize i = 0; i < length; i++) {
+        a = (a + data[i]) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    return (b << 16) | a;
+}
+
+static void
+broker_web_send_frame_telemetry(Broker *broker,
+                                const char *event,
+                                guint64 seq,
+                                guint32 bytes,
+                                const char *sha256,
+                                guint32 adler32,
+                                guint failures)
+{
+    if (!broker || !event || !broker->web_server ||
+        !broker->websocket_attached || !broker->web_protocol_ready) return;
+    char *message = g_strdup_printf(
+        "{\"type\":\"telemetry\",\"event\":\"%s\",\"seq\":%" G_GUINT64_FORMAT
+        ",\"bytes\":%u,\"sha256\":\"%s\",\"adler32\":%u,\"failures\":%u}",
+        event, seq, bytes, sha256 && sha256[0] ? sha256 : "unavailable", adler32, failures);
+    if (!message) return;
+    (void)web_server_send_text(broker->web_server, message);
+    g_free(message);
+}
+
 static gboolean
 broker_handle_web_media_packet(Broker *broker,
                                VncBrokerControlType type,
@@ -713,6 +746,7 @@ broker_handle_web_media_packet(Broker *broker,
             g_compute_checksum_for_data(G_CHECKSUM_SHA256,
                                         broker->web_frame_buffer->data,
                                         (gsize)actual);
+        guint32 frame_adler32 = broker_adler32(broker->web_frame_buffer->data, (gsize)actual);
 
         gboolean sent = broker->websocket_attached &&
                         broker->web_protocol_ready &&
@@ -733,6 +767,15 @@ broker_handle_web_media_packet(Broker *broker,
         g_strlcpy(broker->web_in_flight_sha256,
                   frame_sha256 ? frame_sha256 : "unavailable",
                   sizeof(broker->web_in_flight_sha256));
+        broker->web_in_flight_adler32 = frame_adler32;
+        if (broker->web_in_flight_seq <= 3) {
+            broker_web_send_frame_telemetry(broker, "frame-forwarded",
+                                            broker->web_in_flight_seq,
+                                            broker->web_in_flight_bytes,
+                                            frame_sha256 ? frame_sha256 : "unavailable",
+                                            frame_adler32,
+                                            broker->web_decode_failures);
+        }
         g_free(frame_sha256);
 
         if (broker->web_frames_forwarded == 1) {
@@ -773,6 +816,7 @@ clear_session(Broker *broker, int reset)
     broker->web_in_flight_seq = 0;
     broker->web_in_flight_bytes = 0;
     broker->web_in_flight_sha256[0] = '\0';
+    broker->web_in_flight_adler32 = 0;
     broker->web_decode_failures = 0;
 
     if (broker->web_attach_timeout_source) {
@@ -1114,6 +1158,7 @@ broker_web_bind_websocket(const char *token, gpointer user_data)
     broker->web_in_flight_seq = 0;
     broker->web_in_flight_bytes = 0;
     broker->web_in_flight_sha256[0] = '\0';
+    broker->web_in_flight_adler32 = 0;
     broker->web_decode_failures = 0;
 
     if (broker->web_attach_timeout_source) {
@@ -1161,38 +1206,33 @@ static gboolean
 broker_websocket_frame_ack(gpointer user_data)
 {
     Broker *broker = user_data;
-    if (!broker ||
-        broker->state != BROKER_SESSION_ACTIVE_WEBRTC ||
-        !broker->websocket_attached ||
-        broker->control_fd < 0)
-        return FALSE;
+    if (!broker || broker->state != BROKER_SESSION_ACTIVE_WEBRTC ||
+        !broker->websocket_attached || !broker->web_protocol_ready || broker->control_fd < 0) return FALSE;
+    if (!broker->web_frame_in_flight) return TRUE;
 
-    /* Duplicate/stale ACKs are harmless but never release a second slot. */
-    if (!broker->web_frame_in_flight)
-        return TRUE;
+    guint64 seq = broker->web_in_flight_seq;
+    guint32 bytes = broker->web_in_flight_bytes;
+    guint32 adler32 = broker->web_in_flight_adler32;
+    char sha256[65];
+    g_strlcpy(sha256, broker->web_in_flight_sha256[0] ? broker->web_in_flight_sha256 : "unavailable", sizeof(sha256));
 
     broker->web_frame_in_flight = FALSE;
     broker->web_frames_acked++;
     broker->web_decode_failures = 0;
+    if (seq <= 3) broker_web_send_frame_telemetry(broker, "frame-ack", seq, bytes, sha256, adler32, 0);
+
     broker->web_in_flight_seq = 0;
     broker->web_in_flight_bytes = 0;
     broker->web_in_flight_sha256[0] = '\0';
+    broker->web_in_flight_adler32 = 0;
 
-    if (vnc_broker_send_control(broker->control_fd,
-                                VNC_BROKER_CONTROL_VIDEO_FRAME_ACK,
-                                NULL,
-                                0) < 0) {
-        LOG_INFO("Broker could not forward browser frame ACK for session %s: %s",
-                 broker->session_id,
-                 strerror(errno));
+    if (vnc_broker_send_control(broker->control_fd, VNC_BROKER_CONTROL_VIDEO_FRAME_ACK, NULL, 0) < 0) {
+        LOG_INFO("Broker could not forward browser frame ACK for session %s: %s", broker->session_id, strerror(errno));
         (void)shutdown(broker->control_fd, SHUT_RDWR);
         return FALSE;
     }
-
-    if (broker->web_frames_acked == 1) {
+    if (broker->web_frames_acked == 1)
         LOG_INFO("Broker received first browser JPEG frame ACK; queue-depth=1 decode pacing active");
-    }
-
     return TRUE;
 }
 
@@ -1200,52 +1240,54 @@ static gboolean
 broker_websocket_frame_nack(gpointer user_data)
 {
     Broker *broker = user_data;
-    if (!broker ||
-        broker->state != BROKER_SESSION_ACTIVE_WEBRTC ||
-        !broker->websocket_attached ||
-        !broker->web_protocol_ready ||
-        broker->control_fd < 0)
-        return FALSE;
-
-    if (!broker->web_frame_in_flight)
-        return TRUE;
+    if (!broker || broker->state != BROKER_SESSION_ACTIVE_WEBRTC ||
+        !broker->websocket_attached || !broker->web_protocol_ready || broker->control_fd < 0) return FALSE;
+    if (!broker->web_frame_in_flight) return TRUE;
 
     broker->web_decode_failures++;
-
     LOG_INFO("Broker browser JPEG decode failure: seq=%" G_GUINT64_FORMAT
-             " bytes=%u sha256=%s consecutive=%u/%u",
-             broker->web_in_flight_seq,
-             broker->web_in_flight_bytes,
-             broker->web_in_flight_sha256[0] ?
-                 broker->web_in_flight_sha256 : "unavailable",
-             broker->web_decode_failures,
+             " bytes=%u sha256=%s adler32=%u consecutive=%u/%u",
+             broker->web_in_flight_seq, broker->web_in_flight_bytes,
+             broker->web_in_flight_sha256[0] ? broker->web_in_flight_sha256 : "unavailable",
+             broker->web_in_flight_adler32, broker->web_decode_failures,
              VNC_WEB_JPEG_DECODE_FAILURE_LIMIT);
+
+    broker_web_send_frame_telemetry(broker, "frame-nack",
+                                    broker->web_in_flight_seq,
+                                    broker->web_in_flight_bytes,
+                                    broker->web_in_flight_sha256,
+                                    broker->web_in_flight_adler32,
+                                    broker->web_decode_failures);
 
     broker->web_frame_in_flight = FALSE;
     broker->web_in_flight_seq = 0;
     broker->web_in_flight_bytes = 0;
     broker->web_in_flight_sha256[0] = '\0';
+    broker->web_in_flight_adler32 = 0;
+    if (broker->web_decode_failures >= VNC_WEB_JPEG_DECODE_FAILURE_LIMIT) return FALSE;
 
-    if (broker->web_decode_failures >= VNC_WEB_JPEG_DECODE_FAILURE_LIMIT)
-        return FALSE;
-
-    /*
-     * The agent's queue-depth=1 sender only needs permission to advance.
-     * NACK therefore releases the same pacing slot as ACK while preserving
-     * the broker-side consecutive decode-failure state.
-     */
-    if (vnc_broker_send_control(broker->control_fd,
-                                VNC_BROKER_CONTROL_VIDEO_FRAME_ACK,
-                                NULL,
-                                0) < 0) {
-        LOG_INFO("Broker could not release browser frame after JPEG NACK for session %s: %s",
-                 broker->session_id,
-                 strerror(errno));
+    if (vnc_broker_send_control(broker->control_fd, VNC_BROKER_CONTROL_VIDEO_FRAME_ACK, NULL, 0) < 0) {
+        LOG_INFO("Broker could not release browser frame after JPEG NACK for session %s: %s", broker->session_id, strerror(errno));
         (void)shutdown(broker->control_fd, SHUT_RDWR);
         return FALSE;
     }
-
     return TRUE;
+}
+
+static void
+broker_websocket_client_diagnostic(const WebServerClientDiagnostic *diagnostic, gpointer user_data)
+{
+    Broker *broker = user_data;
+    if (!broker || !diagnostic || broker->state != BROKER_SESSION_ACTIVE_WEBRTC ||
+        !broker->websocket_attached || !broker->web_protocol_ready) return;
+
+    LOG_INFO("Broker browser client diagnostic: kind=%s level=%s event=%s peer=%s session=%s seq=%"
+             G_GUINT64_FORMAT " bytes=%u observed=%u checksum=%u elapsed_ms=%u mime=%s",
+             diagnostic->kind, diagnostic->level, diagnostic->event,
+             broker->peer_addr[0] ? broker->peer_addr : "unknown",
+             broker->session_id[0] ? broker->session_id : "unknown",
+             diagnostic->seq, diagnostic->bytes, diagnostic->observed,
+             diagnostic->checksum, diagnostic->elapsed_ms, diagnostic->mime);
 }
 
 static void
@@ -1979,6 +2021,7 @@ main(int argc, char **argv)
         .websocket_protocol_ready = broker_websocket_protocol_ready,
         .websocket_frame_ack = broker_websocket_frame_ack,
         .websocket_frame_nack = broker_websocket_frame_nack,
+        .websocket_client_diagnostic = broker_websocket_client_diagnostic,
         .websocket_closed = broker_websocket_closed,
         .begin_management_auth = broker_management_begin_auth,
         .validate_management_token = broker_validate_management_token,

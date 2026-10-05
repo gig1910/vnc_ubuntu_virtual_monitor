@@ -4,8 +4,8 @@
 #include <glib.h>
 #include "broker_protocol.h"
 
-#define VNC_WEB_PROTOCOL_VERSION              1u
-#define VNC_WEB_PROTOCOL_VERSION_TEXT         "1"
+#define VNC_WEB_PROTOCOL_VERSION              2u
+#define VNC_WEB_PROTOCOL_VERSION_TEXT         "2"
 #define VNC_WEB_JPEG_DECODE_FAILURE_LIMIT     3u
 
 typedef struct WebServer WebServer;
@@ -40,6 +40,18 @@ typedef struct {
 
     int vnc_port;
 } WebServerManagementInfo;
+
+typedef struct {
+    const char *kind;
+    const char *level;
+    const char *event;
+    guint64 seq;
+    guint32 bytes;
+    guint32 observed;
+    guint32 checksum;
+    guint32 elapsed_ms;
+    const char *mime;
+} WebServerClientDiagnostic;
 
 typedef struct {
     gboolean (*slot_busy)(gpointer user_data);
@@ -89,6 +101,15 @@ typedef struct {
      */
     gboolean (*websocket_frame_ack)(gpointer user_data);
     gboolean (*websocket_frame_nack)(gpointer user_data);
+
+    /*
+     * Structured diagnostics from the authenticated browser. web_server
+     * validates a fixed schema, allowlisted event name and rate limit before
+     * invoking this hook; strings are temporary and valid only for the call.
+     */
+    void (*websocket_client_diagnostic)(
+        const WebServerClientDiagnostic *diagnostic,
+        gpointer user_data);
 
     /* Called only for the currently bound authenticated WebSocket. */
     void (*websocket_closed)(gpointer user_data);

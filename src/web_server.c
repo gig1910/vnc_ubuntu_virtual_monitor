@@ -23,6 +23,8 @@
 #define WEB_DEFAULT_KEY_FILE   "/etc/vnc-monitor/tls/server.key"
 #define WEB_LOGIN_BODY_MAX      8192
 #define WEB_WS_MESSAGE_MAX      8192
+#define WEB_WS_DIAGNOSTIC_MAX       512
+#define WEB_WS_DIAGNOSTIC_RATE       32
 #define WEB_SESSION_COOKIE          "vnc-monitor-session"
 #define WEB_MANAGEMENT_COOKIE       "vnc-monitor-management"
 #define WEB_CONTROL_HEADER          "X-VNC-Monitor-Control"
@@ -36,6 +38,9 @@ struct WebServer {
     SoupServer *server;
     GTlsCertificate *certificate;
     SoupWebsocketConnection *websocket;
+    gboolean websocket_protocol_ready;
+    gint64 websocket_diagnostic_window_us;
+    guint websocket_diagnostic_count;
     guint port;
     char *config_file;
     char *certificate_file;
@@ -158,6 +163,36 @@ static const char protocol_worker_js[] =
     "    if (!socket || socket.readyState !== 1) return false;\n"
     "    try { socket.send(text); return true; } catch (e) { return false; }\n"
     "  }\n"
+    "  function boundedUInt(value) {\n"
+    "    var number = parseInt(value, 10);\n"
+    "    if (!isFinite(number) || number < 0) return 0;\n"
+    "    if (number > 4294967295) return 4294967295;\n"
+    "    return Math.floor(number);\n"
+    "  }\n"
+    "  function diagnosticToken(value, pattern, fallback) {\n"
+    "    var text = value == null ? '' : String(value);\n"
+    "    return pattern.test(text) ? text : fallback;\n"
+    "  }\n"
+    "  function sendDiagnostic(kind, level, eventName, seq, bytes, observed, checksum, elapsed, mime) {\n"
+    "    if (!protocolConfirmed) return false;\n"
+    "    kind = diagnosticToken(kind, /^(log|telemetry)$/, '');\n"
+    "    level = diagnosticToken(level, /^(info|warn|error)$/, '');\n"
+    "    eventName = diagnosticToken(eventName, /^[a-z0-9-]{1,47}$/, '');\n"
+    "    mime = diagnosticToken(mime, /^[A-Za-z0-9+.\\/-]{1,47}$/, 'unknown');\n"
+    "    if (!kind || !level || !eventName) return false;\n"
+    "    var sequence = boundedUInt(seq);\n"
+    "    return sendText('{\"type\":\"client-' + kind + '\",\"level\":\"' + level + '\",\"event\":\"' + eventName + '\",\"seq\":' + String(sequence) + ',\"bytes\":' + String(boundedUInt(bytes)) + ',\"observed\":' + String(boundedUInt(observed)) + ',\"checksum\":' + String(boundedUInt(checksum)) + ',\"elapsed\":' + String(boundedUInt(elapsed)) + ',\"mime\":\"' + mime + '\"}');\n"
+    "  }\n"
+    "  function adler32Bytes(bytes) {\n"
+    "    var a = 1;\n"
+    "    var b = 0;\n"
+    "    for (var i = 0; i < bytes.length; i++) {\n"
+    "      a = (a + bytes[i]) % 65521;\n"
+    "      b = (b + a) % 65521;\n"
+    "    }\n"
+    "    return (((b << 16) | a) >>> 0);\n"
+    "  }\n"
+    "\n"
     "  function closeSocket() { if (socket) { try { socket.close(); } catch (e) {} } }\n"
     "\n"
     "  function handleText(text) {\n"
@@ -171,7 +206,7 @@ static const char protocol_worker_js[] =
     "        return;\n"
     "      }\n"
     "      protocolConfirmed = true;\n"
-    "      if (!sendText('{\\\"type\\\":\\\"protocol-ready\\\",\\\"protocol\\\":' + String(clientProtocol) + '}')) {\n"
+    "      if (!sendText('{\"type\":\"protocol-ready\",\"protocol\":' + String(clientProtocol) + '}')) {\n"
     "        emit('error', { message: 'Could not confirm browser protocol version.' });\n"
     "        closeSocket();\n"
     "        return;\n"
@@ -182,6 +217,7 @@ static const char protocol_worker_js[] =
     "    if (!protocolConfirmed) { emit('error', { message: 'Server sent signalling before protocol handshake.' }); closeSocket(); return; }\n"
     "    if (message.type === 'ready') emit('ready', { state: message.state || '', media: message.media || '' });\n"
     "    else if (message.type === 'media-ready' && message.media === 'hls') emit('media-ready', { media: 'hls', url: message.url || '/live/index.m3u8' });\n"
+    "    else if (message.type === 'telemetry') emit('telemetry', { event: message.event || '', seq: message.seq || 0, bytes: message.bytes || 0, sha256: message.sha256 || '', checksum: message.adler32 || 0, failures: message.failures || 0 });\n"
     "    else if (message.error) emit('error', { message: String(message.error) });\n"
     "  }\n"
     "\n"
@@ -190,11 +226,13 @@ static const char protocol_worker_js[] =
     "    if (framePending) { emit('error', { message: 'Second JPEG arrived before decode result.' }); closeSocket(); return; }\n"
     "    frameSeq += 1;\n"
     "    if (!data || typeof data.size !== 'number') {\n"
+    "      sendDiagnostic('log', 'error', 'worker-blob-read-failed', frameSeq, 0, 0, 0, 0, 'unknown');\n"
     "      sendText('{\"type\":\"frame-nack\"}');\n"
     "      emit('frame-rejected', { seq: frameSeq, bytes: 0, reason: 'not-blob' });\n"
     "      return;\n"
     "    }\n"
     "    var length = data.size;\n"
+    "    if (frameSeq <= 3) sendDiagnostic('telemetry', 'info', 'worker-frame-received', frameSeq, length, length, 0, 0, data.type || 'unknown');\n"
     "    var buffer;\n"
     "    var bytes;\n"
     "    try {\n"
@@ -202,22 +240,26 @@ static const char protocol_worker_js[] =
     "      buffer = new FileReaderSync().readAsArrayBuffer(data);\n"
     "      bytes = new Uint8Array(buffer);\n"
     "    } catch (e) {\n"
+    "      sendDiagnostic('log', 'error', 'worker-blob-read-failed', frameSeq, length, length, 0, 0, data.type || 'unknown');\n"
     "      sendText('{\"type\":\"frame-nack\"}');\n"
     "      emit('frame-rejected', { seq: frameSeq, bytes: length, reason: 'blob-read-failed' });\n"
     "      return;\n"
     "    }\n"
+    "    var checksum = adler32Bytes(bytes);\n"
     "    var soi = length >= 2 && bytes[0] === 255 && bytes[1] === 216;\n"
     "    var eoi = length >= 2 && bytes[length - 2] === 255 && bytes[length - 1] === 217;\n"
     "    if (!soi || !eoi) {\n"
+    "      sendDiagnostic('log', 'error', 'worker-jpeg-envelope-bad', frameSeq, length, bytes.byteLength, checksum, 0, data.type || 'unknown');\n"
     "      sendText('{\"type\":\"frame-nack\"}');\n"
     "      emit('frame-rejected', { seq: frameSeq, bytes: length, reason: 'incomplete-jpeg', soi: soi, eoi: eoi });\n"
     "      return;\n"
     "    }\n"
     "    var frameBlob = data;\n"
     "    try { frameBlob = data.slice(0, length, 'image/jpeg'); } catch (e) {}\n"
+    "    if (frameSeq <= 3) sendDiagnostic('telemetry', 'info', 'worker-jpeg-envelope-ok', frameSeq, length, frameBlob.size, checksum, 0, frameBlob.type || 'unknown');\n"
     "    framePending = true;\n"
     "    pendingSeq = frameSeq;\n"
-    "    emit('frame', { seq: frameSeq, bytes: length, data: frameBlob });\n"
+    "    emit('frame', { seq: frameSeq, bytes: length, checksum: checksum, data: frameBlob });\n"
     "  }\n"
     "\n"
     "  function connect(message) {\n"
@@ -241,12 +283,17 @@ static const char protocol_worker_js[] =
     "    var message = event.data || {};\n"
     "    if (message.type === 'connect') { connect(message); return; }\n"
     "    if (message.type === 'close') { closeSocket(); return; }\n"
+    "    if (message.type === 'client-diagnostic') {\n"
+    "      sendDiagnostic(message.kind, message.level, message.event, message.seq, message.bytes, message.observed, message.checksum, message.elapsed, message.mime);\n"
+    "      return;\n"
+    "    }\n"
     "    if (message.type === 'frame-result') {\n"
     "      if (!framePending || message.seq !== pendingSeq) return;\n"
-    "      sendText(message.ok ? '{\\\"type\\\":\\\"frame-ack\\\"}' : '{\\\"type\\\":\\\"frame-nack\\\"}');\n"
+    "      sendText(message.ok ? '{\"type\":\"frame-ack\"}' : '{\"type\":\"frame-nack\"}');\n"
     "      framePending = false; pendingSeq = 0;\n"
     "    }\n"
     "  };\n"
+    "\n"
     "})();\n";
 
 static const char client_js[] =
@@ -404,50 +451,73 @@ static const char client_js[] =
     "    try { protocolWorker.postMessage({ type: 'frame-result', seq: seq, ok: ok ? true : false }); } catch (e) {}\n"
     "  }\n"
     "\n"
+    "  function reportClientDiagnostic(kind, level, eventName, seq, bytes, observed, checksum, elapsed, mime) {\n"
+    "    if (!protocolWorker) return;\n"
+    "    try { protocolWorker.postMessage({ type: 'client-diagnostic', kind: kind, level: level, event: eventName, seq: seq || 0, bytes: bytes || 0, observed: observed || 0, checksum: checksum || 0, elapsed: elapsed || 0, mime: mime || 'unknown' }); } catch (e) {}\n"
+    "  }\n"
+    "  function adler32BinaryString(value) {\n"
+    "    var a = 1;\n"
+    "    var b = 0;\n"
+    "    for (var i = 0; i < value.length; i++) {\n"
+    "      a = (a + (value.charCodeAt(i) & 255)) % 65521;\n"
+    "      b = (b + a) % 65521;\n"
+    "    }\n"
+    "    return (((b << 16) | a) >>> 0);\n"
+    "  }\n"
+    "  function diagnoseClonedBlob(seq, bytes, blob) {\n"
+    "    if (seq > 3 || !blob || !window.FileReader) return;\n"
+    "    try {\n"
+    "      var reader = new FileReader();\n"
+    "      reader.onload = function () {\n"
+    "        var value = typeof reader.result === 'string' ? reader.result : '';\n"
+    "        reportClientDiagnostic('telemetry', 'info', 'main-blob-integrity', seq, bytes, blob.size || 0, adler32BinaryString(value), 0, blob.type || 'unknown');\n"
+    "      };\n"
+    "      reader.onerror = function () { reportClientDiagnostic('log', 'error', 'main-blob-read-failed', seq, bytes, blob.size || 0, 0, 0, blob.type || 'unknown'); };\n"
+    "      reader.readAsBinaryString(blob);\n"
+    "    } catch (e) {\n"
+    "      reportClientDiagnostic('log', 'error', 'main-blob-read-failed', seq, bytes, blob.size || 0, 0, 0, blob.type || 'unknown');\n"
+    "    }\n"
+    "  }\n"
+    "\n"
     "  function renderVideoFrame(frame) {\n"
     "    var blob = frame ? frame.data : null;\n"
     "    var seq = frame ? frame.seq : 0;\n"
-    "    if (!objectUrlApi || !window.Blob) {\n"
-    "      setStatus('This browser cannot display the binary video stream.', 'error');\n"
-    "      return;\n"
-    "    }\n"
-    "    /* Server-side ACK pacing makes this an invariant, not a drop policy. */\n"
+    "    var expectedBytes = frame && frame.bytes ? frame.bytes : 0;\n"
+    "    if (!objectUrlApi || !window.Blob) { setStatus('This browser cannot display the binary video stream.', 'error'); return; }\n"
     "    if (framePending) return;\n"
     "    framePending = true;\n"
     "    hlsVideo.style.display = 'none';\n"
     "    videoFrame.style.display = 'block';\n"
     "    var nextUrl;\n"
     "    var previousUrl = frameUrl;\n"
-    "    var byteLength = frame && frame.bytes ? frame.bytes : (blob && typeof blob.size === 'number' ? blob.size : 0);\n"
+    "    var byteLength = expectedBytes || (blob && typeof blob.size === 'number' ? blob.size : 0);\n"
+    "    var decodeStarted = new Date().getTime();\n"
     "    try {\n"
     "      if (!blob || typeof blob.size !== 'number') throw new Error('worker frame is not a Blob');\n"
+    "      if (seq <= 3) reportClientDiagnostic('telemetry', 'info', 'main-frame-received', seq, byteLength, blob.size, frame.checksum || 0, 0, blob.type || 'unknown');\n"
+    "      diagnoseClonedBlob(seq, byteLength, blob);\n"
     "      nextUrl = objectUrlApi.createObjectURL(blob);\n"
     "    } catch (e) {\n"
     "      framePending = false;\n"
+    "      reportClientDiagnostic('log', 'error', 'frame-prepare-error', seq, byteLength, blob && blob.size ? blob.size : 0, 0, 0, blob && blob.type ? blob.type : 'unknown');\n"
     "      reportVideoFrame(seq, false);\n"
     "      setStatus('Could not prepare the browser video frame.', 'error');\n"
     "      return;\n"
     "    }\n"
     "    videoFrame.onload = function () {\n"
-    "      videoFrame.onload = null;\n"
-    "      videoFrame.onerror = null;\n"
-    "      frameUrl = nextUrl;\n"
-    "      viewer.style.display = 'block';\n"
-    "      document.body.className = 'streaming';\n"
-    "      framePending = false;\n"
-    "      if (previousUrl) {\n"
-    "        try { objectUrlApi.revokeObjectURL(previousUrl); } catch (e) {}\n"
-    "      }\n"
+    "      videoFrame.onload = null; videoFrame.onerror = null; frameUrl = nextUrl;\n"
+    "      viewer.style.display = 'block'; document.body.className = 'streaming'; framePending = false;\n"
+    "      if (previousUrl) { try { objectUrlApi.revokeObjectURL(previousUrl); } catch (e) {} }\n"
+    "      if (seq <= 3) reportClientDiagnostic('telemetry', 'info', 'img-decode-ok', seq, byteLength, blob.size || 0, frame.checksum || 0, new Date().getTime() - decodeStarted, blob.type || 'unknown');\n"
     "      reportVideoFrame(seq, true);\n"
     "      setStatus('Connected. Live browser video.', 'ok');\n"
     "    };\n"
     "    videoFrame.onerror = function () {\n"
-    "      videoFrame.onload = null;\n"
-    "      videoFrame.onerror = null;\n"
+    "      videoFrame.onload = null; videoFrame.onerror = null;\n"
     "      try { objectUrlApi.revokeObjectURL(nextUrl); } catch (e) {}\n"
-    "      if (previousUrl) videoFrame.src = previousUrl;\n"
-    "      else videoFrame.removeAttribute('src');\n"
+    "      if (previousUrl) videoFrame.src = previousUrl; else videoFrame.removeAttribute('src');\n"
     "      framePending = false;\n"
+    "      reportClientDiagnostic('log', 'error', 'img-decode-error', seq, byteLength, blob.size || 0, frame.checksum || 0, new Date().getTime() - decodeStarted, blob.type || 'unknown');\n"
     "      reportVideoFrame(seq, false);\n"
     "      if (window.console && console.error) console.error('VNC Monitor: Safari rejected JPEG frame seq=' + String(seq) + ' bytes=' + String(blob.size || 0) + ' inputBytes=' + String(byteLength) + '; dropped and continuing');\n"
     "      if (!frameUrl) setStatus('JPEG decode failed; dropped one frame and retrying.', 'working');\n"
@@ -500,6 +570,8 @@ static const char client_js[] =
     "        startHlsVideo(message.url || '/live/index.m3u8');\n"
     "      } else if (message.type === 'frame') {\n"
     "        renderVideoFrame(message);\n"
+    "      } else if (message.type === 'telemetry') {\n"
+    "        if (window.console && console.log) console.log('VNC Monitor telemetry event=' + String(message.event || '') + ' seq=' + String(message.seq || 0) + ' bytes=' + String(message.bytes || 0) + ' checksum=' + String(message.checksum || 0) + ' failures=' + String(message.failures || 0));\n"
     "      } else if (message.type === 'frame-rejected') {\n"
     "        if (window.console && console.error) console.error('VNC Monitor worker rejected JPEG frame seq=' + String(message.seq || 0) + ' bytes=' + String(message.bytes || 0) + ' reason=' + String(message.reason || 'unknown'));\n"
     "        setStatus('Invalid JPEG frame dropped; waiting for the next frame.', 'working');\n"
@@ -2220,6 +2292,86 @@ websocket_message_equals(GBytes *message, const char *expected)
            memcmp(data, expected, expected_len) == 0;
 }
 
+static gboolean
+websocket_client_event_valid(const char *event)
+{
+    static const char *const allowed[] = {
+        "worker-frame-received",
+        "worker-blob-read-failed",
+        "worker-jpeg-envelope-bad",
+        "worker-jpeg-envelope-ok",
+        "main-frame-received",
+        "main-blob-integrity",
+        "main-blob-read-failed",
+        "frame-prepare-error",
+        "img-decode-ok",
+        "img-decode-error"
+    };
+    if (!event) return FALSE;
+    for (guint i = 0; i < G_N_ELEMENTS(allowed); i++) {
+        if (strcmp(event, allowed[i]) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean
+websocket_parse_client_diagnostic(GBytes *message,
+                                  WebServerClientDiagnostic *diagnostic,
+                                  char kind[16],
+                                  char level[8],
+                                  char event[48],
+                                  char mime[48])
+{
+    if (!message || !diagnostic) return FALSE;
+    gsize length = 0;
+    const guint8 *data = g_bytes_get_data(message, &length);
+    if (!data || length == 0 || length > WEB_WS_DIAGNOSTIC_MAX ||
+        length > G_MAXINT || memchr(data, '\0', length)) return FALSE;
+    char *text = g_strndup((const char *)data, length);
+    if (!text) return FALSE;
+    unsigned long long seq = 0, bytes = 0, observed = 0;
+    unsigned long long checksum = 0, elapsed = 0;
+    int consumed = 0;
+    int fields = sscanf(
+        text,
+        "{\"type\":\"client-%15[a-z]\",\"level\":\"%7[a-z]\","
+        "\"event\":\"%47[a-z0-9-]\",\"seq\":%llu,\"bytes\":%llu,"
+        "\"observed\":%llu,\"checksum\":%llu,\"elapsed\":%llu,"
+        "\"mime\":\"%47[a-zA-Z0-9/+.-]\"}%n",
+        kind, level, event, &seq, &bytes, &observed, &checksum, &elapsed,
+        mime, &consumed);
+    gboolean valid =
+        fields == 9 && consumed == (int)length &&
+        (strcmp(kind, "log") == 0 || strcmp(kind, "telemetry") == 0) &&
+        (strcmp(level, "info") == 0 || strcmp(level, "warn") == 0 || strcmp(level, "error") == 0) &&
+        websocket_client_event_valid(event) &&
+        bytes <= G_MAXUINT32 && observed <= G_MAXUINT32 &&
+        checksum <= G_MAXUINT32 && elapsed <= G_MAXUINT32;
+    if (valid) {
+        diagnostic->kind = kind; diagnostic->level = level; diagnostic->event = event;
+        diagnostic->seq = (guint64)seq; diagnostic->bytes = (guint32)bytes;
+        diagnostic->observed = (guint32)observed; diagnostic->checksum = (guint32)checksum;
+        diagnostic->elapsed_ms = (guint32)elapsed; diagnostic->mime = mime;
+    }
+    g_free(text);
+    return valid;
+}
+
+static gboolean
+websocket_client_diagnostic_rate_allowed(WebServer *web)
+{
+    if (!web) return FALSE;
+    gint64 now = g_get_monotonic_time();
+    if (web->websocket_diagnostic_window_us == 0 ||
+        now - web->websocket_diagnostic_window_us >= G_USEC_PER_SEC) {
+        web->websocket_diagnostic_window_us = now;
+        web->websocket_diagnostic_count = 0;
+    }
+    if (web->websocket_diagnostic_count >= WEB_WS_DIAGNOSTIC_RATE) return FALSE;
+    web->websocket_diagnostic_count++;
+    return TRUE;
+}
+
 static void
 websocket_message_cb(SoupWebsocketConnection *connection,
                      SoupWebsocketDataType type,
@@ -2227,64 +2379,49 @@ websocket_message_cb(SoupWebsocketConnection *connection,
                      gpointer user_data)
 {
     WebServer *web = user_data;
-
     if (type != SOUP_WEBSOCKET_DATA_TEXT) {
-        soup_websocket_connection_close(connection,
-                                        SOUP_WEBSOCKET_CLOSE_UNSUPPORTED_DATA,
-                                        "Text signalling only");
+        soup_websocket_connection_close(connection, SOUP_WEBSOCKET_CLOSE_UNSUPPORTED_DATA, "Text signalling only");
         return;
     }
 
-    if (websocket_message_equals(
-            message,
-            "{\"type\":\"protocol-ready\",\"protocol\":" VNC_WEB_PROTOCOL_VERSION_TEXT "}")) {
+    if (websocket_message_equals(message, "{\"type\":\"protocol-ready\",\"protocol\":" VNC_WEB_PROTOCOL_VERSION_TEXT "}")) {
         if (web && web->hooks.websocket_protocol_ready &&
-            web->hooks.websocket_protocol_ready(VNC_WEB_PROTOCOL_VERSION,
-                                                web->user_data)) {
-            soup_websocket_connection_send_text(
-                connection,
-                "{\"type\":\"ready\",\"state\":\"active-browser\","
-                "\"media\":\"pending\"}");
+            web->hooks.websocket_protocol_ready(VNC_WEB_PROTOCOL_VERSION, web->user_data)) {
+            web->websocket_protocol_ready = TRUE;
+            soup_websocket_connection_send_text(connection, "{\"type\":\"ready\",\"state\":\"active-browser\",\"media\":\"pending\"}");
             return;
         }
-
-        soup_websocket_connection_send_text(
-            connection,
-            "{\"type\":\"error\",\"error\":\"protocol-not-accepted\"}");
-        soup_websocket_connection_close(connection,
-                                        SOUP_WEBSOCKET_CLOSE_POLICY_VIOLATION,
-                                        "Protocol not accepted");
+        soup_websocket_connection_send_text(connection, "{\"type\":\"error\",\"error\":\"protocol-not-accepted\"}");
+        soup_websocket_connection_close(connection, SOUP_WEBSOCKET_CLOSE_POLICY_VIOLATION, "Protocol not accepted");
         return;
+    }
+
+    if (web && web->websocket_protocol_ready) {
+        WebServerClientDiagnostic diagnostic = {0};
+        char kind[16] = {0}, level[8] = {0}, event[48] = {0}, mime[48] = {0};
+        if (websocket_parse_client_diagnostic(message, &diagnostic, kind, level, event, mime)) {
+            if (websocket_client_diagnostic_rate_allowed(web) && web->hooks.websocket_client_diagnostic)
+                web->hooks.websocket_client_diagnostic(&diagnostic, web->user_data);
+            return;
+        }
     }
 
     if (websocket_message_equals(message, "{\"type\":\"frame-ack\"}")) {
-        if (web && web->hooks.websocket_frame_ack &&
-            web->hooks.websocket_frame_ack(web->user_data)) {
-            return;
-        }
-
-        soup_websocket_connection_send_text(
-            connection,
-            "{\"type\":\"error\",\"error\":\"frame-ack-not-accepted\"}");
+        if (web && web->websocket_protocol_ready && web->hooks.websocket_frame_ack &&
+            web->hooks.websocket_frame_ack(web->user_data)) return;
+        soup_websocket_connection_send_text(connection, "{\"type\":\"error\",\"error\":\"frame-ack-not-accepted\"}");
         return;
     }
 
     if (websocket_message_equals(message, "{\"type\":\"frame-nack\"}")) {
-        if (web && web->hooks.websocket_frame_nack &&
-            web->hooks.websocket_frame_nack(web->user_data)) {
-            return;
-        }
-
+        if (web && web->websocket_protocol_ready && web->hooks.websocket_frame_nack &&
+            web->hooks.websocket_frame_nack(web->user_data)) return;
         LOG_INFO("Authenticated legacy browser reached consecutive JPEG decode failure limit; closing media session");
-        soup_websocket_connection_close(connection,
-                                        SOUP_WEBSOCKET_CLOSE_UNSUPPORTED_DATA,
-                                        "JPEG decode failure limit");
+        soup_websocket_connection_close(connection, SOUP_WEBSOCKET_CLOSE_UNSUPPORTED_DATA, "JPEG decode failure limit");
         return;
     }
 
-    soup_websocket_connection_send_text(
-        connection,
-        "{\"type\":\"error\",\"error\":\"signalling-not-implemented\"}");
+    soup_websocket_connection_send_text(connection, "{\"type\":\"error\",\"error\":\"signalling-not-implemented\"}");
 }
 
 static void
@@ -2296,6 +2433,9 @@ websocket_closed_cb(SoupWebsocketConnection *connection, gpointer user_data)
         return;
 
     web->websocket = NULL;
+    web->websocket_protocol_ready = FALSE;
+    web->websocket_diagnostic_window_us = 0;
+    web->websocket_diagnostic_count = 0;
 
     if (web->hooks.websocket_closed)
         web->hooks.websocket_closed(web->user_data);
@@ -2328,6 +2468,9 @@ websocket_handler(SoupServer *server,
     }
 
     web->websocket = g_object_ref(connection);
+    web->websocket_protocol_ready = FALSE;
+    web->websocket_diagnostic_window_us = 0;
+    web->websocket_diagnostic_count = 0;
     soup_websocket_connection_set_max_incoming_payload_size(connection,
                                                             WEB_WS_MESSAGE_MAX);
     g_signal_connect(connection, "message",
