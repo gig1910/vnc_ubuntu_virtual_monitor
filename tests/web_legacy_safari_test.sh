@@ -213,3 +213,11 @@ if grep -Fq 'WEB_HLS_GOP_DIVISOR' "$hls_source"; then
     exit 1
 fi
 echo "HLS stable one-second legacy profile: OK"
+
+grep -Fq 'function seekHlsNearLiveEdge(reason)' <<<"$client_js"
+grep -Fq 'hlsVideo.seekable.end(index)' <<<"$client_js"
+grep -Fq 'target = end - 0.75' <<<"$client_js"
+grep -Fq 'hlsVideo.onloadedmetadata = function ()' <<<"$client_js"
+grep -Fq 'hlsVideo.oncanplay = function ()' <<<"$client_js"
+grep -Fq 'hlsVideo.onplaying = function ()' <<<"$client_js"
+echo "HLS live-edge seek: OK"
