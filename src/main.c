@@ -21,6 +21,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <glib.h>
+#include <inttypes.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <pwd.h>
