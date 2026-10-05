@@ -94,6 +94,7 @@ typedef struct {
     gboolean web_protocol_ready;
     guint64 web_frames_forwarded;
     guint64 web_frames_acked;
+    guint64 web_frames_nacked;
     guint64 web_in_flight_seq;
     guint32 web_in_flight_bytes;
     char web_in_flight_sha256[65];
@@ -866,6 +867,7 @@ clear_session(Broker *broker, int reset)
     broker->web_protocol_ready = FALSE;
     broker->web_frames_forwarded = 0;
     broker->web_frames_acked = 0;
+    broker->web_frames_nacked = 0;
     broker->web_in_flight_seq = 0;
     broker->web_in_flight_bytes = 0;
     broker->web_in_flight_sha256[0] = '\0';
@@ -1218,7 +1220,9 @@ broker_web_bind_websocket(const char *token, gpointer user_data)
     broker_reset_web_frame(broker);
     broker->web_frame_in_flight = FALSE;
     broker->web_protocol_ready = FALSE;
+    broker->web_frames_forwarded = 0;
     broker->web_frames_acked = 0;
+    broker->web_frames_nacked = 0;
     broker->web_in_flight_seq = 0;
     broker->web_in_flight_bytes = 0;
     broker->web_in_flight_sha256[0] = '\0';
@@ -1309,6 +1313,7 @@ broker_websocket_frame_nack(gpointer user_data)
     if (!broker->web_frame_in_flight) return TRUE;
 
     broker->web_decode_failures++;
+    broker->web_frames_nacked++;
     LOG_INFO("Broker browser JPEG decode failure: seq=%" G_GUINT64_FORMAT
              " bytes=%u sha256=%s adler32=%u consecutive=%u/%u",
              broker->web_in_flight_seq, broker->web_in_flight_bytes,
@@ -1639,6 +1644,11 @@ broker_get_management_info(WebServerManagementInfo *info, gpointer user_data)
     info->vnc_port = broker->vnc_port;
     info->viewer_active = broker_session_owns_slot(broker) ? TRUE : FALSE;
     info->websocket_attached = broker->websocket_attached;
+    info->web_protocol_ready = broker->web_protocol_ready;
+    info->web_frame_in_flight = broker->web_frame_in_flight;
+    info->web_frames_forwarded = broker->web_frames_forwarded;
+    info->web_frames_acked = broker->web_frames_acked;
+    info->web_frames_nacked = broker->web_frames_nacked;
     g_strlcpy(info->viewer_state,
               broker_session_state_name(broker->state),
               sizeof(info->viewer_state));
