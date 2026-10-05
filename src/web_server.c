@@ -149,6 +149,7 @@ static const char client_js[] =
     "  var objectUrlApi = window.URL || window.webkitURL;\n"
     "  var frameUrl = null;\n"
     "  var framePending = false;\n"
+    "  var frameDiagnosticsLogged = false;\n"
     "  var hlsLiveSeekDone = false;\n"
     "  var socket = null;\n"
     "  var socketOpened = false;\n"
@@ -248,6 +249,11 @@ static const char client_js[] =
     "    try { socket.send('{\\\"type\\\":\\\"frame-ack\\\"}'); } catch (e) {}\n"
     "  }\n"
     "\n"
+    "  function rejectVideoFrame() {\n"
+    "    if (!socket || socket.readyState !== 1) return;\n"
+    "    try { socket.send('{\\\"type\\\":\\\"frame-nack\\\"}'); } catch (e) {}\n"
+    "  }\n"
+    "\n"
     "  function renderVideoFrame(data) {\n"
     "    if (!objectUrlApi || !window.Blob) {\n"
     "      setStatus('This browser cannot display the binary video stream.', 'error');\n"
@@ -261,13 +267,33 @@ static const char client_js[] =
     "    var blob;\n"
     "    var nextUrl;\n"
     "    var previousUrl = frameUrl;\n"
+    "    var bytes;\n"
+    "    var byteLength = 0;\n"
+    "    var soiOk = false;\n"
+    "    var eoiOk = false;\n"
     "    try {\n"
-    "      /* Normalize MIME because iOS 9 WebSocket Blob frames may have an empty type. */\n"
+    "      if (!data || typeof data.byteLength !== 'number') throw new Error('binary frame is not an ArrayBuffer');\n"
+    "      bytes = new Uint8Array(data);\n"
+    "      byteLength = bytes.byteLength;\n"
+    "      soiOk = byteLength >= 2 && bytes[0] === 255 && bytes[1] === 216;\n"
+    "      eoiOk = byteLength >= 2 && bytes[byteLength - 2] === 255 && bytes[byteLength - 1] === 217;\n"
+    "      if (!frameDiagnosticsLogged && window.console && console.log) {\n"
+    "        frameDiagnosticsLogged = true;\n"
+    "        console.log('VNC Monitor: WSS JPEG bytes=' + String(byteLength) + ' soi=' + String(soiOk) + ' eoi=' + String(eoiOk));\n"
+    "      }\n"
+    "      if (!soiOk || !eoiOk) {\n"
+    "        framePending = false;\n"
+    "        rejectVideoFrame();\n"
+    "        setStatus('Received binary frame is not a complete JPEG.', 'error');\n"
+    "        return;\n"
+    "      }\n"
+    "      /* Keep the first compatibility probe on iOS 9: inspect with Uint8Array,\n"
+    "       * but preserve the original ArrayBuffer -> Blob construction path. */\n"
     "      blob = new Blob([data], { type: 'image/jpeg' });\n"
     "      nextUrl = objectUrlApi.createObjectURL(blob);\n"
     "    } catch (e) {\n"
     "      framePending = false;\n"
-    "      acknowledgeVideoFrame();\n"
+    "      rejectVideoFrame();\n"
     "      setStatus('Could not prepare the browser video frame.', 'error');\n"
     "      return;\n"
     "    }\n"
@@ -289,8 +315,8 @@ static const char client_js[] =
     "      videoFrame.onerror = null;\n"
     "      try { objectUrlApi.revokeObjectURL(nextUrl); } catch (e) {}\n"
     "      framePending = false;\n"
-    "      acknowledgeVideoFrame();\n"
-    "      if (window.console && console.error) console.error('VNC Monitor: Safari rejected JPEG frame bytes=' + String(blob.size || 0) + ' type=' + String(blob.type || ''));\n"
+    "      rejectVideoFrame();\n"
+    "      if (window.console && console.error) console.error('VNC Monitor: Safari rejected JPEG frame bytes=' + String(blob.size || 0) + ' type=' + String(blob.type || '') + ' inputBytes=' + String(byteLength) + ' soi=' + String(soiOk) + ' eoi=' + String(eoiOk));\n"
     "      if (!frameUrl) setStatus('Received video frame could not be decoded as JPEG.', 'error');\n"
     "    };\n"
     "    videoFrame.src = nextUrl;\n"
@@ -2057,6 +2083,14 @@ websocket_message_cb(SoupWebsocketConnection *connection,
         soup_websocket_connection_send_text(
             connection,
             "{\"type\":\"error\",\"error\":\"frame-ack-not-accepted\"}");
+        return;
+    }
+
+    if (websocket_message_equals(message, "{\"type\":\"frame-nack\"}")) {
+        LOG_INFO("Authenticated legacy browser reported JPEG decode failure; closing media session");
+        soup_websocket_connection_close(connection,
+                                        SOUP_WEBSOCKET_CLOSE_UNSUPPORTED_DATA,
+                                        "JPEG decode failed");
         return;
     }
 

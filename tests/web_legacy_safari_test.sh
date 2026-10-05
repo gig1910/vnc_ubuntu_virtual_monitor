@@ -72,8 +72,12 @@ grep -Fq 'function (' <<<"$client_js"
 grep -Fq "socket.binaryType = 'arraybuffer'" <<<"$client_js"
 grep -Fq "new Blob([data], { type: 'image/jpeg' })" <<<"$client_js"
 grep -Fq 'function acknowledgeVideoFrame()' <<<"$client_js"
+grep -Fq 'function rejectVideoFrame()' <<<"$client_js"
 grep -Fq 'socket.send' <<<"$client_js"
 grep -Fq 'frame-ack' <<<"$client_js"
+grep -Fq 'frame-nack' <<<"$client_js"
+grep -Fq 'new Uint8Array(data)' <<<"$client_js"
+grep -Fq 'WSS JPEG bytes=' <<<"$client_js"
 grep -Fq 'videoFrame.onload = function ()' <<<"$client_js"
 grep -Fq 'videoFrame.onerror = function ()' <<<"$client_js"
 grep -Fq 'framePending' <<<"$client_js"
@@ -179,7 +183,10 @@ echo "authenticated HLS serving: OK"
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'VNC_BROKER_CONTROL_VIDEO_FRAME_ACK' include/broker_protocol.h src/broker.c src/main.c
 grep -Fq 'queue-depth=1' src/main.c src/broker.c
-echo "legacy WSS/JPEG ACK pacing: OK"
+grep -Fq 'Legacy browser first JPEG integrity:' src/main.c
+grep -Fq 'Broker first JPEG integrity:' src/broker.c
+grep -Fq 'Authenticated legacy browser reported JPEG decode failure' src/web_server.c
+echo "legacy WSS/JPEG ACK pacing and integrity diagnostics: OK"
 
 grep -Fq 'soup_websocket_connection_get_state(web->websocket) ==' "$source_file"
 echo "WebSocket shutdown state guard: OK"

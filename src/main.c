@@ -19,6 +19,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <glib.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -754,6 +755,26 @@ web_media_sender_worker(void *opaque)
             LOG_ERROR("Legacy browser JPEG encode failed");
             (void)shutdown(sender->control_fd, SHUT_RDWR);
             break;
+        }
+
+        if (frames_sent == 0) {
+            int soi_ok = jpeg_size >= 2 &&
+                         jpeg[0] == 0xffu &&
+                         jpeg[1] == 0xd8u;
+            int eoi_ok = jpeg_size >= 2 &&
+                         jpeg[jpeg_size - 2] == 0xffu &&
+                         jpeg[jpeg_size - 1] == 0xd9u;
+            gchar *sha256 =
+                g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+                                            jpeg,
+                                            (gsize)jpeg_size);
+
+            LOG_INFO("Legacy browser first JPEG integrity: bytes=%zu soi=%s eoi=%s sha256=%s",
+                     jpeg_size,
+                     soi_ok ? "ok" : "bad",
+                     eoi_ok ? "ok" : "bad",
+                     sha256 ? sha256 : "unavailable");
+            g_free(sha256);
         }
 
         if (!web_media_sender_begin_frame(sender)) {

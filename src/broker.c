@@ -674,6 +674,35 @@ broker_handle_web_media_packet(Broker *broker,
             broker->web_frame_buffer->len != broker->web_frame_expected)
             return FALSE;
 
+        if (broker->web_frames_forwarded == 0) {
+            guint actual = broker->web_frame_buffer->len;
+            const guint8 *data = broker->web_frame_buffer->data;
+            gboolean soi_ok = actual >= 2 &&
+                              data[0] == 0xffu &&
+                              data[1] == 0xd8u;
+            gboolean eoi_ok = actual >= 2 &&
+                              data[actual - 2] == 0xffu &&
+                              data[actual - 1] == 0xd9u;
+            gchar *sha256 =
+                g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+                                            data,
+                                            (gsize)actual);
+
+            LOG_INFO("Broker first JPEG integrity: declared=%u actual=%u soi=%s eoi=%s sha256=%s",
+                     broker->web_frame_expected,
+                     actual,
+                     soi_ok ? "ok" : "bad",
+                     eoi_ok ? "ok" : "bad",
+                     sha256 ? sha256 : "unavailable");
+            g_free(sha256);
+
+            if (!soi_ok || !eoi_ok) {
+                LOG_ERROR("Broker rejected malformed legacy JPEG before WebSocket forwarding");
+                broker_reset_web_frame(broker);
+                return FALSE;
+            }
+        }
+
         gboolean sent = broker->websocket_attached &&
                         broker->web_server &&
                         web_server_send_binary(
