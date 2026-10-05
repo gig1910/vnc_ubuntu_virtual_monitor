@@ -108,6 +108,23 @@ grep -Fq 'Protocol client/server:' <<<"$login_page"
 grep -Fq 'Build client/server:' <<<"$login_page"
 grep -Fq 'protocol-mismatch' <<<"$protocol_worker_js"
 grep -Fq 'protocol-ready' <<<"$protocol_worker_js"
+grep -Fq 'DISPLAY_STATE_HYSTERESIS_MS = 2500' <<<"$client_js"
+grep -Fq "window.addEventListener('resize'" <<<"$client_js"
+grep -Fq "window.addEventListener('orientationchange'" <<<"$client_js"
+grep -Fq "document.addEventListener('webkitfullscreenchange'" <<<"$client_js"
+grep -Fq "message.type === 'display-state'" <<<"$protocol_worker_js"
+grep -Fq 'flushDisplayState' <<<"$protocol_worker_js"
+grep -Fq 'display-state-applied' <<<"$protocol_worker_js"
+grep -Fq '__Host-vnc-monitor-device' "$source_file"
+grep -Fq 'HttpOnly; SameSite=Strict' "$source_file"
+grep -Fq 'websocket_parse_display_state' "$source_file"
+grep -Fq 'WEB_DISPLAY_MIN_INTERVAL_US' "$source_file"
+grep -Fq 'VNC_BROKER_CONTROL_DEVICE_BIND' include/broker_protocol.h src/broker.c
+grep -Fq 'VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED' include/broker_protocol.h src/broker.c
+if grep -Fq 'device_id' <<<"$client_js" || grep -Fq 'deviceId' <<<"$client_js"; then
+    echo "Legacy Safari regression: server device identity leaked into client JavaScript" >&2
+    exit 1
+fi
 grep -Fq 'protocol-reload=' <<<"$client_js"
 grep -Fq 'function finishSuccess()' <<<"$client_js"
 grep -Fq 'videoFrame.onload = finishSuccess' <<<"$client_js"
@@ -212,7 +229,7 @@ grep -Fq 'validate_media_token' "$source_file"
 grep -Fq 'hls_segment_name_valid' "$source_file"
 echo "authenticated HLS serving: OK"
 
-grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              2u' include/web_server.h
+grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              3u' include/web_server.h
 grep -Fq 'VNC_WEB_PROTOCOL_VERSION' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c

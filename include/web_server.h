@@ -4,8 +4,8 @@
 #include <glib.h>
 #include "broker_protocol.h"
 
-#define VNC_WEB_PROTOCOL_VERSION              2u
-#define VNC_WEB_PROTOCOL_VERSION_TEXT         "2"
+#define VNC_WEB_PROTOCOL_VERSION              3u
+#define VNC_WEB_PROTOCOL_VERSION_TEXT         "3"
 #define VNC_WEB_JPEG_DECODE_FAILURE_LIMIT     3u
 
 typedef struct WebServer WebServer;
@@ -42,6 +42,14 @@ typedef struct {
 } WebServerManagementInfo;
 
 typedef struct {
+    guint32 generation;
+    guint32 width;
+    guint32 height;
+    VncBrokerDisplayMode mode;
+    VncBrokerDisplayOrientation orientation;
+} WebServerDisplayState;
+
+typedef struct {
     const char *kind;
     const char *level;
     const char *event;
@@ -70,6 +78,7 @@ typedef struct {
     WebServerAuthResult (*begin_auth)(const char *username,
                                       const char *password,
                                       const char *peer_addr,
+                                      const char *device_id,
                                       WebServerAuthComplete completion,
                                       gpointer completion_data,
                                       gpointer user_data);
@@ -101,6 +110,10 @@ typedef struct {
      */
     gboolean (*websocket_frame_ack)(gpointer user_data);
     gboolean (*websocket_frame_nack)(gpointer user_data);
+
+    gboolean (*websocket_display_state)(
+        const WebServerDisplayState *state,
+        gpointer user_data);
 
     /*
      * Structured diagnostics from the authenticated browser. web_server

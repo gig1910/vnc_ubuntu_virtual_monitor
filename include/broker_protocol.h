@@ -17,6 +17,8 @@
 #define VNC_BROKER_CONTROL_PAYLOAD_MAX  8192u
 #define VNC_BROKER_VIDEO_FRAME_MAX      (4u * 1024u * 1024u)
 #define VNC_BROKER_VIDEO_DIMENSION_MAX  4096u
+#define VNC_BROKER_VIDEO_DIMENSION_MIN  64u
+#define VNC_BROKER_DEVICE_ID_HEX_LEN    64u
 
 typedef enum {
     /* Protocol-v1 handoffs from beta.3 used zero in this former reserved field. */
@@ -49,6 +51,8 @@ typedef enum {
     VNC_BROKER_CONTROL_SDP_ANSWER = 11,
     VNC_BROKER_CONTROL_ICE_CANDIDATE = 12,
     VNC_BROKER_CONTROL_DISPLAY_SIZE = 13,
+    VNC_BROKER_CONTROL_DEVICE_BIND = 14,
+    VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED = 15,
 
     VNC_BROKER_CONTROL_MEDIA_START = 20,
     VNC_BROKER_CONTROL_HLS_READY = 21,
@@ -70,6 +74,25 @@ typedef struct {
     size_t username_len;
     size_t password_len;
 } VncBrokerWebAuthRequest;
+
+typedef enum {
+    VNC_BROKER_DISPLAY_WINDOW = 0,
+    VNC_BROKER_DISPLAY_FULLSCREEN = 1
+} VncBrokerDisplayMode;
+
+typedef enum {
+    VNC_BROKER_ORIENTATION_PORTRAIT = 0,
+    VNC_BROKER_ORIENTATION_LANDSCAPE = 1
+} VncBrokerDisplayOrientation;
+
+typedef struct {
+    uint32_t generation;
+    uint32_t width;
+    uint32_t height;
+    VncBrokerDisplayMode mode;
+    VncBrokerDisplayOrientation orientation;
+} VncBrokerDisplayState;
+
 
 /*
  * Backward-compatible VNC handoff helper. Existing callers keep using this
@@ -140,6 +163,18 @@ int vnc_broker_send_web_auth_result(int control_fd,
 
 int vnc_broker_recv_web_auth_result(int control_fd,
                                     VncBrokerWebAuthResult *result);
+
+int vnc_broker_send_device_bind(int control_fd, const char *device_id);
+int vnc_broker_parse_device_bind(const void *payload,
+                                 size_t payload_len,
+                                 char device_id[VNC_BROKER_DEVICE_ID_HEX_LEN + 1]);
+
+int vnc_broker_send_display_state(int control_fd,
+                                  VncBrokerControlType type,
+                                  const VncBrokerDisplayState *state);
+int vnc_broker_parse_display_state(const void *payload,
+                                   size_t payload_len,
+                                   VncBrokerDisplayState *state);
 
 int vnc_broker_send_video_frame_begin(int control_fd,
                                       uint32_t width,

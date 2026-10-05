@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/random.h>
 #include <unistd.h>
 
 #define WEB_DEFAULT_PORT       8443
@@ -26,6 +27,9 @@
 #define WEB_WS_DIAGNOSTIC_MAX       512
 #define WEB_WS_DIAGNOSTIC_RATE       32
 #define WEB_SESSION_COOKIE          "vnc-monitor-session"
+#define WEB_DEVICE_COOKIE           "__Host-vnc-monitor-device"
+#define WEB_DEVICE_MAX_AGE_S        31536000
+#define WEB_DISPLAY_MIN_INTERVAL_US (2 * G_USEC_PER_SEC)
 #define WEB_MANAGEMENT_COOKIE       "vnc-monitor-management"
 #define WEB_CONTROL_HEADER          "X-VNC-Monitor-Control"
 #define WEB_WS_TOKEN_DATA_KEY       "vnc-monitor-ws-token"
@@ -41,6 +45,8 @@ struct WebServer {
     gboolean websocket_protocol_ready;
     gint64 websocket_diagnostic_window_us;
     guint websocket_diagnostic_count;
+    gint64 websocket_display_last_us;
+    guint32 websocket_display_generation;
     guint port;
     char *config_file;
     char *certificate_file;
@@ -151,6 +157,7 @@ static const char protocol_worker_js[] =
     "  var framePending = false;\n"
     "  var frameSeq = 0;\n"
     "  var pendingSeq = 0;\n"
+    "  var pendingDisplayState = null;\n"
     "  var clientProtocol = 0;\n"
     "\n"
     "  function emit(type, fields) {\n"
@@ -193,6 +200,23 @@ static const char protocol_worker_js[] =
     "    return (((b << 16) | a) >>> 0);\n"
     "  }\n"
     "\n"
+    "  function displayToken(value, pattern) {\n"
+    "    var text = value == null ? '' : String(value);\n"
+    "    return pattern.test(text) ? text : '';\n"
+    "  }\n"
+    "  function flushDisplayState() {\n"
+    "    if (!pendingDisplayState || framePending || !protocolConfirmed) return;\n"
+    "    var state = pendingDisplayState;\n"
+    "    pendingDisplayState = null;\n"
+    "    var generation = boundedUInt(state.generation);\n"
+    "    var width = boundedUInt(state.width);\n"
+    "    var height = boundedUInt(state.height);\n"
+    "    var mode = displayToken(state.mode, /^(window|fullscreen)$/);\n"
+    "    var orientation = displayToken(state.orientation, /^(portrait|landscape)$/);\n"
+    "    if (!generation || width < 64 || height < 64 || width > 4096 || height > 4096 || !mode || !orientation) return;\n"
+    "    sendText('{\"type\":\"display-state\",\"generation\":' + String(generation) + ',\"mode\":\"' + mode + '\",\"orientation\":\"' + orientation + '\",\"width\":' + String(width) + ',\"height\":' + String(height) + '}');\n"
+    "  }\n"
+    "\n"
     "  function closeSocket() { if (socket) { try { socket.close(); } catch (e) {} } }\n"
     "\n"
     "  function handleText(text) {\n"
@@ -218,6 +242,8 @@ static const char protocol_worker_js[] =
     "    if (message.type === 'ready') emit('ready', { state: message.state || '', media: message.media || '' });\n"
     "    else if (message.type === 'media-ready' && message.media === 'hls') emit('media-ready', { media: 'hls', url: message.url || '/live/index.m3u8' });\n"
     "    else if (message.type === 'telemetry') emit('telemetry', { event: message.event || '', seq: message.seq || 0, bytes: message.bytes || 0, sha256: message.sha256 || '', checksum: message.adler32 || 0, failures: message.failures || 0 });\n"
+    "    else if (message.type === 'display-state-applied') emit('display-state-applied', { generation: message.generation || 0, width: message.width || 0, height: message.height || 0, mode: message.mode || '', orientation: message.orientation || '' });\n"
+    "    else if (message.type === 'display-state-rejected') emit('display-state-rejected', { generation: message.generation || 0, reason: message.reason || 'rejected' });\n"
     "    else if (message.error) emit('error', { message: String(message.error) });\n"
     "  }\n"
     "\n"
@@ -274,7 +300,7 @@ static const char protocol_worker_js[] =
     "    socket.onmessage = function (event) { if (typeof event.data === 'string') handleText(event.data); else handleBinary(event.data); };\n"
     "    socket.onerror = function () { emit('socket-error', { message: socketOpened ? 'Secure WebSocket error.' : 'Secure WebSocket network/TLS handshake failed before open.' }); };\n"
     "    socket.onclose = function () {\n"
-    "      var wasOpen = socketOpened; socket = null; socketOpened = false; protocolConfirmed = false; framePending = false; pendingSeq = 0;\n"
+    "      var wasOpen = socketOpened; socket = null; socketOpened = false; protocolConfirmed = false; framePending = false; pendingSeq = 0; pendingDisplayState = null;\n"
     "      emit('closed', { wasOpen: wasOpen });\n"
     "    };\n"
     "  }\n"
@@ -283,6 +309,7 @@ static const char protocol_worker_js[] =
     "    var message = event.data || {};\n"
     "    if (message.type === 'connect') { connect(message); return; }\n"
     "    if (message.type === 'close') { closeSocket(); return; }\n"
+    "    if (message.type === 'display-state') { pendingDisplayState = message; flushDisplayState(); return; }\n"
     "    if (message.type === 'client-diagnostic') {\n"
     "      sendDiagnostic(message.kind, message.level, message.event, message.seq, message.bytes, message.observed, message.checksum, message.elapsed, message.mime);\n"
     "      return;\n"
@@ -291,6 +318,7 @@ static const char protocol_worker_js[] =
     "      if (!framePending || message.seq !== pendingSeq) return;\n"
     "      sendText(message.ok ? '{\"type\":\"frame-ack\"}' : '{\"type\":\"frame-nack\"}');\n"
     "      framePending = false; pendingSeq = 0;\n"
+    "      flushDisplayState();\n"
     "    }\n"
     "  };\n"
     "\n"
@@ -322,6 +350,44 @@ static const char client_js[] =
     "  var protocolWorker = null;\n"
     "  var workerConnected = false;\n"
     "  var protocolFatal = false;\n"
+    "  var displaySyncReady = false;\n"
+    "  var displayTimer = null;\n"
+    "  var displayGeneration = 0;\n"
+    "  var displayAppliedGeneration = 0;\n"
+    "  var DISPLAY_STATE_HYSTERESIS_MS = 2500;\n"
+    "\n"
+    "  function currentDisplayMode() {\n"
+    "    if (document.fullscreenElement || document.webkitFullscreenElement || navigator.standalone) return 'fullscreen';\n"
+    "    return 'window';\n"
+    "  }\n"
+    "  function currentViewport() {\n"
+    "    var width = document.documentElement && document.documentElement.clientWidth ? document.documentElement.clientWidth : window.innerWidth;\n"
+    "    var height = document.documentElement && document.documentElement.clientHeight ? document.documentElement.clientHeight : window.innerHeight;\n"
+    "    width = Math.max(64, Math.min(4096, Math.round(width || 0)));\n"
+    "    height = Math.max(64, Math.min(4096, Math.round(height || 0)));\n"
+    "    return { width: width, height: height };\n"
+    "  }\n"
+    "  function currentOrientation(viewport) {\n"
+    "    if (typeof window.orientation === 'number' && (window.orientation === 90 || window.orientation === -90)) return 'landscape';\n"
+    "    if (typeof window.orientation === 'number' && (window.orientation === 0 || window.orientation === 180 || window.orientation === -180)) return 'portrait';\n"
+    "    return viewport.width >= viewport.height ? 'landscape' : 'portrait';\n"
+    "  }\n"
+    "  function sendDisplayState() {\n"
+    "    displayTimer = null;\n"
+    "    if (!displaySyncReady || !protocolWorker) return;\n"
+    "    var viewport = currentViewport();\n"
+    "    displayGeneration += 1;\n"
+    "    try { protocolWorker.postMessage({ type: 'display-state', generation: displayGeneration, mode: currentDisplayMode(), orientation: currentOrientation(viewport), width: viewport.width, height: viewport.height }); } catch (e) {}\n"
+    "  }\n"
+    "  function scheduleDisplayState() {\n"
+    "    if (displayTimer) window.clearTimeout(displayTimer);\n"
+    "    displayTimer = window.setTimeout(sendDisplayState, DISPLAY_STATE_HYSTERESIS_MS);\n"
+    "  }\n"
+    "  function resetDisplaySync() {\n"
+    "    displaySyncReady = false;\n"
+    "    if (displayTimer) window.clearTimeout(displayTimer);\n"
+    "    displayTimer = null;\n"
+    "  }\n"
     "\n"
     "  function setStatus(text, kind) {\n"
     "    statusText.innerHTML = '';\n"
@@ -609,6 +675,8 @@ static const char client_js[] =
     "        handleProtocolMismatch(message.clientProtocol, message.serverProtocol);\n"
     "      } else if (message.type === 'protocol-ready') {\n"
     "        updateProtocolInfo(message.protocol, message.build);\n"
+    "        displaySyncReady = true;\n"
+    "        scheduleDisplayState();\n"
     "        setStatus('Connected. Protocol verified; preparing browser media...', 'ok');\n"
     "      } else if (message.type === 'ready') {\n"
     "        setStatus('Connected. Preparing browser media...', 'ok');\n"
@@ -618,6 +686,10 @@ static const char client_js[] =
     "        renderVideoFrame(message);\n"
     "      } else if (message.type === 'telemetry') {\n"
     "        if (window.console && console.log) console.log('VNC Monitor telemetry event=' + String(message.event || '') + ' seq=' + String(message.seq || 0) + ' bytes=' + String(message.bytes || 0) + ' checksum=' + String(message.checksum || 0) + ' failures=' + String(message.failures || 0));\n"
+    "      } else if (message.type === 'display-state-applied') {\n"
+    "        if (message.generation >= displayAppliedGeneration) { displayAppliedGeneration = message.generation; if (window.console && console.log) console.log('VNC Monitor display state applied generation=' + String(message.generation) + ' size=' + String(message.width) + 'x' + String(message.height) + ' mode=' + String(message.mode) + ' orientation=' + String(message.orientation)); }\n"
+    "      } else if (message.type === 'display-state-rejected') {\n"
+    "        if (message.generation >= displayAppliedGeneration) scheduleDisplayState();\n"
     "      } else if (message.type === 'frame-rejected') {\n"
     "        if (window.console && console.error) console.error('VNC Monitor worker rejected JPEG frame seq=' + String(message.seq || 0) + ' bytes=' + String(message.bytes || 0) + ' reason=' + String(message.reason || 'unknown'));\n"
     "        setStatus('Invalid JPEG frame dropped; waiting for the next frame.', 'working');\n"
@@ -627,6 +699,7 @@ static const char client_js[] =
     "        if (!protocolFatal) setStatus('Server/protocol message: ' + String(message.message || 'unknown error'), 'error');\n"
     "      } else if (message.type === 'closed') {\n"
     "        var wasOpen = workerConnected || message.wasOpen;\n"
+    "        resetDisplaySync();\n"
     "        destroyProtocolWorker();\n"
     "        setFormBusy(false);\n"
     "        setConnected(false);\n"
@@ -686,6 +759,13 @@ static const char client_js[] =
     "\n"
     "    xhr.send('username=' + encodeURIComponent(userValue) + '&password=' + encodeURIComponent(passwordValue));\n"
     "    return false;\n"
+    "  }\n"
+    "\n"
+    "  if (window.addEventListener) {\n"
+    "    window.addEventListener('resize', scheduleDisplayState, false);\n"
+    "    window.addEventListener('orientationchange', scheduleDisplayState, false);\n"
+    "    document.addEventListener('fullscreenchange', scheduleDisplayState, false);\n"
+    "    document.addEventListener('webkitfullscreenchange', scheduleDisplayState, false);\n"
     "  }\n"
     "\n"
     "  form.onsubmit = login;\n"
@@ -1059,6 +1139,63 @@ static char *
 extract_session_cookie(SoupServerMessage *msg)
 {
     return extract_cookie(msg, WEB_SESSION_COOKIE);
+}
+
+static gboolean
+device_id_valid(const char *device_id)
+{
+    if (!device_id || strlen(device_id) != VNC_BROKER_DEVICE_ID_HEX_LEN)
+        return FALSE;
+
+    for (size_t i = 0; i < VNC_BROKER_DEVICE_ID_HEX_LEN; i++) {
+        char c = device_id[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+static int
+generate_device_id(char out[VNC_BROKER_DEVICE_ID_HEX_LEN + 1])
+{
+    static const char hex[] = "0123456789abcdef";
+    guint8 random_bytes[VNC_BROKER_DEVICE_ID_HEX_LEN / 2];
+    size_t offset = 0;
+
+    while (offset < sizeof(random_bytes)) {
+        ssize_t n = getrandom(random_bytes + offset,
+                              sizeof(random_bytes) - offset,
+                              0);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        offset += (size_t)n;
+    }
+
+    for (size_t i = 0; i < sizeof(random_bytes); i++) {
+        out[i * 2] = hex[random_bytes[i] >> 4];
+        out[i * 2 + 1] = hex[random_bytes[i] & 0x0f];
+    }
+    out[VNC_BROKER_DEVICE_ID_HEX_LEN] = '\0';
+    return 0;
+}
+
+static void
+append_device_cookie(SoupServerMessage *msg, const char *device_id)
+{
+    if (!msg || !device_id_valid(device_id))
+        return;
+
+    SoupMessageHeaders *headers = soup_server_message_get_response_headers(msg);
+    char *cookie = g_strdup_printf(
+        WEB_DEVICE_COOKIE "=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=%d",
+        device_id,
+        WEB_DEVICE_MAX_AGE_S);
+    soup_message_headers_append(headers, "Set-Cookie", cookie);
+    g_free(cookie);
 }
 
 static void
@@ -1592,6 +1729,8 @@ status_handler(SoupServer *server,
 
 typedef struct {
     SoupServerMessage *msg;
+    char device_id[VNC_BROKER_DEVICE_ID_HEX_LEN + 1];
+    gboolean set_device_cookie;
 } PendingLogin;
 
 static void
@@ -1674,6 +1813,8 @@ login_auth_complete(WebServerAuthResult result,
         return;
 
     respond_auth_result(pending->msg, result, session_token);
+    if (result == WEB_SERVER_AUTH_OK && pending->set_device_cookie)
+        append_device_cookie(pending->msg, pending->device_id);
     soup_server_message_unpause(pending->msg);
     g_object_unref(pending->msg);
     g_free(pending);
@@ -1773,11 +1914,36 @@ login_handler(SoupServer *server,
     PendingLogin *pending = g_new0(PendingLogin, 1);
     pending->msg = g_object_ref(msg);
 
+    char *device_cookie = extract_cookie(msg, WEB_DEVICE_COOKIE);
+    if (device_cookie && device_id_valid(device_cookie)) {
+        g_strlcpy(pending->device_id,
+                  device_cookie,
+                  sizeof(pending->device_id));
+    }
+    else {
+        if (generate_device_id(pending->device_id) < 0) {
+            g_free(device_cookie);
+            g_object_unref(pending->msg);
+            g_free(pending);
+            secure_clear_string(password);
+            g_hash_table_destroy(form);
+            soup_message_body_truncate(request_body);
+            respond_text(msg,
+                         SOUP_STATUS_INTERNAL_SERVER_ERROR,
+                         "application/json; charset=utf-8",
+                         "{\"error\":\"device-id-unavailable\"}\n");
+            return;
+        }
+        pending->set_device_cookie = TRUE;
+    }
+    g_free(device_cookie);
+
     soup_server_message_pause(msg);
 
     WebServerAuthResult start = web->hooks.begin_auth(username,
                                                        password,
                                                        peer_addr,
+                                                       pending->device_id,
                                                        login_auth_complete,
                                                        pending,
                                                        web->user_data);
@@ -2420,6 +2586,63 @@ websocket_client_diagnostic_rate_allowed(WebServer *web)
     return TRUE;
 }
 
+static gboolean
+websocket_parse_display_state(GBytes *message, WebServerDisplayState *state)
+{
+    if (!message || !state)
+        return FALSE;
+
+    gsize length = 0;
+    const guint8 *data = g_bytes_get_data(message, &length);
+    if (!data || length == 0 || length > 256 || length > G_MAXINT ||
+        memchr(data, '\0', length))
+        return FALSE;
+
+    char *text = g_strndup((const char *)data, length);
+    if (!text)
+        return FALSE;
+
+    unsigned generation = 0;
+    unsigned width = 0;
+    unsigned height = 0;
+    char mode[16] = {0};
+    char orientation[16] = {0};
+    int consumed = 0;
+
+    int fields = sscanf(
+        text,
+        "{\"type\":\"display-state\",\"generation\":%u,"
+        "\"mode\":\"%15[a-z]\",\"orientation\":\"%15[a-z]\","
+        "\"width\":%u,\"height\":%u}%n",
+        &generation, mode, orientation, &width, &height, &consumed);
+
+    gboolean valid =
+        fields == 5 &&
+        consumed == (int)length &&
+        generation > 0 &&
+        width >= VNC_BROKER_VIDEO_DIMENSION_MIN &&
+        height >= VNC_BROKER_VIDEO_DIMENSION_MIN &&
+        width <= VNC_BROKER_VIDEO_DIMENSION_MAX &&
+        height <= VNC_BROKER_VIDEO_DIMENSION_MAX &&
+        (strcmp(mode, "window") == 0 || strcmp(mode, "fullscreen") == 0) &&
+        (strcmp(orientation, "portrait") == 0 ||
+         strcmp(orientation, "landscape") == 0);
+
+    if (valid) {
+        state->generation = generation;
+        state->width = width;
+        state->height = height;
+        state->mode = strcmp(mode, "fullscreen") == 0 ?
+            VNC_BROKER_DISPLAY_FULLSCREEN : VNC_BROKER_DISPLAY_WINDOW;
+        state->orientation = strcmp(orientation, "landscape") == 0 ?
+            VNC_BROKER_ORIENTATION_LANDSCAPE :
+            VNC_BROKER_ORIENTATION_PORTRAIT;
+    }
+
+    g_free(text);
+    return valid;
+}
+
 static void
 websocket_message_cb(SoupWebsocketConnection *connection,
                      SoupWebsocketDataType type,
@@ -2445,6 +2668,36 @@ websocket_message_cb(SoupWebsocketConnection *connection,
     }
 
     if (web && web->websocket_protocol_ready) {
+        WebServerDisplayState display_state = {0};
+        if (websocket_parse_display_state(message, &display_state)) {
+            gint64 now = g_get_monotonic_time();
+            gboolean generation_ok =
+                display_state.generation > web->websocket_display_generation;
+            gboolean rate_ok =
+                web->websocket_display_last_us == 0 ||
+                now - web->websocket_display_last_us >=
+                    WEB_DISPLAY_MIN_INTERVAL_US;
+
+            if (generation_ok && rate_ok &&
+                web->hooks.websocket_display_state &&
+                web->hooks.websocket_display_state(&display_state,
+                                                   web->user_data)) {
+                web->websocket_display_generation = display_state.generation;
+                web->websocket_display_last_us = now;
+            }
+            else {
+                char *reply = g_strdup_printf(
+                    "{\"type\":\"display-state-rejected\","
+                    "\"generation\":%u,\"reason\":\"%s\"}",
+                    display_state.generation,
+                    !generation_ok ? "stale" :
+                    (!rate_ok ? "rate-limit" : "not-accepted"));
+                soup_websocket_connection_send_text(connection, reply);
+                g_free(reply);
+            }
+            return;
+        }
+
         WebServerClientDiagnostic diagnostic = {0};
         char kind[16] = {0}, level[8] = {0}, event[48] = {0}, mime[48] = {0};
         if (websocket_parse_client_diagnostic(message, &diagnostic, kind, level, event, mime)) {
@@ -2484,6 +2737,8 @@ websocket_closed_cb(SoupWebsocketConnection *connection, gpointer user_data)
     web->websocket_protocol_ready = FALSE;
     web->websocket_diagnostic_window_us = 0;
     web->websocket_diagnostic_count = 0;
+    web->websocket_display_last_us = 0;
+    web->websocket_display_generation = 0;
 
     if (web->hooks.websocket_closed)
         web->hooks.websocket_closed(web->user_data);
@@ -2519,6 +2774,8 @@ websocket_handler(SoupServer *server,
     web->websocket_protocol_ready = FALSE;
     web->websocket_diagnostic_window_us = 0;
     web->websocket_diagnostic_count = 0;
+    web->websocket_display_last_us = 0;
+    web->websocket_display_generation = 0;
     soup_websocket_connection_set_max_incoming_payload_size(connection,
                                                             WEB_WS_MESSAGE_MAX);
     g_signal_connect(connection, "message",

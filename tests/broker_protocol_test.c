@@ -467,9 +467,89 @@ test_video_frame_chunk_roundtrip(void)
     close(control[1]);
 }
 
+static void
+test_device_bind_roundtrip(void)
+{
+    int control[2] = {-1, -1};
+    CHECK(make_seqpacket_pair(control) == 0);
+
+    const char *device_id =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    CHECK(vnc_broker_send_device_bind(control[0], device_id) == 0);
+
+    uint8_t payload[VNC_BROKER_CONTROL_PAYLOAD_MAX];
+    VncBrokerControlType type = 0;
+    size_t payload_len = 0;
+    CHECK(vnc_broker_recv_control(control[1], &type,
+                                  payload, sizeof(payload),
+                                  &payload_len) == 0);
+    CHECK(type == VNC_BROKER_CONTROL_DEVICE_BIND);
+
+    char parsed[VNC_BROKER_DEVICE_ID_HEX_LEN + 1];
+    CHECK(vnc_broker_parse_device_bind(payload, payload_len, parsed) == 0);
+    CHECK(strcmp(parsed, device_id) == 0);
+
+    close(control[0]);
+    close(control[1]);
+}
+
+static void
+test_display_state_roundtrip(void)
+{
+    int control[2] = {-1, -1};
+    CHECK(make_seqpacket_pair(control) == 0);
+
+    VncBrokerDisplayState sent = {
+        .generation = 17,
+        .width = 1024,
+        .height = 704,
+        .mode = VNC_BROKER_DISPLAY_FULLSCREEN,
+        .orientation = VNC_BROKER_ORIENTATION_LANDSCAPE
+    };
+    CHECK(vnc_broker_send_display_state(control[0],
+                                        VNC_BROKER_CONTROL_DISPLAY_SIZE,
+                                        &sent) == 0);
+
+    uint8_t payload[VNC_BROKER_CONTROL_PAYLOAD_MAX];
+    VncBrokerControlType type = 0;
+    size_t payload_len = 0;
+    CHECK(vnc_broker_recv_control(control[1], &type,
+                                  payload, sizeof(payload),
+                                  &payload_len) == 0);
+    CHECK(type == VNC_BROKER_CONTROL_DISPLAY_SIZE);
+
+    VncBrokerDisplayState parsed;
+    CHECK(vnc_broker_parse_display_state(payload, payload_len, &parsed) == 0);
+    CHECK(parsed.generation == sent.generation);
+    CHECK(parsed.width == sent.width);
+    CHECK(parsed.height == sent.height);
+    CHECK(parsed.mode == sent.mode);
+    CHECK(parsed.orientation == sent.orientation);
+
+    sent.generation++;
+    sent.mode = VNC_BROKER_DISPLAY_WINDOW;
+    sent.orientation = VNC_BROKER_ORIENTATION_PORTRAIT;
+    CHECK(vnc_broker_send_display_state(control[1],
+                                        VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED,
+                                        &sent) == 0);
+    CHECK(vnc_broker_recv_control(control[0], &type,
+                                  payload, sizeof(payload),
+                                  &payload_len) == 0);
+    CHECK(type == VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED);
+    CHECK(vnc_broker_parse_display_state(payload, payload_len, &parsed) == 0);
+    CHECK(parsed.generation == sent.generation);
+    CHECK(parsed.mode == VNC_BROKER_DISPLAY_WINDOW);
+    CHECK(parsed.orientation == VNC_BROKER_ORIENTATION_PORTRAIT);
+
+    close(control[0]);
+    close(control[1]);
+}
+
 int
 main(void)
 {
+    test_device_bind_roundtrip();
+    test_display_state_roundtrip();
     test_legacy_broker_to_new_agent();
     test_new_broker_to_legacy_agent();
     test_webrtc_handoff_has_no_fd();

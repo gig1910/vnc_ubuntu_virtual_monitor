@@ -99,6 +99,7 @@ typedef struct {
     char web_in_flight_sha256[65];
     guint32 web_in_flight_adler32;
     guint web_decode_failures;
+    char web_device_id[VNC_BROKER_DEVICE_ID_HEX_LEN + 1];
 
     ManagementAuth *management_auth;
     gboolean management_token_valid;
@@ -660,6 +661,31 @@ broker_handle_web_media_packet(Broker *broker,
     if (!broker)
         return FALSE;
 
+    if (type == VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED) {
+        VncBrokerDisplayState state;
+        if (!broker->websocket_attached ||
+            !broker->web_protocol_ready ||
+            vnc_broker_parse_display_state(payload,
+                                           payload_len,
+                                           &state) < 0)
+            return FALSE;
+
+        char *message = g_strdup_printf(
+            "{\"type\":\"display-state-applied\","
+            "\"generation\":%u,\"width\":%u,\"height\":%u,"
+            "\"mode\":\"%s\",\"orientation\":\"%s\"}",
+            state.generation,
+            state.width,
+            state.height,
+            state.mode == VNC_BROKER_DISPLAY_FULLSCREEN ?
+                "fullscreen" : "window",
+            state.orientation == VNC_BROKER_ORIENTATION_LANDSCAPE ?
+                "landscape" : "portrait");
+        gboolean sent = web_server_send_text(broker->web_server, message);
+        g_free(message);
+        return sent;
+    }
+
     if (type == VNC_BROKER_CONTROL_HLS_READY) {
         if (payload_len != 0 ||
             !broker->websocket_attached ||
@@ -806,6 +832,7 @@ clear_session(Broker *broker, int reset)
     }
 
     broker_invalidate_web_token(broker);
+    secure_clear(broker->web_device_id, sizeof(broker->web_device_id));
     if (broker->web_server)
         web_server_set_hls_root(broker->web_server, NULL);
     broker_reset_web_frame(broker);
@@ -1018,6 +1045,17 @@ web_control_ready_cb(gint fd, GIOCondition condition, gpointer user_data)
             if ((condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) != 0) {
                 LOG_INFO("Broker lost browser agent channel after successful authentication for session %s",
                          broker->session_id);
+                broker->control_source = 0;
+                broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
+                clear_session(broker, 1);
+                return G_SOURCE_REMOVE;
+            }
+
+            if (vnc_broker_send_device_bind(fd,
+                                            broker->web_device_id) < 0) {
+                LOG_INFO("Broker could not bind browser device identity for session %s: %s",
+                         broker->session_id,
+                         strerror(errno));
                 broker->control_source = 0;
                 broker_complete_web_auth(broker, WEB_SERVER_AUTH_ERROR);
                 clear_session(broker, 1);
@@ -1274,6 +1312,46 @@ broker_websocket_frame_nack(gpointer user_data)
     return TRUE;
 }
 
+static gboolean
+broker_websocket_display_state(const WebServerDisplayState *state,
+                               gpointer user_data)
+{
+    Broker *broker = user_data;
+    if (!broker || !state ||
+        broker->state != BROKER_SESSION_ACTIVE_WEBRTC ||
+        !broker->websocket_attached ||
+        !broker->web_protocol_ready ||
+        broker->control_fd < 0 ||
+        broker->web_frame_in_flight)
+        return FALSE;
+
+    VncBrokerDisplayState wire = {
+        .generation = state->generation,
+        .width = state->width,
+        .height = state->height,
+        .mode = state->mode,
+        .orientation = state->orientation
+    };
+
+    if (vnc_broker_send_display_state(broker->control_fd,
+                                      VNC_BROKER_CONTROL_DISPLAY_SIZE,
+                                      &wire) < 0) {
+        LOG_INFO("Broker could not forward browser display state generation=%u: %s",
+                 state->generation,
+                 strerror(errno));
+        return FALSE;
+    }
+
+    LOG_INFO("Broker forwarded browser display state: device=%.8s generation=%u size=%ux%u mode=%s orientation=%s",
+             broker->web_device_id,
+             state->generation,
+             state->width,
+             state->height,
+             state->mode == VNC_BROKER_DISPLAY_FULLSCREEN ? "fullscreen" : "window",
+             state->orientation == VNC_BROKER_ORIENTATION_LANDSCAPE ? "landscape" : "portrait");
+    return TRUE;
+}
+
 static void
 broker_websocket_client_diagnostic(const WebServerClientDiagnostic *diagnostic, gpointer user_data)
 {
@@ -1429,7 +1507,8 @@ broker_management_begin_auth(const char *username,
                              gpointer user_data)
 {
     Broker *broker = user_data;
-    if (!broker || !username || !password || !completion)
+    if (!broker || !username || !password || !device_id || !completion ||
+        strlen(device_id) != VNC_BROKER_DEVICE_ID_HEX_LEN)
         return WEB_SERVER_AUTH_ERROR;
 
     if (broker->management_auth)
@@ -1591,6 +1670,7 @@ static WebServerAuthResult
 broker_web_begin_auth(const char *username,
                       const char *password,
                       const char *peer_addr,
+                      const char *device_id,
                       WebServerAuthComplete completion,
                       gpointer completion_data,
                       gpointer user_data)
@@ -1643,6 +1723,9 @@ broker_web_begin_auth(const char *username,
               sizeof(broker->peer_addr));
     broker->web_auth_complete = completion;
     broker->web_auth_complete_data = completion_data;
+    g_strlcpy(broker->web_device_id,
+              device_id,
+              sizeof(broker->web_device_id));
 
     if (vnc_broker_send_handoff_transport(control_fd,
                                           VNC_BROKER_TRANSPORT_WEBRTC,
@@ -2021,6 +2104,7 @@ main(int argc, char **argv)
         .websocket_protocol_ready = broker_websocket_protocol_ready,
         .websocket_frame_ack = broker_websocket_frame_ack,
         .websocket_frame_nack = broker_websocket_frame_nack,
+        .websocket_display_state = broker_websocket_display_state,
         .websocket_client_diagnostic = broker_websocket_client_diagnostic,
         .websocket_closed = broker_websocket_closed,
         .begin_management_auth = broker_management_begin_auth,

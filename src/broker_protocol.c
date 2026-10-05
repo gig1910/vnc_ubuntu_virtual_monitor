@@ -560,6 +560,131 @@ vnc_broker_recv_web_auth_result(int control_fd,
 }
 
 
+
+static int
+device_id_valid(const char *device_id)
+{
+    if (!device_id || strlen(device_id) != VNC_BROKER_DEVICE_ID_HEX_LEN)
+        return 0;
+
+    for (size_t i = 0; i < VNC_BROKER_DEVICE_ID_HEX_LEN; i++) {
+        char c = device_id[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return 0;
+    }
+
+    return 1;
+}
+
+int
+vnc_broker_send_device_bind(int control_fd, const char *device_id)
+{
+    if (!device_id_valid(device_id)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    return vnc_broker_send_control(control_fd,
+                                   VNC_BROKER_CONTROL_DEVICE_BIND,
+                                   device_id,
+                                   VNC_BROKER_DEVICE_ID_HEX_LEN);
+}
+
+int
+vnc_broker_parse_device_bind(const void *payload,
+                             size_t payload_len,
+                             char device_id[VNC_BROKER_DEVICE_ID_HEX_LEN + 1])
+{
+    if (!payload || !device_id ||
+        payload_len != VNC_BROKER_DEVICE_ID_HEX_LEN) {
+        errno = EPROTO;
+        return -1;
+    }
+
+    memcpy(device_id, payload, VNC_BROKER_DEVICE_ID_HEX_LEN);
+    device_id[VNC_BROKER_DEVICE_ID_HEX_LEN] = '\0';
+
+    if (!device_id_valid(device_id)) {
+        memset(device_id, 0, VNC_BROKER_DEVICE_ID_HEX_LEN + 1);
+        errno = EPROTO;
+        return -1;
+    }
+
+    return 0;
+}
+
+int
+vnc_broker_send_display_state(int control_fd,
+                              VncBrokerControlType type,
+                              const VncBrokerDisplayState *state)
+{
+    if (!state ||
+        (type != VNC_BROKER_CONTROL_DISPLAY_SIZE &&
+         type != VNC_BROKER_CONTROL_DISPLAY_SIZE_APPLIED) ||
+        state->generation == 0 ||
+        state->width < VNC_BROKER_VIDEO_DIMENSION_MIN ||
+        state->height < VNC_BROKER_VIDEO_DIMENSION_MIN ||
+        state->width > VNC_BROKER_VIDEO_DIMENSION_MAX ||
+        state->height > VNC_BROKER_VIDEO_DIMENSION_MAX ||
+        (state->mode != VNC_BROKER_DISPLAY_WINDOW &&
+         state->mode != VNC_BROKER_DISPLAY_FULLSCREEN) ||
+        (state->orientation != VNC_BROKER_ORIENTATION_PORTRAIT &&
+         state->orientation != VNC_BROKER_ORIENTATION_LANDSCAPE)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint8_t payload[16] = {0};
+    put_u32_be(payload, state->generation);
+    put_u32_be(payload + 4, state->width);
+    put_u32_be(payload + 8, state->height);
+    payload[12] = (uint8_t)state->mode;
+    payload[13] = (uint8_t)state->orientation;
+
+    return vnc_broker_send_control(control_fd, type, payload, sizeof(payload));
+}
+
+int
+vnc_broker_parse_display_state(const void *payload,
+                               size_t payload_len,
+                               VncBrokerDisplayState *state)
+{
+    if (!payload || !state || payload_len != 16) {
+        errno = EPROTO;
+        return -1;
+    }
+
+    const uint8_t *p = payload;
+    if (p[14] != 0 || p[15] != 0) {
+        errno = EPROTO;
+        return -1;
+    }
+
+    VncBrokerDisplayState parsed = {
+        .generation = get_u32_be(p),
+        .width = get_u32_be(p + 4),
+        .height = get_u32_be(p + 8),
+        .mode = (VncBrokerDisplayMode)p[12],
+        .orientation = (VncBrokerDisplayOrientation)p[13]
+    };
+
+    if (parsed.generation == 0 ||
+        parsed.width < VNC_BROKER_VIDEO_DIMENSION_MIN ||
+        parsed.height < VNC_BROKER_VIDEO_DIMENSION_MIN ||
+        parsed.width > VNC_BROKER_VIDEO_DIMENSION_MAX ||
+        parsed.height > VNC_BROKER_VIDEO_DIMENSION_MAX ||
+        (parsed.mode != VNC_BROKER_DISPLAY_WINDOW &&
+         parsed.mode != VNC_BROKER_DISPLAY_FULLSCREEN) ||
+        (parsed.orientation != VNC_BROKER_ORIENTATION_PORTRAIT &&
+         parsed.orientation != VNC_BROKER_ORIENTATION_LANDSCAPE)) {
+        errno = EPROTO;
+        return -1;
+    }
+
+    *state = parsed;
+    return 0;
+}
+
 int
 vnc_broker_send_video_frame_begin(int control_fd,
                                   uint32_t width,
