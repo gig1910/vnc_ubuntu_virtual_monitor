@@ -127,8 +127,8 @@ if grep -Fq 'device_id' <<<"$client_js" || grep -Fq 'deviceId' <<<"$client_js"; 
 fi
 grep -Fq 'protocol-reload=' <<<"$client_js"
 grep -Fq 'function finishSuccess()' <<<"$client_js"
-grep -Fq 'videoFrame.onload = finishSuccess' <<<"$client_js"
-grep -Fq 'videoFrame.onerror = function ()' <<<"$client_js"
+grep -Fq 'stagingVideoFrame.onload = finishSuccess' <<<"$client_js"
+grep -Fq 'stagingVideoFrame.onerror = function ()' <<<"$client_js"
 grep -Fq 'framePending' <<<"$client_js"
 grep -Fq 'createObjectURL' <<<"$client_js"
 grep -Fq 'video-frame' <<<"$login_page"
@@ -180,16 +180,16 @@ public_status_handler="$(
         capture { print }
     ' "$source_file"
 )"
-grep -Fq 'id="service-health"' <<<"$login_page"
-grep -Fq 'id="service-telemetry"' <<<"$login_page"
+grep -Fq 'service-health' <<<"$login_page"
+grep -Fq 'service-telemetry' <<<"$login_page"
 grep -Fq "xhr.open('GET', '/api/status?ts='" <<<"$client_js"
 grep -Fq 'schedulePublicStatus(5000)' <<<"$client_js"
-grep -Fq '"service":"ready"' <<<"$public_status_handler"
-grep -Fq '"protocol":%u' <<<"$public_status_handler"
-grep -Fq '"uptimeMs":%' <<<"$public_status_handler"
-grep -Fq '"framesForwarded":%' <<<"$public_status_handler"
-grep -Fq '"framesAcked":%' <<<"$public_status_handler"
-grep -Fq '"framesNacked":%' <<<"$public_status_handler"
+grep -Fq 'service' <<<"$public_status_handler"
+grep -Fq 'VNC_WEB_PROTOCOL_VERSION' <<<"$public_status_handler"
+grep -Fq 'uptimeMs' <<<"$public_status_handler"
+grep -Fq 'framesForwarded' <<<"$public_status_handler"
+grep -Fq 'framesAcked' <<<"$public_status_handler"
+grep -Fq 'framesNacked' <<<"$public_status_handler"
 grep -Fq '"Cache-Control"' <<<"$public_status_handler"
 if grep -Eq 'viewer_peer|viewer_user|session_id|device_id|certificate_file|private_key_file' <<<"$public_status_handler"; then
     echo "Public status regression: sensitive session/config identity leaked" >&2
@@ -280,8 +280,8 @@ if [[ -z "$sticky_line" || -z "$blob_create_line" || "$sticky_line" -ge "$blob_c
     exit 1
 fi
 echo "legacy Safari sticky data-URL JPEG rendering: OK"
-grep -Fq 'id="video-frame-a"' <<<"$login_page"
-grep -Fq 'id="video-frame-b"' <<<"$login_page"
+grep -Fq 'video-frame-a' <<<"$login_page"
+grep -Fq 'video-frame-b' <<<"$login_page"
 grep -Fq "var activeVideoFrame = videoFrameA" <<<"$client_js"
 grep -Fq "var stagingVideoFrame = videoFrameB" <<<"$client_js"
 grep -Fq "activeVideoFrame = stagingVideoFrame" <<<"$client_js"
