@@ -180,12 +180,13 @@ echo "WebSocket shutdown state guard: OK"
 
 hls_source="src/web_hls.c"
 
-if grep -Fq 'g_shell_quote' "$hls_source"; then
+if grep -Fq '= g_shell_quote(' "$hls_source"; then
     echo "HLS regression: shell quoting must never be used for GStreamer file properties" >&2
     exit 1
 fi
 
 grep -Fq 'g_strescape(segment_path, NULL)' "$hls_source"
+grep -Fq 'send-keyframe-requests=false' "$hls_source"
 grep -Fq 'playlist-location=\"%s\"' "$hls_source"
 echo "HLS GStreamer path quoting: OK"
 

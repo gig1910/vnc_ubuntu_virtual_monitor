@@ -345,3 +345,10 @@ teardown invalidates the token and clears the HLS root.
 The browser waits for HLS_READY from the user agent before assigning the
 playlist to a native video element. iOS 9 may still require a tap on Play
 because its autoplay policy predates modern muted autoplay.
+
+
+### First live HLS latency measurement
+
+The first successful iPad 3 / iOS 9.3.6 run produced native H.264/HLS playback with roughly 1-2 seconds of end-to-end delay. The generated playlist also showed alternating normal one-second fragments and one-frame (~0.067 s) fragments. That pattern came from combining x264's fixed one-second GOP with hlssink2's own keyframe requests.
+
+The test profile now disables hlssink2 keyframe requests and relies on the encoder's regular key-int-max=fps cadence. The HLS target remains one second, which is the smallest non-zero integer target exposed by hlssink2. This should make the MPEG-TS fragments regular and gives a cleaner latency baseline before considering a custom sub-second segmenter.

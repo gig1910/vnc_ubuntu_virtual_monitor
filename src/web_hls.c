@@ -340,8 +340,8 @@ web_hls_start(WebHlsStream *stream,
         g_strdup_printf("%s/segment%%05d.ts", stream->directory);
 
     /*
-     * gst_parse_launch() has its own quoting grammar. g_shell_quote() is
-     * shell syntax and its single quotes become literal path bytes in
+     * gst_parse_launch() has its own quoting grammar. Shell-style quoting is
+     * wrong here because quote characters become literal path bytes in
      * hlssink2. Escape for a double-quoted GStreamer property instead.
      */
     char *escaped_segment = g_strescape(segment_path, NULL);
@@ -357,7 +357,7 @@ web_hls_start(WebHlsStream *stream,
         "! video/x-h264,profile=baseline "
         "! h264parse config-interval=-1 "
         "! hlssink2 name=hls max-files=%d playlist-length=%d "
-        "target-duration=%d send-keyframe-requests=true playlist-root=/live "
+        "target-duration=%d send-keyframe-requests=false playlist-root=/live "
         "location=\"%s\" playlist-location=\"%s\"",
         WEB_HLS_BITRATE_KBIT,
         fps,
@@ -417,7 +417,7 @@ web_hls_start(WebHlsStream *stream,
     }
 
     stream->thread_started = 1;
-    LOG_INFO("Legacy browser HLS test path started: H.264 baseline x264 %dx%d@%dfps target=%ds",
+    LOG_INFO("Legacy browser HLS test path started: H.264 baseline x264 %dx%d@%dfps target=%ds keyframe-requests=off",
              width, height, fps, WEB_HLS_TARGET_DURATION);
     return 0;
 
