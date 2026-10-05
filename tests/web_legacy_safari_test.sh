@@ -282,7 +282,7 @@ grep -Fq 'validate_media_token' "$source_file"
 grep -Fq 'hls_segment_name_valid' "$source_file"
 echo "authenticated HLS serving: OK"
 
-grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              7u' include/web_server.h
+grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              8u' include/web_server.h
 grep -Fq 'VNC_WEB_PROTOCOL_VERSION' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c
@@ -368,6 +368,22 @@ if grep -Fq 'broker_invalidate_web_token(broker)' <<<"$clear_session_block"; the
     exit 1
 fi
 echo "browser authentication lifetime separated from viewer lifetime: OK"
+
+grep -Fq 'WEB_SESSION_MAX_AGE_S       31536000' src/web_server.c
+grep -Fq 'extract_session_cookie(msg)' src/web_server.c
+grep -Fq 'begin_resume' include/web_server.h src/web_server.c src/broker.c
+grep -Fq '"/api/resume"' src/web_server.c
+grep -Fq '"/api/logout"' src/web_server.c
+grep -Fq "xhr.open('POST', '/api/resume'" <<<"$client_js"
+grep -Fq "xhr.open('POST', '/api/logout'" <<<"$client_js"
+grep -Fq "browserAuthenticated" <<<"$client_js"
+grep -Fq "Reconnect" <<<"$client_js"
+grep -Fq "Disconnecting viewer; login remains active" <<<"$client_js"
+grep -Fq 'id="logout"' <<<"$login_page" || grep -Fq 'id=\"logout\"' <<<"$login_page"
+grep -Fq 'set_session_cookie(pending->msg, session_token)' src/web_server.c
+grep -Fq 'set_session_cookie(msg, NULL)' src/web_server.c
+echo "shared persistent browser authentication with explicit logout: OK"
+
 
 
 

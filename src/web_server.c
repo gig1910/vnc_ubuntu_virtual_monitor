@@ -27,13 +27,14 @@
 #define WEB_WS_DIAGNOSTIC_MAX       512
 #define WEB_WS_DIAGNOSTIC_RATE       32
 #define WEB_SESSION_COOKIE          "vnc-monitor-session"
+#define WEB_SESSION_MAX_AGE_S       31536000
 #define WEB_DEVICE_COOKIE           "__Host-vnc-monitor-device"
 #define WEB_DEVICE_MAX_AGE_S        31536000
 #define WEB_DISPLAY_MIN_INTERVAL_US (2 * G_USEC_PER_SEC)
 #define WEB_MANAGEMENT_COOKIE       "vnc-monitor-management"
 #define WEB_CONTROL_HEADER          "X-VNC-Monitor-Control"
 #define WEB_WS_TOKEN_DATA_KEY       "vnc-monitor-ws-token"
-#define WEB_MANAGEMENT_MAX_AGE_S    600
+#define WEB_MANAGEMENT_MAX_AGE_S    WEB_SESSION_MAX_AGE_S
 #define WEB_SETTINGS_BODY_MAX       8192
 #define WEB_HLS_PLAYLIST_MAX         (64u * 1024u)
 #define WEB_HLS_SEGMENT_MAX          (8u * 1024u * 1024u)
@@ -174,6 +175,7 @@ static const char login_page[] =
     "          <label class=\"field\"><span>Password</span><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label>\n"
     "          <button id=\"connect\" type=\"submit\">Connect</button>\n"
     "          <button id=\"disconnect\" class=\"secondary\" type=\"button\" style=\"display:none\">Disconnect</button>\n"
+    "          <button id=\"logout\" class=\"secondary\" type=\"button\" style=\"display:none\">Logout</button>\n"
     "        </form>\n"
     "        <div id=\"status\" class=\"status\"><span class=\"status-dot\"></span><span id=\"status-text\">Ready to connect.</span></div>\n"
     "        <p class=\"hint\">Authentication is bound to the currently active local GNOME Wayland user.<br><a href=\"/manage\">Manage sessions and settings</a></p>\n"
@@ -370,6 +372,8 @@ static const char client_js[] =
     "  var password = document.getElementById('password');\n"
     "  var connectButton = document.getElementById('connect');\n"
     "  var disconnectButton = document.getElementById('disconnect');\n"
+    "  var logoutButton = document.getElementById('logout');\n"
+    "  var browserAuthenticated = false;\n"
     "  var controlCard = document.getElementById('control-card');\n"
     "  var controlToggle = document.getElementById('control-toggle');\n"
     "  var fullscreenButton = document.getElementById('fullscreen');\n"
@@ -562,19 +566,27 @@ static const char client_js[] =
     "    }\n"
     "  }\n"
     "\n"
+    "  function setAuthenticated(authenticated) {\n"
+    "    browserAuthenticated = authenticated ? true : false;\n"
+    "    logoutButton.style.display = browserAuthenticated ? 'block' : 'none';\n"
+    "    username.disabled = browserAuthenticated;\n"
+    "    password.disabled = browserAuthenticated;\n"
+    "    if (!workerConnected) connectButton.innerHTML = browserAuthenticated ? 'Reconnect' : 'Connect';\n"
+    "  }\n"
     "  function setFormBusy(busy) {\n"
-    "    username.disabled = busy;\n"
-    "    password.disabled = busy;\n"
+    "    username.disabled = busy || browserAuthenticated;\n"
+    "    password.disabled = busy || browserAuthenticated;\n"
     "    connectButton.disabled = busy;\n"
-    "    connectButton.innerHTML = busy ? 'Connecting...' : 'Connect';\n"
+    "    connectButton.innerHTML = busy ? 'Connecting...' : (browserAuthenticated ? 'Reconnect' : 'Connect');\n"
     "  }\n"
     "\n"
     "  function setConnected(connected) {\n"
-    "    username.disabled = connected;\n"
-    "    password.disabled = connected;\n"
+    "    username.disabled = connected || browserAuthenticated;\n"
+    "    password.disabled = connected || browserAuthenticated;\n"
     "    connectButton.style.display = connected ? 'none' : 'block';\n"
     "    disconnectButton.style.display = connected ? 'block' : 'none';\n"
-    "    if (!connected) connectButton.disabled = false;\n"
+    "    logoutButton.style.display = browserAuthenticated ? 'block' : 'none';\n"
+    "    if (!connected) { connectButton.disabled = false; connectButton.innerHTML = browserAuthenticated ? 'Reconnect' : 'Connect'; }\n"
     "  }\n"
     "\n"
     "  function safeJson(text) {\n"
@@ -875,9 +887,52 @@ static const char client_js[] =
     "    protocolWorker.onerror = function () { if (!protocolFatal) setStatus('Protocol worker failed.', 'error'); };\n"
     "    protocolWorker.postMessage({ type: 'connect', url: 'wss://' + window.location.host + '/ws', protocol: CLIENT_PROTOCOL_VERSION });\n"
     "  }\n"
+    "\n"
+    "  function resumeSession(automatic) {\n"
+    "    if (protocolWorker) stopProtocolWorker();\n"
+    "    setFormBusy(true);\n"
+    "    if (!automatic) setStatus('Reconnecting authenticated session...', 'working');\n"
+    "    var xhr = new XMLHttpRequest();\n"
+    "    xhr.open('POST', '/api/resume', true);\n"
+    "    xhr.setRequestHeader('X-VNC-Monitor-Control', '1');\n"
+    "    xhr.onreadystatechange = function () {\n"
+    "      if (xhr.readyState !== 4) return;\n"
+    "      var result = safeJson(xhr.responseText);\n"
+    "      if (xhr.status === 200 && result.ok) {\n"
+    "        setAuthenticated(true);\n"
+    "        setStatus('Authenticated session restored. Opening secure control channel...', 'working');\n"
+    "        startProtocolWorker();\n"
+    "        return;\n"
+    "      }\n"
+    "      setFormBusy(false);\n"
+    "      if (xhr.status === 401) { setAuthenticated(false); if (!automatic) setStatus('Authentication expired. Enter your password again.', 'error'); }\n"
+    "      else if (xhr.status === 409) setStatus('Another VNC or WebRTC session is already active.', 'error');\n"
+    "      else if (!automatic) setStatus('Reconnect failed. HTTP ' + xhr.status + '.', 'error');\n"
+    "    };\n"
+    "    xhr.onerror = function () { setFormBusy(false); if (!automatic) setStatus('Network error while reconnecting.', 'error'); };\n"
+    "    xhr.send(null);\n"
+    "  }\n"
+    "  function logoutBrowser() {\n"
+    "    if (protocolWorker) stopProtocolWorker();\n"
+    "    var xhr = new XMLHttpRequest();\n"
+    "    xhr.open('POST', '/api/logout', true);\n"
+    "    xhr.setRequestHeader('X-VNC-Monitor-Control', '1');\n"
+    "    xhr.onreadystatechange = function () {\n"
+    "      if (xhr.readyState !== 4) return;\n"
+    "      if (xhr.status === 200) {\n"
+    "        setAuthenticated(false);\n"
+    "        setConnected(false);\n"
+    "        clearVideoFrame();\n"
+    "        username.value = ''; password.value = '';\n"
+    "        setStatus('Logged out.', '');\n"
+    "      } else setStatus('Logout failed. HTTP ' + xhr.status + '.', 'error');\n"
+    "    };\n"
+    "    xhr.send(null);\n"
+    "  }\n"
     "\n"    "  function login(event) {\n"
     "    if (event && event.preventDefault) event.preventDefault();\n"
     "    if (protocolWorker) stopProtocolWorker();\n"
+    "    if (browserAuthenticated) { resumeSession(false); return false; }\n"
     "\n"
     "    var userValue = username.value || '';\n"
     "    var passwordValue = password.value || '';\n"
@@ -900,6 +955,7 @@ static const char client_js[] =
     "      var result = safeJson(xhr.responseText);\n"
     "\n"
     "      if (xhr.status === 200 && result.ok) {\n"
+    "        setAuthenticated(true);\n"
     "        setStatus('Authenticated. Opening secure control channel...', 'working');\n"
     "        startProtocolWorker();\n"
     "        return;\n"
@@ -945,14 +1001,17 @@ static const char client_js[] =
     "  loadPublicStatus();\n"
     "  form.onsubmit = login;\n"
     "  disconnectButton.onclick = function () {\n"
-    "    setStatus('Disconnecting...', 'working');\n"
+    "    setStatus('Disconnecting viewer; login remains active...', 'working');\n"
     "    stopProtocolWorker();\n"
     "  };\n"
+    "  logoutButton.onclick = logoutBrowser;\n"
     "\n"
     "  updateProtocolInfo(null, null);\n"
     "  if (!window.Worker || !window.XMLHttpRequest || !window.JSON || !window.Blob || !objectUrlApi) {\n"
     "    connectButton.disabled = true;\n"
     "    setStatus('This browser is too old for the secure browser connection.', 'error');\n"
+    "  } else {\n"
+    "    resumeSession(true);\n"
     "  }\n"
     "})();\n";
 
@@ -1387,8 +1446,9 @@ set_session_cookie(SoupServerMessage *msg, const char *token)
     }
 
     char *cookie = g_strdup_printf(
-        WEB_SESSION_COOKIE "=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=86400",
-        token);
+        WEB_SESSION_COOKIE "=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=%d",
+        token,
+        WEB_SESSION_MAX_AGE_S);
     soup_message_headers_replace(headers, "Set-Cookie", cookie);
     g_free(cookie);
 }
@@ -1415,10 +1475,21 @@ set_management_cookie(SoupServerMessage *msg, const char *token)
 static gboolean
 management_request_authenticated(WebServer *web, SoupServerMessage *msg)
 {
-    char *token = extract_cookie(msg, WEB_MANAGEMENT_COOKIE);
+    if (!web || !web->hooks.validate_management_token)
+        return FALSE;
+
+    char *token = extract_session_cookie(msg);
     gboolean ok = token &&
-                  web->hooks.validate_management_token &&
                   web->hooks.validate_management_token(token, web->user_data);
+    g_free(token);
+
+    if (ok)
+        return TRUE;
+
+    /* Transitional fallback for a pre-unification management cookie. */
+    token = extract_cookie(msg, WEB_MANAGEMENT_COOKIE);
+    ok = token &&
+         web->hooks.validate_management_token(token, web->user_data);
     g_free(token);
     return ok;
 }
@@ -2166,6 +2237,116 @@ login_handler(SoupServer *server,
 }
 
 static void
+resume_handler(SoupServer *server,
+               SoupServerMessage *msg,
+               const char *path,
+               GHashTable *query,
+               gpointer user_data)
+{
+    (void)server; (void)path; (void)query;
+    WebServer *web = user_data;
+
+    if (strcmp(soup_server_message_get_method(msg), "POST") != 0) {
+        respond_method_not_allowed(msg, "POST");
+        return;
+    }
+    if (!management_control_request_allowed(msg) || !web->hooks.begin_resume) {
+        respond_text(msg, SOUP_STATUS_FORBIDDEN,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"request-rejected\"}\n");
+        return;
+    }
+
+    char *token = extract_session_cookie(msg);
+    if (!token || !*token) {
+        g_free(token);
+        set_session_cookie(msg, NULL);
+        respond_text(msg, SOUP_STATUS_UNAUTHORIZED,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"authentication-required\"}\n");
+        return;
+    }
+
+    if (slot_busy(web)) {
+        g_free(token);
+        respond_auth_result(msg, WEB_SERVER_AUTH_BUSY, NULL);
+        return;
+    }
+
+    const char *peer_addr = soup_server_message_get_remote_host(msg);
+    if (!peer_addr || !*peer_addr)
+        peer_addr = "unknown";
+
+    PendingLogin *pending = g_new0(PendingLogin, 1);
+    pending->msg = g_object_ref(msg);
+
+    char *device_cookie = extract_cookie(msg, WEB_DEVICE_COOKIE);
+    if (device_cookie && device_id_valid(device_cookie)) {
+        g_strlcpy(pending->device_id,
+                  device_cookie,
+                  sizeof(pending->device_id));
+    }
+    else {
+        if (generate_device_id(pending->device_id) < 0) {
+            g_free(device_cookie);
+            g_free(token);
+            g_object_unref(pending->msg);
+            g_free(pending);
+            respond_text(msg, SOUP_STATUS_INTERNAL_SERVER_ERROR,
+                         "application/json; charset=utf-8",
+                         "{\"error\":\"device-id-unavailable\"}\n");
+            return;
+        }
+        pending->set_device_cookie = TRUE;
+    }
+    g_free(device_cookie);
+
+    soup_server_message_pause(msg);
+    WebServerAuthResult start =
+        web->hooks.begin_resume(token,
+                                peer_addr,
+                                pending->device_id,
+                                login_auth_complete,
+                                pending,
+                                web->user_data);
+    g_free(token);
+
+    if (start != WEB_SERVER_AUTH_STARTED)
+        login_auth_complete(start, NULL, pending);
+}
+
+static void
+browser_logout_handler(SoupServer *server,
+                       SoupServerMessage *msg,
+                       const char *path,
+                       GHashTable *query,
+                       gpointer user_data)
+{
+    (void)server; (void)path; (void)query;
+    WebServer *web = user_data;
+
+    if (strcmp(soup_server_message_get_method(msg), "POST") != 0) {
+        respond_method_not_allowed(msg, "POST");
+        return;
+    }
+    if (!management_control_request_allowed(msg)) {
+        respond_text(msg, SOUP_STATUS_FORBIDDEN,
+                     "application/json; charset=utf-8",
+                     "{\"error\":\"request-rejected\"}\n");
+        return;
+    }
+
+    if (web->hooks.browser_logout)
+        web->hooks.browser_logout(web->user_data);
+
+    set_session_cookie(msg, NULL);
+    set_management_cookie(msg, NULL);
+    respond_text(msg, SOUP_STATUS_OK,
+                 "application/json; charset=utf-8",
+                 "{\"ok\":true}\n");
+}
+
+static void
 management_auth_complete(WebServerAuthResult result,
                          const char *session_token,
                          gpointer completion_data)
@@ -2175,6 +2356,7 @@ management_auth_complete(WebServerAuthResult result,
         return;
 
     if (result == WEB_SERVER_AUTH_OK && session_token && *session_token) {
+        set_session_cookie(pending->msg, session_token);
         set_management_cookie(pending->msg, session_token);
         respond_text(pending->msg, SOUP_STATUS_OK, "application/json; charset=utf-8", "{\"ok\":true}\n");
     }
@@ -2607,6 +2789,7 @@ management_logout_handler(SoupServer *server,
 
     if (web->hooks.management_logout)
         web->hooks.management_logout(web->user_data);
+    set_session_cookie(msg, NULL);
     set_management_cookie(msg, NULL);
     respond_text(msg, SOUP_STATUS_OK, "application/json; charset=utf-8", "{\"ok\":true}\n");
 }
@@ -3197,6 +3380,8 @@ web_server_start(WebServer **out,
     soup_server_set_tls_certificate(web->server, web->certificate);
     soup_server_add_handler(web->server, "/api/status", status_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/login", login_handler, web, NULL);
+    soup_server_add_handler(web->server, "/api/resume", resume_handler, web, NULL);
+    soup_server_add_handler(web->server, "/api/logout", browser_logout_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/manage/login", management_login_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/manage/status", management_status_handler, web, NULL);
     soup_server_add_handler(web->server, "/api/manage/settings", management_settings_handler, web, NULL);
