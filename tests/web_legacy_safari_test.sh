@@ -194,8 +194,11 @@ echo "collapsible anchored viewer controls and fullscreen fallback: OK"
 
 grep -Fq 'SPA_FORMAT_VIDEO_framerate' src/pipewire_capture.c
 grep -Fq 'SPA_FRACTION((uint32_t)fps, 1)' src/pipewire_capture.c
-grep -Fq 'RecordVirtual derives its output cadence' src/pipewire_capture.c
-echo "virtual monitor fixed PipeWire cadence: OK"
+grep -Fq 'params[1] = spa_pod_builder_add_object' src/pipewire_capture.c
+grep -Fq 'transparently fall back otherwise' src/pipewire_capture.c
+grep -Fq 'params,' src/pipewire_capture.c
+grep -Fq '        2);' src/pipewire_capture.c
+echo "virtual monitor PipeWire cadence preference with compatible fallback: OK"
 
 
 public_status_handler="$(

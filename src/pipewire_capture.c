@@ -719,11 +719,18 @@ pipewire_capture_start(PipewireCapture *capture,
         goto fail;
     }
 
-    uint8_t pod_buffer[1024];
+    uint8_t pod_buffer[2048];
     struct spa_pod_builder builder =
         SPA_POD_BUILDER_INIT(pod_buffer, sizeof(pod_buffer));
-    const struct spa_pod *params[1];
+    const struct spa_pod *params[2];
 
+    /*
+     * Prefer an explicit cadence, but keep the original variable-rate format
+     * as a second EnumFormat. Mutter RecordVirtual on some releases advertises
+     * framerate=0/1 only; requiring fps/1 then fails with "no more input
+     * formats". Multiple EnumFormat pods let PipeWire select the preferred
+     * fixed cadence when supported and transparently fall back otherwise.
+     */
     params[0] = spa_pod_builder_add_object(
         &builder,
         SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
@@ -732,15 +739,17 @@ pipewire_capture_start(PipewireCapture *capture,
         SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
         SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(
             &SPA_RECTANGLE((uint32_t)width, (uint32_t)height)),
-        /*
-         * RecordVirtual derives its output cadence from PipeWire negotiation.
-         * A 0/1 variable rate can miss compositor-only motion/effects because
-         * no client surface damage is required while an actor is moving.
-         * Request the configured monitor cadence explicitly so every stage
-         * paint can become a capture frame.
-         */
         SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(
             &SPA_FRACTION((uint32_t)fps, 1)));
+
+    params[1] = spa_pod_builder_add_object(
+        &builder,
+        SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+        SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+        SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+        SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
+        SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(
+            &SPA_RECTANGLE((uint32_t)width, (uint32_t)height)));
 
     struct pw_properties *props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Video",
@@ -785,7 +794,7 @@ pipewire_capture_start(PipewireCapture *capture,
         node_id,
         PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
         params,
-        1);
+        2);
 
     pw_thread_loop_unlock(capture->loop);
 
