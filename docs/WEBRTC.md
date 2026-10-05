@@ -373,3 +373,10 @@ With ~0.533 s segments and only three advertised entries, iOS 9 Safari fetched t
 The iPad 3 / iOS 9.3.6 compatibility probe with ~0.533 s MPEG-TS fragments and a six-entry playlist did play, but end-to-end delay increased to roughly 3 seconds or more. The client continuously fetched every short segment, so transport, authentication, playlist refresh and H.264 decode were all functioning. The behavior is consistent with classic live-HLS clients maintaining a multi-target-duration live buffer rather than following each shorter fragment at the live edge.
 
 The legacy browser fallback therefore returns to the previously working one-second GOP with a three-entry playlist. That profile produced the lowest observed delay (about 1-2 seconds by visual measurement) and is retained as the compatibility baseline. Sub-second classic-HLS fragmentation is not used as a production latency optimization. Successful HLS GET/HEAD request logs are debug-level after this diagnosis; failures remain visible at info/error levels.
+
+
+### Legacy Safari live-edge seek probe
+
+Repeated one-second HLS measurements on the iPad 3 showed roughly 3-4 seconds of end-to-end delay. This matches classic HLS client behavior: live playback normally starts several target durations behind the playlist end. The earlier 1-2 second estimate was therefore too optimistic.
+
+As a final browser-side latency experiment, the ES5 client now performs one explicit seek after metadata/canplay/playing becomes available. It reads the native video element's seekable range and requests seekable.end minus 0.75 seconds, clamped to the range start. This does not change the HLS stream or segment format; it tests whether iOS 9 AVFoundation will honor an explicit application seek closer to the live edge than its default startup position. The console records the reported seekable start/end and target for measurement.
