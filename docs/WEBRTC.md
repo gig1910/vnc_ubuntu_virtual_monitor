@@ -352,3 +352,12 @@ because its autoplay policy predates modern muted autoplay.
 The first successful iPad 3 / iOS 9.3.6 run produced native H.264/HLS playback with roughly 1-2 seconds of end-to-end delay. The generated playlist also showed alternating normal one-second fragments and one-frame (~0.067 s) fragments. That pattern came from combining x264's fixed one-second GOP with hlssink2's own keyframe requests.
 
 The test profile now disables hlssink2 keyframe requests and relies on the encoder's regular key-int-max=fps cadence. The HLS target remains one second, which is the smallest non-zero integer target exposed by hlssink2. This should make the MPEG-TS fragments regular and gives a cleaner latency baseline before considering a custom sub-second segmenter.
+
+
+### Sub-second classic-HLS probe
+
+The byte-range experiment showed that iOS 9 Safari fetches the playlist and MPEG-TS segments as ordinary complete HTTP GETs; byte ranges are retained for media-server compatibility but are not part of the observed playback path.
+
+The next latency probe keeps protocol version 3 and EXT-X-TARGETDURATION:1, but halves the encoder GOP. At 15 fps the x264 keyframe interval is 8 frames (~0.533 s). With hlssink2 keyframe requests disabled, fragment boundaries follow those regular encoder keyframes, so the playlist should contain floating-point EXTINF values around 0.53 s. HLS version 3 permits floating-point segment durations, and each fragment remains below the one-second target duration.
+
+The advertised playlist remains three segments long to preserve classic-HLS client compatibility. File retention is increased to eight fragments so a slower legacy client can still complete an older segment request without affecting the live playlist window.
