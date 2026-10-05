@@ -157,7 +157,7 @@ if grep -Eq 'display:[[:space:]]*(grid|flex)|color-scheme|var\(' <<<"$login_page
     exit 1
 fi
 
-grep -Fq 'max-width: 520px' <<<"$login_page"
+grep -Fq 'max-width: 760px' <<<"$login_page"
 grep -Fq -- '-webkit-appearance: none' <<<"$login_page"
 grep -Fq -- '-webkit-text-size-adjust: 100%' <<<"$login_page"
 grep -Fq 'XMLHttpRequest' <<<"$management_js"
@@ -175,6 +175,38 @@ grep -Fq 'settings-key' <<<"$management_page"
 grep -Fq 'max-width: 760px' <<<"$management_page"
 
 echo "legacy Safari frontend: OK"
+
+grep -Fq 'Активные сессии' <<<"$login_page"
+grep -Fq 'Настройки' <<<"$login_page"
+grep -Fq 'Отладка' <<<"$login_page"
+grep -Fq 'data-tab=\"sessions\"' <<<"$login_page"
+grep -Fq 'panel-settings' <<<"$login_page"
+grep -Fq 'panel-debug' <<<"$login_page"
+grep -Fq "function selectTab(name)" <<<"$client_js"
+grep -Fq "selectTab('sessions')" <<<"$client_js"
+grep -Fq "appRequest('GET', '/api/manage/status'" <<<"$client_js"
+grep -Fq "appRequest('GET', '/api/manage/settings'" <<<"$client_js"
+grep -Fq "appRequest('POST', '/api/manage/settings'" <<<"$client_js"
+grep -Fq "X-VNC-Monitor-Control" <<<"$client_js"
+echo "unified authenticated sessions/settings/debug tabs: OK"
+
+grep -Fq 'perf-overlay-enabled' <<<"$login_page"
+grep -Fq 'perf-overlay' <<<"$login_page"
+grep -Fq "PERF_OVERLAY_KEY = 'vnc-monitor-perf-overlay-v1'" <<<"$client_js"
+grep -Fq 'function recordFrameMetric()' <<<"$client_js"
+grep -Fq 'recordFrameMetric();' <<<"$client_js"
+grep -Fq "message.type === 'network-sample'" <<<"$client_js"
+grep -Fq 'latestPing' <<<"$client_js"
+grep -Fq 'latestJitter' <<<"$client_js"
+grep -Fq 'FPS / jitter / ping overlay' <<<"$login_page"
+echo "optional truthful FPS jitter ping overlay: OK"
+
+grep -Fq 'debug-log' <<<"$login_page"
+grep -Fq 'debug-summary' <<<"$login_page"
+grep -Fq 'function appendDebug(level, text)' <<<"$client_js"
+grep -Fq 'while (debugLines.length > 160)' <<<"$client_js"
+grep -Fq "appendDebug('telemetry'" <<<"$client_js"
+echo "bounded browser WSS debug log and telemetry: OK"
 
 grep -Fq 'control-card' <<<"$login_page"
 grep -Fq 'control-toggle' <<<"$login_page"
