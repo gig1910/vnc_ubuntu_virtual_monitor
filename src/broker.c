@@ -129,6 +129,8 @@ struct ManagementAuth {
     gpointer completion_data;
 };
 
+static int query_active_session(Broker *broker, ActiveSession *out);
+
 static const char *
 broker_session_state_name(BrokerSessionState state)
 {
