@@ -173,6 +173,31 @@ grep -Fq 'max-width: 760px' <<<"$management_page"
 
 echo "legacy Safari frontend: OK"
 
+public_status_handler="$(
+    awk '
+        /status_handler\(SoupServer \*server,/ { capture = 1 }
+        /typedef struct \{/ { if (capture) exit }
+        capture { print }
+    ' "$source_file"
+)"
+grep -Fq 'id="service-health"' <<<"$login_page"
+grep -Fq 'id="service-telemetry"' <<<"$login_page"
+grep -Fq "xhr.open('GET', '/api/status?ts='" <<<"$client_js"
+grep -Fq 'schedulePublicStatus(5000)' <<<"$client_js"
+grep -Fq '"service":"ready"' <<<"$public_status_handler"
+grep -Fq '"protocol":%u' <<<"$public_status_handler"
+grep -Fq '"uptimeMs":%' <<<"$public_status_handler"
+grep -Fq '"framesForwarded":%' <<<"$public_status_handler"
+grep -Fq '"framesAcked":%' <<<"$public_status_handler"
+grep -Fq '"framesNacked":%' <<<"$public_status_handler"
+grep -Fq '"Cache-Control"' <<<"$public_status_handler"
+if grep -Eq 'viewer_peer|viewer_user|session_id|device_id|certificate_file|private_key_file' <<<"$public_status_handler"; then
+    echo "Public status regression: sensitive session/config identity leaked" >&2
+    exit 1
+fi
+echo "unauthenticated safe service health and telemetry: OK"
+
+
 status_handler="$(
     awk '
         /management_status_handler\(SoupServer \*server,/ { capture = 1 }
@@ -229,7 +254,7 @@ grep -Fq 'validate_media_token' "$source_file"
 grep -Fq 'hls_segment_name_valid' "$source_file"
 echo "authenticated HLS serving: OK"
 
-grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              5u' include/web_server.h
+grep -Fq '#define VNC_WEB_PROTOCOL_VERSION              6u' include/web_server.h
 grep -Fq 'VNC_WEB_PROTOCOL_VERSION' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_protocol_ready' include/web_server.h src/web_server.c src/broker.c
 grep -Fq 'websocket_frame_ack' include/web_server.h src/web_server.c src/broker.c
