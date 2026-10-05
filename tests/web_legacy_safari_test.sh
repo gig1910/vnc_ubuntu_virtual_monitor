@@ -190,6 +190,14 @@ grep -Fq "appRequest('POST', '/api/manage/settings'" <<<"$client_js"
 grep -Fq "X-VNC-Monitor-Control" <<<"$client_js"
 echo "unified authenticated sessions/settings/debug tabs: OK"
 
+grep -Fq "names[i] === 'sessions' ? '' : ' auth-panel-extra'" <<<"$client_js"
+grep -Fq 'session-extra' <<<"$login_page"
+if grep -Fq 'panel-sessions\" class=\"auth-panel auth-panel-extra' <<<"$login_page"; then
+    echo "Unified UI regression: active sessions panel would disappear while streaming" >&2
+    exit 1
+fi
+echo "active sessions controls remain visible while viewer streams: OK"
+
 grep -Fq 'perf-overlay-enabled' <<<"$login_page"
 grep -Fq 'perf-overlay' <<<"$login_page"
 grep -Fq "PERF_OVERLAY_KEY = 'vnc-monitor-perf-overlay-v1'" <<<"$client_js"
