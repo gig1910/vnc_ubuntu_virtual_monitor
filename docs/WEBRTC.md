@@ -298,3 +298,15 @@ requests and also emits an explicit `wss://<request-host>` source. Older
 WebKit/Safari releases do not consistently treat `'self'` as matching the
 equivalent WSS endpoint. The Host value is syntax-validated before it is
 included, and the policy does not permit scheme-wide `wss:` access.
+
+
+### Legacy browser viewer presentation
+
+Once the first JPEG frame arrives, the login page switches to a dedicated
+full-viewport viewing mode. The framebuffer is aspect-fit against the Safari
+viewport and the authentication card collapses to a small top-right overlay
+containing only connection status and Disconnect. Returning to a disconnected
+state restores the normal login layout.
+
+Broker shutdown is also state-aware: an already-closing libsoup WebSocket is
+not closed a second time during server teardown.

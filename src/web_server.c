@@ -81,6 +81,16 @@ static const char login_page[] =
     "    .status-error .status-dot { background: #c25757; }\n"
     "    .viewer { display: none; width: 100%; max-width: 1024px; margin: 18px auto 0; overflow: hidden; border: 1px solid #273542; border-radius: 10px; background: #111820; -webkit-box-shadow: 0 12px 32px rgba(28,45,61,.16); box-shadow: 0 12px 32px rgba(28,45,61,.16); }\n"
     "    .viewer img { display: block; width: 100%; height: auto; margin: 0; }\n"
+    "    body.streaming { overflow: hidden; background: #000000; }\n"
+    "    body.streaming .page { padding: 0; }\n"
+    "    body.streaming .viewer { display: block; position: fixed; z-index: 1; left: 0; top: 0; width: 100%; height: 100%; max-width: none; margin: 0; border: 0; border-radius: 0; background: #000000; -webkit-box-shadow: none; box-shadow: none; }\n"
+    "    body.streaming .viewer img { position: absolute; left: 50%; top: 50%; width: auto; height: auto; max-width: 100%; max-height: 100%; -webkit-transform: translate(-50%, -50%); transform: translate(-50%, -50%); }\n"
+    "    body.streaming .card { position: fixed; z-index: 2; top: 10px; right: 10px; width: 220px; margin: 0; border-radius: 8px; background: rgba(255,255,255,.94); -webkit-box-shadow: 0 4px 18px rgba(0,0,0,.22); box-shadow: 0 4px 18px rgba(0,0,0,.22); }\n"
+    "    body.streaming .head, body.streaming .badge, body.streaming .field, body.streaming .hint, body.streaming #connect { display: none; }\n"
+    "    body.streaming .body { padding: 8px; }\n"
+    "    body.streaming #disconnect { display: block !important; height: 38px; margin: 0; line-height: 38px; font-size: 14px; }\n"
+    "    body.streaming .status { margin: 7px 0 0; padding: 6px 8px; font-size: 11px; line-height: 15px; }\n"
+    "    body.streaming .status-dot { width: 7px; height: 7px; margin-right: 6px; }\n"
     "    .hint { margin: 18px 0 0; color: #84919c; font-size: 12px; line-height: 18px; text-align: center; }\n"
     "    @media only screen and (max-width: 600px) {\n"
     "      .page { padding: 16px 10px; }\n"
@@ -168,6 +178,7 @@ static const char client_js[] =
     "    frameUrl = null;\n"
     "    videoFrame.removeAttribute('src');\n"
     "    viewer.style.display = 'none';\n"
+    "    document.body.className = '';\n"
     "  }\n"
     "\n"
     "  function renderVideoFrame(data) {\n"
@@ -189,6 +200,7 @@ static const char client_js[] =
     "    frameUrl = objectUrlApi.createObjectURL(blob);\n"
     "    videoFrame.src = frameUrl;\n"
     "    viewer.style.display = 'block';\n"
+    "    document.body.className = 'streaming';\n"
     "    setStatus('Connected. Live browser video.', 'ok');\n"
     "  }\n"
     "\n"
@@ -2019,9 +2031,12 @@ web_server_stop(WebServer *web)
 
     if (web->websocket) {
         g_signal_handlers_disconnect_by_data(web->websocket, web);
-        soup_websocket_connection_close(web->websocket,
-                                        SOUP_WEBSOCKET_CLOSE_GOING_AWAY,
-                                        "Server stopping");
+        if (soup_websocket_connection_get_state(web->websocket) ==
+            SOUP_WEBSOCKET_STATE_OPEN) {
+            soup_websocket_connection_close(web->websocket,
+                                            SOUP_WEBSOCKET_CLOSE_GOING_AWAY,
+                                            "Server stopping");
+        }
         g_object_unref(web->websocket);
         web->websocket = NULL;
     }

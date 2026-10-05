@@ -73,6 +73,9 @@ grep -Fq "socket.binaryType = 'blob'" <<<"$client_js"
 grep -Fq 'createObjectURL' <<<"$client_js"
 grep -Fq 'video-frame' <<<"$login_page"
 grep -Fq 'Live browser video.' <<<"$client_js"
+grep -Fq "document.body.className = 'streaming'" <<<"$client_js"
+grep -Fq "body.streaming .viewer" <<<"$login_page"
+grep -Fq "body.streaming #disconnect" <<<"$login_page"
 if grep -Fq 'WebRTC video is being prepared' <<<"$client_js"; then
     echo "Legacy Safari regression: browser UI still claims WebRTC media" >&2
     exit 1
@@ -154,3 +157,6 @@ echo "legacy Safari same-host WSS CSP: OK"
 
 grep -Fq "img-src blob:" "$source_file"
 echo "legacy Safari Blob image CSP: OK"
+
+grep -Fq 'soup_websocket_connection_get_state(web->websocket) ==' "$source_file"
+echo "WebSocket shutdown state guard: OK"
