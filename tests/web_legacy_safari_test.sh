@@ -197,3 +197,11 @@ if grep -Fq 'gst_app_src_end_of_stream(GST_APP_SRC(stream->appsrc))' "$hls_sourc
     exit 1
 fi
 echo "HLS teardown ordering: OK"
+
+grep -Fq 'strcmp(method, "HEAD") == 0' "$source_file"
+grep -Fq 'soup_message_headers_get_one(request_headers, "Range")' "$source_file"
+grep -Fq '"Accept-Ranges"' "$source_file"
+grep -Fq '"Content-Range"' "$source_file"
+grep -Fq 'range=invalid status=416' "$source_file"
+grep -Fq 'HLS GET path=%s range=%zu-%zu status=%u bytes=%zu' "$source_file"
+echo "HLS HEAD/byte-range serving: OK"
