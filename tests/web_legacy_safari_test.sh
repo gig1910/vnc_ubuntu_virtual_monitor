@@ -247,6 +247,28 @@ grep -Fq 'Broker browser JPEG decode failure:' src/broker.c
 grep -Fq 'VNC_WEB_JPEG_DECODE_FAILURE_LIMIT' include/web_server.h src/broker.c
 echo "legacy WSS/JPEG worker protocol, ACK/NACK pacing and integrity diagnostics: OK"
 
+web_media_lifetime="$(
+    awk '
+        /serve_web_media_lifetime\(int control_fd,/ { capture = 1 }
+        capture { print }
+        capture && /^}/ { exit }
+    ' src/main.c
+)"
+grep -Fq 'MonitorLayoutCache layout_cache' <<<"$web_media_lifetime"
+grep -Fq 'monitor_layout_cache_prepare(&layout_cache, cfg)' <<<"$web_media_lifetime"
+grep -Fq 'monitor_layout_cache_apply(&layout_cache' <<<"$web_media_lifetime"
+grep -Fq 'monitor_layout_cache_save(&layout_cache, cfg)' <<<"$web_media_lifetime"
+grep -Fq 'monitor_layout_cache_clear(&layout_cache)' <<<"$web_media_lifetime"
+
+save_line="$(grep -nF 'monitor_layout_cache_save(&layout_cache, cfg)' <<<"$web_media_lifetime" | head -n1 | cut -d: -f1)"
+stop_line="$(grep -nF 'real_monitor_stop(&real)' <<<"$web_media_lifetime" | head -n1 | cut -d: -f1)"
+if [[ -z "$save_line" || -z "$stop_line" || "$save_line" -ge "$stop_line" ]]; then
+    echo "Web monitor layout regression: layout must be saved before virtual monitor teardown" >&2
+    exit 1
+fi
+echo "transport-independent monitor layout persistence: OK"
+
+
 grep -Fq 'soup_websocket_connection_get_state(web->websocket) ==' "$source_file"
 echo "WebSocket shutdown state guard: OK"
 

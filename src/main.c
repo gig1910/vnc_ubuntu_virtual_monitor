@@ -831,6 +831,15 @@ serve_web_media_lifetime(int control_fd,
     RealMonitor real;
     memset(&real, 0, sizeof(real));
 
+    /*
+     * Layout persistence belongs to the virtual-monitor lifetime, not to a
+     * specific client transport. Reuse the exact same Mutter DisplayConfig
+     * cache as the VNC path so VNC, WSS/JPEG, HLS and future WebRTC sessions
+     * restore/update one shared per-user monitor arrangement.
+     */
+    MonitorLayoutCache layout_cache;
+    memset(&layout_cache, 0, sizeof(layout_cache));
+
     WebMediaSender sender;
     memset(&sender, 0, sizeof(sender));
     sender.control_fd = control_fd;
@@ -891,13 +900,27 @@ serve_web_media_lifetime(int control_fd,
 
             frame_bridge_clear(frames);
 
+            if (monitor_layout_cache_prepare(&layout_cache, cfg) < 0) {
+                LOG_DEBUG("Browser monitor-layout cache preparation failed; continuing without cached layout");
+            }
+
             if (real_monitor_start(&real, cfg, frames, pipeline_stats) < 0) {
                 LOG_ERROR("Could not start legacy browser virtual monitor/capture");
+                monitor_layout_cache_clear(&layout_cache);
                 result = -1;
                 break;
             }
 
             media_started = 1;
+
+            if (monitor_layout_cache_apply(&layout_cache,
+                                           cfg,
+                                           cfg->capture_timeout_ms) < 0) {
+                LOG_DEBUG("Cached browser monitor layout could not be applied; using Mutter's current layout");
+            }
+
+            if (vnc_log_enabled(VNC_LOG_DEBUG))
+                (void)monitor_layout_log_matching_modes(&layout_cache, cfg);
 
             /*
              * Low-latency legacy proof: prefer decode-paced WSS/JPEG. HLS is
@@ -953,9 +976,19 @@ serve_web_media_lifetime(int control_fd,
     }
 
     if (media_started) {
+        /*
+         * Save before RecordVirtual teardown while Mutter still exposes the
+         * Meta-* connector. monitor_layout_cache_save() is wrapped here by
+         * save_latest(), so the last live arrangement replaces the old cache.
+         */
+        if (monitor_layout_cache_save(&layout_cache, cfg) < 0)
+            LOG_DEBUG("Browser monitor layout was not saved");
+
         real_monitor_stop(&real);
         frame_bridge_clear(frames);
     }
+
+    monitor_layout_cache_clear(&layout_cache);
 
     pthread_cond_destroy(&sender.ack_cond);
     pthread_mutex_destroy(&sender.mutex);
